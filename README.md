@@ -102,6 +102,7 @@ STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 
 速度模式：
 
+- `npm run verify`：本地确定性检查，包含语法检查和无需下一场真实市场的 Event Market 自检。
 - `npm run event:bench -- --samples 5`：离线 benchmark 下一批同期开盘 bundle 的 plan 构建、bundle 编码、预签耗时；使用公开测试私钥，不广播。
 - `npm run event:rpc`：预热并测速 broadcast RPC 池，只输出 provider 域名、区块号、延迟和错误摘要，不打印 RPC URL。
 - `npm run event:presign-test`：离线验证“pending records -> pre-signed bundle -> cached bundle reuse”链路；使用公开测试私钥，只签名不广播。
@@ -117,6 +118,7 @@ STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 - `EVENT_OUTCOME_SELECTION_FALLBACK=token_order`：刚开场链上日志缺少赔率字段时，仍按 token 顺序选 5 个并继续抢；设为 `error` 则缺少赔率数据时直接跳过/报错，保证只在能判断赔率时下单。
 - `EVENT_OUTCOME_SELECTION=all`：恢复旧策略，买入该市场全部 outcome。
 - `AUTO_SELL_ENABLED=1`、`AUTO_SELL_PROFIT_MULTIPLIER=2`、`AUTO_SELL_PERCENT=50`：长期守护进程会轮询持仓，真实卖出报价达到成本 2 倍后自动卖出一半；已触发的 outcome 会写入 `AUTO_SELL_STATE_FILE`，避免重复半仓卖出。
+- `FEISHU_WEBHOOK=`：长期守护进程告警入口。生产环境放在服务器 env，不提交到 Git；会通知启动、资金不足、买入成功/失败、WS/链上降级、自动卖出触发等关键事件。`FEISHU_ALERT_COOLDOWN_MS` 控制同类噪音告警的冷却时间。
 - `EVENT_BUY_MODE=fast`：不逐个报价，直接 `minOut=1` 买入选中的 outcome。抢新场默认用这个。
 - `EVENT_BUY_MODE=quoted`：先模拟再买，慢但输出更完整。
 - `FAST_SKIP_PREFLIGHT=1`：触发时不再查余额/allowance，依赖启动前 `event:preflight` 和 `event:approve`。
@@ -132,7 +134,7 @@ STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 - `WATCH_STARTUP_RETRY_MS=5000`：启动时如果 REST 补种、链上回放或 chain watch 初始区块读取遇到瞬时网络错误，按这个间隔告警/重试；WS 模式下 REST/链上补种失败不会直接退出主进程。
 - `ARM_WAIT_FOR_FUNDING=1`、`ARM_FUNDING_RETRY_MS=60000`：长期守护进程资金不足时不退出，按普通间隔复查 BUSDT/BNB/allowance；资金补足后自动进入 WS watch。
 - `ARM_FUNDING_HOT_WINDOW_MS=600000`、`ARM_FUNDING_HOT_RETRY_MS=1000`：距离下一批开盘小于热窗口时，资金复查自动切到 1 秒，避免临近开盘补款后最多睡 60 秒。
-- `ARM_CATCH_UP_AFTER_FUNDING=1`、`ARM_CATCH_UP_WINDOW_MS=60000`：如果守护进程因为资金不足没进入 watch，资金补足后启动时会追赶刚开盘 60 秒内、尚未买过的 Event Markets；catch-up 会为缺少 odds 的 due market 补一次 REST 赔率以尽量严格选择最低 3 档，超过窗口仍标记 seen，避免误买老盘。
+- `ARM_CATCH_UP_AFTER_FUNDING=1`、`ARM_CATCH_UP_WINDOW_MS=60000`：如果守护进程因为资金不足没进入 watch，资金补足后启动时会追赶刚开盘 60 秒内、尚未买过的 Event Markets；catch-up 会为缺少 odds 的 due market 补一次 REST 赔率以尽量严格选择当前配置的最低赔率档，超过窗口仍标记 seen，避免误买老盘。
 - `EVENT_LOG_LOOKBACK_BLOCKS=50000`：启动时回放最近 controller 日志，把已创建但未开盘的未来 Event Market 放入 pending，避免开盘时漏买。
 - `LOG_CHUNK_BLOCKS=5000`：HTTP 回放/轮询时分块 `eth_getLogs`，避免 Chainstack 这类付费 RPC 的 block range 限制。
 - `HOT_POLL_MS=50`、`PREOPEN_HOT_MS=5000`：已知未来开盘场进入开盘前热窗口后，把 pending 检查从普通 `POLL_MS` 切到更高频；最后一跳会按剩余毫秒贴近开盘/预广播点醒来，而不是固定多睡一个完整 hot poll。

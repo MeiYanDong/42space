@@ -107,6 +107,9 @@ export function readConfig() {
     armFundingHotWindowMs: envInteger("ARM_FUNDING_HOT_WINDOW_MS", 600000),
     armCatchUpAfterFunding: envBool("ARM_CATCH_UP_AFTER_FUNDING", true),
     armCatchUpWindowMs: envInteger("ARM_CATCH_UP_WINDOW_MS", 45000),
+    feishuAlertsEnabled: envBool("FEISHU_ALERTS_ENABLED", true),
+    feishuWebhook: envString("FEISHU_WEBHOOK", ""),
+    feishuAlertCooldownMs: envInteger("FEISHU_ALERT_COOLDOWN_MS", 60000),
     autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
     autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 30000),
     autoSellProfitMultiplier: envNumber("AUTO_SELL_PROFIT_MULTIPLIER", 2),
@@ -185,6 +188,9 @@ export function readConfig() {
   }
   if (cfg.autoSellPositionLimit <= 0) {
     throw new Error("AUTO_SELL_POSITION_LIMIT must be positive");
+  }
+  if (cfg.feishuAlertCooldownMs < 0) {
+    throw new Error("FEISHU_ALERT_COOLDOWN_MS must be 0 or a positive integer");
   }
   if (cfg.executionRetryMs <= 0) {
     throw new Error("EXECUTION_RETRY_MS must be positive");
@@ -291,16 +297,42 @@ export function parseArgs(argv) {
 
 export function loadSeen(file) {
   if (!fs.existsSync(file)) return new Set();
-  const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-  return new Set(Array.isArray(parsed) ? parsed : []);
+  return new Set(readSeenArray(file));
 }
 
 export function saveSeen(file, seen) {
-  fs.writeFileSync(file, `${JSON.stringify([...seen].sort(), null, 2)}\n`);
+  ensureParentDir(file);
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  const backup = `${file}.bak`;
+  const body = `${JSON.stringify([...seen].sort(), null, 2)}\n`;
+  fs.writeFileSync(tmp, body, { mode: 0o600 });
+  if (fs.existsSync(file)) {
+    fs.copyFileSync(file, backup);
+    fs.chmodSync(backup, 0o600);
+  }
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
 }
 
 export function appendJsonl(file, row) {
+  ensureParentDir(file);
   fs.appendFileSync(file, `${JSON.stringify(row)}\n`);
+}
+
+function readSeenArray(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    const backup = `${file}.bak`;
+    if (fs.existsSync(backup)) {
+      const parsed = JSON.parse(fs.readFileSync(backup, "utf8"));
+      return Array.isArray(parsed) ? parsed : [];
+    }
+    throw new Error(`Failed to load seen file ${file}: ${error.message}`);
+  }
 }
 
 function envString(key, fallback) {

@@ -23,6 +23,7 @@
     "event:catchup-test": "node src/event-sniper.js catchup-test",
     "event:retry-test": "node src/event-sniper.js retry-test",
     "event:deadline-test": "node src/event-sniper.js deadline-test",
+    "event:self-test": "node src/event-sniper.js self-test",
     "event:buy": "node src/event-sniper.js buy",
     "event:minimal": "node src/event-sniper.js minimal",
     "event:arm": "node src/event-sniper.js arm",
@@ -31,7 +32,8 @@
     "event:approve": "node src/event-sniper.js approve",
     "event:doctor": "node src/event-sniper.js doctor",
     "dashboard": "node src/dashboard-server.js",
-    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/config.js"
+    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/config.js",
+    "verify": "npm run check && npm run event:self-test"
   },
   "dependencies": {
     "viem": "^2.41.2"

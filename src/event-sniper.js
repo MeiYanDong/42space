@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { performance } from "node:perf_hooks";
 import readline from "node:readline/promises";
 import { promisify } from "node:util";
@@ -48,6 +51,7 @@ import {
 const execFileAsync = promisify(execFile);
 const PUBLIC_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const alertCooldowns = new Map();
 
 async function main() {
   const [command = "scan", ...rest] = process.argv.slice(2);
@@ -116,6 +120,10 @@ async function main() {
   }
   if (command === "deadline-test") {
     await deadlineTest(cfg, args);
+    return;
+  }
+  if (command === "self-test") {
+    await selfTest(cfg);
     return;
   }
   if (command === "buy") {
@@ -981,6 +989,142 @@ async function deadlineTest(cfg, args) {
   }, null, 2));
 }
 
+async function selfTest(cfg) {
+  const testCfg = {
+    ...cfg,
+    privateKey: PUBLIC_TEST_PRIVATE_KEY,
+    walletAddress: PUBLIC_TEST_RECEIVER,
+    dryRun: true,
+    execute: false,
+    eventBuyMode: "fast",
+    eventOutcomeSelection: "lowest_odds",
+    eventOutcomeCount: 5,
+    eventOutcomeSelectionFallback: "token_order",
+    stakePerOutcomeUsdt: 5,
+    maxStakeUsdt: 25,
+    maxMarketStakeUsdt: 25,
+    maxBatchStakeUsdt: 100,
+    maxOutcomesPerMarket: 12,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: ["8 hour", "automated"]
+  };
+  const passed = [];
+
+  const lowestOddsPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket(), testCfg);
+  assertSelfTest(
+    lowestOddsPlan.selection?.rankSource === "payout",
+    `expected payout ranking, got ${lowestOddsPlan.selection?.rankSource}`
+  );
+  assertArrayEqual(
+    lowestOddsPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["8", "2", "16", "32", "4"],
+    "lowest-odds token selection"
+  );
+  passed.push("lowest-odds selection uses lowest payout");
+
+  const noOddsPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000043",
+    outcomes: tokenOrderOutcomes()
+  }), testCfg);
+  assertSelfTest(
+    noOddsPlan.selection?.rankSource === "token_order",
+    `expected token_order fallback, got ${noOddsPlan.selection?.rankSource}`
+  );
+  assertSelfTest(
+    noOddsPlan.selection?.fallbackReason === "missing_complete_odds_data",
+    `expected missing odds fallback, got ${noOddsPlan.selection?.fallbackReason}`
+  );
+  assertArrayEqual(
+    noOddsPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["1", "2", "4", "8", "16"],
+    "token-order fallback selection"
+  );
+  passed.push("speed fallback selects token order when odds are missing");
+
+  const priceMarkets = filterEventMarkets([mockEventMarket({
+    address: "0x0000000000000000000000000000000000000044",
+    question: "BTC price range - 8 Hours",
+    curve: "0x495B31876c092c236d1b0Df5Cc953D45d41301F1",
+    categories: ["Price"],
+    tags: ["8 hour"]
+  })], testCfg);
+  assertSelfTest(priceMarkets.length === 0, "Price market filter should exclude BTC price range markets");
+  passed.push("Price markets are excluded from Event Market bot");
+
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-self-test-"));
+  try {
+    const stateFile = path.join(stateDir, "seen.json");
+    saveSeen(stateFile, new Set(["market-a", "market-b"]));
+    assertSelfTest(loadSeen(stateFile).has("market-a"), "saved seen file should load");
+    saveSeen(stateFile, new Set(["market-c"]));
+    fs.writeFileSync(stateFile, "{ broken json", { mode: 0o600 });
+    const recovered = loadSeen(stateFile);
+    assertSelfTest(
+      recovered.has("market-a") && recovered.has("market-b"),
+      "corrupt seen file should recover from backup"
+    );
+    passed.push("seen state write is atomic and backup-recoverable");
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+
+  console.log(JSON.stringify({
+    level: "event-self-test",
+    passed: passed.length,
+    checks: passed,
+    at: new Date().toISOString()
+  }, null, 2));
+}
+
+function mockEventMarket(overrides = {}) {
+  const now = Date.now();
+  return {
+    address: "0x0000000000000000000000000000000000000042",
+    question: "Self test Event Market",
+    status: "live",
+    createdAt: new Date(now).toISOString(),
+    startDate: new Date(now + 60000).toISOString(),
+    endDate: new Date(now + 3600000).toISOString(),
+    contractVersion: 2,
+    collateral: "0x55d398326f99059fF775485246999027B3197955",
+    parentTokenId: "0",
+    curve: "0xDC26047458FEa8Bd45164217CCb7eE90b9bE10B8",
+    categories: ["Crypto"],
+    tags: ["Normal"],
+    outcomes: [
+      { tokenId: "1", name: "A", payout: 6, price: 0.1667 },
+      { tokenId: "2", name: "B", payout: 2, price: 0.5 },
+      { tokenId: "4", name: "C", payout: 5, price: 0.2 },
+      { tokenId: "8", name: "D", payout: 1, price: 1 },
+      { tokenId: "16", name: "E", payout: 3, price: 0.3333 },
+      { tokenId: "32", name: "F", payout: 4, price: 0.25 }
+    ],
+    ...overrides
+  };
+}
+
+function tokenOrderOutcomes() {
+  return [
+    { tokenId: "1", name: "A" },
+    { tokenId: "2", name: "B" },
+    { tokenId: "4", name: "C" },
+    { tokenId: "8", name: "D" },
+    { tokenId: "16", name: "E" },
+    { tokenId: "32", name: "F" }
+  ];
+}
+
+function assertSelfTest(condition, message) {
+  if (!condition) throw new Error(`Self-test failed: ${message}`);
+}
+
+function assertArrayEqual(actual, expected, label) {
+  const same = actual.length === expected.length && actual.every((value, index) => value === expected[index]);
+  if (!same) {
+    throw new Error(`Self-test failed: ${label}; expected ${expected.join(",")}, got ${actual.join(",")}`);
+  }
+}
+
 async function buildPresignTestRecords(cfg, args) {
   const chain = await loadChainEventMarkets(cfg, args);
   const futureMarkets = chain.eventMarkets
@@ -1135,6 +1279,18 @@ async function arm(cfg, args) {
       fundingStatus
     };
   }
+
+  notifyFeishu(cfg, {
+    title: "42space bot 已启动",
+    fields: {
+      mode: "execute",
+      discovery: cfg.eventDiscovery,
+      stake: `${cfg.eventOutcomeCount}档 / ${cfg.stakePerOutcomeUsdt}U`,
+      autoSell: cfg.autoSellEnabled ? `${cfg.autoSellProfitMultiplier}x 卖 ${cfg.autoSellPercent}%` : "off"
+    },
+    dedupeKey: "bot-start",
+    cooldownMs: cfg.feishuAlertCooldownMs
+  });
 
   await watch(cfg, { fundingRecovery });
 }
@@ -1502,6 +1658,18 @@ function startAutoSellMonitor(cfg, runtime = null) {
           mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
           ...result
         }));
+        notifyFeishu(cfg, {
+          title: result.errors.length > 0 ? "自动卖出有错误" : "自动卖出已触发",
+          level: result.errors.length > 0 ? "warn" : "info",
+          fields: {
+            triggered: result.triggered,
+            executed: result.executed,
+            errors: result.errors.length,
+            first: result.actions[0]?.question ?? result.errors[0]?.question ?? ""
+          },
+          dedupeKey: result.errors.length > 0 ? "auto-sell-errors" : null,
+          cooldownMs: cfg.feishuAlertCooldownMs
+        });
       }
     } catch (error) {
       console.error(JSON.stringify({
@@ -1510,6 +1678,13 @@ function startAutoSellMonitor(cfg, runtime = null) {
         message: errorMessage(error),
         at: new Date().toISOString()
       }));
+      notifyFeishu(cfg, {
+        title: "自动卖出监控异常",
+        level: "warn",
+        fields: { message: errorMessage(error) },
+        dedupeKey: "auto-sell-monitor-error",
+        cooldownMs: cfg.feishuAlertCooldownMs
+      });
     } finally {
       running = false;
     }
@@ -1700,6 +1875,16 @@ async function waitForWatchFunding(cfg) {
           requiredBnbGasReserve: fundingStatus.gasReserve?.requiredBnb ?? null,
           at: new Date().toISOString()
         }));
+        notifyFeishu(cfg, {
+          title: "资金检查通过",
+          fields: {
+            wallet: fundingStatus.address ?? "",
+            requiredBusdt: fundingStatus.funding?.requiredBusdt ?? "",
+            requiredBnb: fundingStatus.gasReserve?.requiredBnb ?? ""
+          },
+          dedupeKey: "funding-ready",
+          cooldownMs: cfg.feishuAlertCooldownMs
+        });
         return fundingStatus;
       }
       retryMs = nextFundingRetryMs(cfg, fundingStatus);
@@ -1713,6 +1898,16 @@ async function waitForWatchFunding(cfg) {
         msUntilNextStart: fundingMsUntilStart(fundingStatus),
         at: new Date().toISOString()
       }));
+      notifyFeishu(cfg, {
+        title: "资金不足，等待补款",
+        level: "warn",
+        fields: {
+          message: fundingStatus.message,
+          retryMs
+        },
+        dedupeKey: "waiting-for-funds",
+        cooldownMs: cfg.feishuAlertCooldownMs
+      });
     } catch (error) {
       console.error(JSON.stringify({
         level: "event-arm-waiting-error",
@@ -1720,6 +1915,13 @@ async function waitForWatchFunding(cfg) {
         retryMs,
         at: new Date().toISOString()
       }));
+      notifyFeishu(cfg, {
+        title: "资金检查异常",
+        level: "warn",
+        fields: { message: errorMessage(error), retryMs },
+        dedupeKey: "funding-check-error",
+        cooldownMs: cfg.feishuAlertCooldownMs
+      });
     }
     await sleep(retryMs);
   }
@@ -1968,6 +2170,13 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
       wsFailed = true;
       wakeSignal.wake();
       console.error(JSON.stringify({ level: "error", message: errorMessage(error), at: new Date().toISOString() }));
+      notifyFeishu(cfg, {
+        title: "WS 监听异常",
+        level: "warn",
+        fields: { message: errorMessage(error) },
+        dedupeKey: "ws-subscription-error",
+        cooldownMs: cfg.feishuAlertCooldownMs
+      });
     }
   });
 
@@ -2003,6 +2212,13 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
           message: "ws discovery failed repeatedly; falling back to chain polling",
           at: new Date().toISOString()
         }));
+        notifyFeishu(cfg, {
+          title: "WS 已降级",
+          level: "warn",
+          fields: { fallback: "chain polling" },
+          dedupeKey: "ws-fallback-chain",
+          cooldownMs: cfg.feishuAlertCooldownMs
+        });
         await watchChain(cfg, seen, runtime, pending);
         return;
       }
@@ -2073,6 +2289,13 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
           message: "chain discovery failed repeatedly; falling back to REST polling",
           at: new Date().toISOString()
         }));
+        notifyFeishu(cfg, {
+          title: "链上轮询已降级",
+          level: "warn",
+          fields: { fallback: "REST polling" },
+          dedupeKey: "chain-fallback-rest",
+          cooldownMs: cfg.feishuAlertCooldownMs
+        });
         await watchRest(cfg, seen, runtime, pending);
         return;
       }
@@ -2189,7 +2412,7 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
     }
     const preSigned = records.find((record) => record.preSignedFastBundleTransaction)?.preSignedFastBundleTransaction;
     if (preSigned) bundle = { ...bundle, preSignedFastBundleTransaction: preSigned };
-  const result = await executeOrPrintBundle(bundle, cfg, runtime);
+    const result = await executeOrPrintBundle(bundle, cfg, runtime);
     appendJsonl(cfg.fillsFile, {
       bundle: describeFastBundlePlan(bundle),
       result,
@@ -2212,6 +2435,17 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
       seen.add(eventSeenKey(market, cfg));
     }
     saveSeen(cfg.stateFile, seen);
+    notifyFeishu(cfg, {
+      title: "买入成功",
+      fields: {
+        type: "bundle",
+        markets: markets.length,
+        stake: `${bundle.totalStakeUsdt}U`,
+        rankSource: [...new Set(bundle.markets.map((market) => market.selection?.rankSource).filter(Boolean))].join(","),
+        fallback: [...new Set(bundle.markets.map((market) => market.selection?.fallbackReason).filter(Boolean))].join(","),
+        tx: result.txHash
+      }
+    });
     return true;
   } catch (error) {
     for (const record of records) markExecutionRetry(record, cfg, error);
@@ -2223,6 +2457,15 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
       retryInMs: cfg.executionRetryMs,
       at: new Date().toISOString()
     }));
+    notifyFeishu(cfg, {
+      title: "买入失败",
+      level: "warn",
+      fields: {
+        type: "bundle",
+        markets: markets.length,
+        message: errorMessage(error)
+      }
+    });
     return false;
   }
 }
@@ -2813,6 +3056,16 @@ function markSkippedIfExpired(cfg, seen, market, source) {
   seen.add(key);
   appendJsonl(cfg.fillsFile, row);
   console.error(JSON.stringify(row));
+  notifyFeishu(cfg, {
+    title: "开盘窗口已跳过",
+    level: "warn",
+    fields: {
+      source,
+      market: market.address,
+      question: market.question,
+      reason: row.reason
+    }
+  });
   return true;
 }
 
@@ -3023,6 +3276,16 @@ async function maybeExecuteMarket(
     };
     appendJsonl(cfg.fillsFile, row);
     console.error(JSON.stringify(row));
+    notifyFeishu(cfg, {
+      title: "买入失败",
+      level: "warn",
+      fields: {
+        type: "single",
+        market: market.address,
+        question: market.question,
+        message: errorMessage(error)
+      }
+    });
     return false;
   }
   appendJsonl(cfg.fillsFile, {
@@ -3040,11 +3303,33 @@ async function maybeExecuteMarket(
       retryInMs: cfg.executionRetryMs,
       at: new Date().toISOString()
     }));
+    notifyFeishu(cfg, {
+      title: "买入未确认成功",
+      level: "warn",
+      fields: {
+        type: "single",
+        market: market.address,
+        status: result.status ?? "unknown",
+        tx: result.txHash ?? ""
+      }
+    });
     return false;
   }
   clearExecutionRetry(retryRecord);
   seen.add(key);
   saveSeen(cfg.stateFile, seen);
+  notifyFeishu(cfg, {
+    title: "买入成功",
+    fields: {
+      type: "single",
+      market: market.address,
+      question: market.question,
+      stake: `${eventPlan.totalStakeUsdt}U`,
+      rankSource: eventPlan.selection?.rankSource ?? "",
+      fallback: eventPlan.selection?.fallbackReason ?? "",
+      tx: result.txHash
+    }
+  });
   return true;
 }
 
@@ -3166,6 +3451,83 @@ async function trackReceipt(cfg, txHash, context) {
   };
   appendJsonl(cfg.fillsFile, row);
   console.log(JSON.stringify(row));
+  if (receipt.status !== "success") {
+    notifyFeishu(cfg, {
+      title: "交易 receipt 非成功",
+      level: "warn",
+      fields: {
+        tx: txHash,
+        status: receipt.status,
+        context: context.type ?? ""
+      }
+    });
+  }
+}
+
+function notifyFeishu(cfg, { title, level = "info", fields = {}, dedupeKey = null, cooldownMs = 0 } = {}) {
+  if (!cfg.feishuAlertsEnabled || !cfg.feishuWebhook || !title) return;
+  const now = Date.now();
+  if (dedupeKey && cooldownMs > 0) {
+    const last = alertCooldowns.get(dedupeKey) ?? 0;
+    if (now - last < cooldownMs) return;
+    alertCooldowns.set(dedupeKey, now);
+  }
+
+  const text = formatFeishuAlertText({ title, level, fields });
+  void sendFeishuMessage(cfg.feishuWebhook, text).catch((error) => {
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "feishu-alert-error",
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    }));
+  });
+}
+
+async function sendFeishuMessage(webhook, text) {
+  const response = await fetch(webhook, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      msg_type: "text",
+      content: { text }
+    })
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Feishu webhook ${response.status}: ${body.slice(0, 200)}`);
+  }
+}
+
+function formatFeishuAlertText({ title, level, fields }) {
+  const lines = [
+    `${alertLevelLabel(level)} ${title}`,
+    `时间: ${new Date().toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}`
+  ];
+  for (const [key, value] of Object.entries(fields ?? {})) {
+    const formatted = formatAlertValue(value);
+    if (formatted === "") continue;
+    lines.push(`${key}: ${formatted}`);
+  }
+  return lines.join("\n").slice(0, 3000);
+}
+
+function alertLevelLabel(level) {
+  if (level === "warn") return "[WARN]";
+  if (level === "error") return "[ERROR]";
+  return "[INFO]";
+}
+
+function formatAlertValue(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "object") {
+    try {
+      return redactSecretUrls(JSON.stringify(value)).slice(0, 500);
+    } catch {
+      return "[object]";
+    }
+  }
+  return redactSecretUrls(String(value)).slice(0, 500);
 }
 
 function sleep(ms) {
@@ -3353,7 +3715,7 @@ function redactSecretUrls(message) {
   return String(message).replace(/(?:https?|wss?):\/\/[^\s")]+/g, (raw) => {
     try {
       const url = new URL(raw);
-      if (/chainstack|ankr|rpc/i.test(url.hostname)) {
+      if (/chainstack|ankr|rpc|open\.feishu\.cn/i.test(url.hostname)) {
         return `${url.protocol}//${url.hostname}/***`;
       }
       return raw;
