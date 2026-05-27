@@ -221,7 +221,9 @@ async function positions(cfg, args) {
 async function funding(cfg, args) {
   const { publicClient, account } = makeClients(cfg);
   const chain = await loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks });
-  const requirement = computeFundingRequirement(cfg, chain.eventMarkets);
+  const restMarkets = await loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit });
+  const knownEventMarkets = mergeKnownEventMarkets(chain.eventMarkets, restMarkets);
+  const requirement = computeFundingRequirement(cfg, knownEventMarkets);
   const gasReserve = await estimateFastGasReserve(publicClient, cfg, requirement);
   const walletAddress = args.wallet ?? cfg.walletAddress ?? account?.address;
 
@@ -256,6 +258,10 @@ async function funding(cfg, args) {
       decodedMarkets: chain.decodedMarkets,
       eventMarkets: chain.eventMarkets.length,
       decodeErrors: chain.decodeErrors
+    },
+    restReplay: {
+      eventMarkets: restMarkets.length,
+      futureEventMarkets: restMarkets.filter((market) => msUntilStart(market) > 0).length
     },
     commands: {
       approveIfAllowanceShort: "npm run event:approve",
@@ -403,11 +409,13 @@ async function replay(cfg, args) {
 
 async function status(cfg, args) {
   const { publicClient } = makeClients(cfg);
-  const [liveMarkets, chain] = await Promise.all([
+  const [liveMarkets, restMarkets, chain] = await Promise.all([
     loadEventMarkets(cfg, { limit: cfg.watchScanLimit }),
+    loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit }),
     loadChainEventMarkets(cfg, args)
   ]);
-  const funding = computeFundingRequirement(cfg, chain.eventMarkets);
+  const knownEventMarkets = mergeKnownEventMarkets(chain.eventMarkets, restMarkets);
+  const funding = computeFundingRequirement(cfg, knownEventMarkets);
   const gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
   const walletAddress = args.wallet ?? cfg.walletAddress;
   let wallet = null;
@@ -432,7 +440,7 @@ async function status(cfg, args) {
     }
   }
 
-  const futureMarkets = chain.eventMarkets
+  const futureMarkets = knownEventMarkets
     .filter((market) => msUntilStart(market) > 0)
     .sort(compareStartAsc);
   const latestLive = liveMarkets[0] ?? null;
@@ -517,6 +525,10 @@ async function status(cfg, args) {
       decodedMarkets: chain.decodedMarkets,
       eventMarkets: chain.eventMarkets.length,
       decodeErrors: chain.decodeErrors
+    },
+    restReplay: {
+      eventMarkets: restMarkets.length,
+      futureEventMarkets: restMarkets.filter((market) => msUntilStart(market) > 0).length
     },
     future
   }, null, 2));
@@ -1335,15 +1347,23 @@ async function doctor(cfg, args = {}) {
   let gasReserve = null;
   let chainFundingSource = null;
   let chainFundingError = null;
+  let restFundingSource = null;
   try {
-    const chain = await loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks });
-    funding = computeFundingRequirement(cfg, chain.eventMarkets);
+    const [chain, restMarkets] = await Promise.all([
+      loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks }),
+      loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit })
+    ]);
+    funding = computeFundingRequirement(cfg, mergeKnownEventMarkets(chain.eventMarkets, restMarkets));
     chainFundingSource = {
       head: chain.head,
       fromBlock: chain.fromBlock,
       controllerLogs: chain.controllerLogs,
       eventMarkets: chain.eventMarkets.length,
       decodeErrors: chain.decodeErrors.length
+    };
+    restFundingSource = {
+      eventMarkets: restMarkets.length,
+      futureEventMarkets: restMarkets.filter((market) => msUntilStart(market) > 0).length
     };
   } catch (error) {
     chainFundingError = errorMessage(error);
@@ -1391,6 +1411,7 @@ async function doctor(cfg, args = {}) {
     funding,
     gasReserve,
     chainFundingSource,
+    restFundingSource,
     docs: {
       restTradingApi: "not documented; contract route required",
       chainId: 56
@@ -1968,8 +1989,11 @@ async function getWatchFundingStatus(cfg) {
     return { skipped: true, ready: true };
   }
   const { publicClient } = makeClients(cfg);
-  const chain = await loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks });
-  const funding = computeFundingRequirement(cfg, chain.eventMarkets);
+  const [chain, restMarkets] = await Promise.all([
+    loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks }),
+    loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit })
+  ]);
+  const funding = computeFundingRequirement(cfg, mergeKnownEventMarkets(chain.eventMarkets, restMarkets));
   const gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
   const walletStatus = await getWalletStatus(cfg);
   const balanceReady = Number(walletStatus.busdtBalance) >= funding.requiredBusdt;
@@ -2049,7 +2073,7 @@ async function seedStartupMarkets(cfg, seen, pending, runtime = null, options = 
 async function seedExistingRestMarkets(cfg, seen, pending, runtime = null, options = {}) {
   let currentMarkets = [];
   try {
-    currentMarkets = await loadEventMarkets(cfg);
+    currentMarkets = await loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit });
   } catch (error) {
     return {
       ok: false,
@@ -2271,7 +2295,7 @@ async function maybePollRestDiscovery(cfg, seen, pending, runtime, state) {
 
   state.running = true;
   try {
-    const markets = await loadEventMarkets(cfg, { limit: cfg.watchScanLimit });
+    const markets = await loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit });
     const candidates = markets.filter((market) => {
       const key = eventSeenKey(market, cfg);
       return !seen.has(key) && !pending.has(key);
@@ -3440,6 +3464,47 @@ async function loadEventMarkets(cfg, { status = "live", limit = 500 } = {}) {
     limit
   });
   return filterEventMarkets(markets, cfg);
+}
+
+async function loadRestEventMarkets(cfg, { status = "all", limit = 500 } = {}) {
+  return loadEventMarkets(cfg, { status, limit });
+}
+
+function mergeKnownEventMarkets(...groups) {
+  const byAddress = new Map();
+  for (const market of groups.flat()) {
+    if (!market?.address) continue;
+    const key = String(market.address).toLowerCase();
+    const existing = byAddress.get(key);
+    byAddress.set(key, existing ? mergeKnownEventMarket(existing, market) : market);
+  }
+  return [...byAddress.values()];
+}
+
+function mergeKnownEventMarket(left, right) {
+  const richerOutcomes = chooseRicherOutcomes(left.outcomes, right.outcomes);
+  return {
+    ...left,
+    ...right,
+    address: left.address ?? right.address,
+    transactionHash: left.transactionHash ?? right.transactionHash,
+    blockNumber: left.blockNumber ?? right.blockNumber,
+    transactionIndex: left.transactionIndex ?? right.transactionIndex,
+    logIndex: left.logIndex ?? right.logIndex,
+    outcomes: richerOutcomes
+  };
+}
+
+function chooseRicherOutcomes(left = [], right = []) {
+  const leftScore = outcomeDataScore(left);
+  const rightScore = outcomeDataScore(right);
+  return rightScore >= leftScore ? right : left;
+}
+
+function outcomeDataScore(outcomes = []) {
+  return outcomes.length * 10 +
+    outcomes.filter((outcome) => outcome.payout !== undefined && outcome.payout !== null).length * 2 +
+    outcomes.filter((outcome) => outcome.price !== undefined && outcome.price !== null).length;
 }
 
 async function executeOrPrint(eventPlan, cfg, runtime = null) {

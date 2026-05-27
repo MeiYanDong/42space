@@ -8,11 +8,15 @@ export function filterEventMarkets(markets, cfg) {
 }
 
 export function isEventMarket(market, cfg) {
-  if (!market || market.status !== "live") return false;
+  if (!market || !isMonitorableEventStatus(market.status)) return false;
   if (!Array.isArray(market.outcomes) || market.outcomes.length === 0) return false;
   if (isPriceMarket(market, cfg)) return false;
   if (!passesCategoryAllowlist(market, cfg)) return false;
   return true;
+}
+
+function isMonitorableEventStatus(status) {
+  return status === "live" || status === "not_started";
 }
 
 export function isPriceMarket(market, cfg) {

@@ -112,7 +112,7 @@ STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 - `EVENT_DISCOVERY=ws`：通过 WebSocket 订阅 `FTControllerV2` 的 `CreateNewQuestionV2` / `AddOutcome` / `CreateNewMarket` 日志。默认值，最快，优先使用 `BSC_WS_URL` / `CHAINSTACK_BSC_WS_URL` / `ANKR_BSC_WS_URL` / `ANKR_BSC_WS_RPC_URL`。
 - `EVENT_DISCOVERY=chain`：HTTP 轮询同一组 controller 日志，要求 `BSC_RPC_URL` 支持 `eth_getLogs`。
 - `EVENT_DISCOVERY=rest`：REST 轮询兜底。
-- `REST_DISCOVERY_ENABLED=1`、`REST_DISCOVERY_POLL_MS=1000`：即使主发现路径是 WSS/链上日志，也每秒轮询一次 42 REST live markets 作为补漏。官网 New markets 有时先通过 REST 暴露，或不落在当前 controller 日志路径里；这个旁路保证这类场次进入 60 秒开盘窗口处理。
+- `REST_DISCOVERY_ENABLED=1`、`REST_DISCOVERY_POLL_MS=1000`：即使主发现路径是 WSS/链上日志，也每秒轮询一次 42 REST `status=all` markets 作为补漏。REST 会暴露 `not_started` 提前场，程序会提前放入 pending 并在开盘前预构建/预签；官网 New markets 有时先通过 REST 暴露，或不落在当前 controller 日志路径里，这个旁路保证这类场次进入 60 秒开盘窗口处理。
 - `WATCH_FUNDING_MODE=next_batch`：实盘 watch 启动前按已知下一批同一开盘时间的 Event Markets 合计资金校验；设为 `upper_bound` 时只按单场 `STAKE_PER_OUTCOME_USDT * min(EVENT_OUTCOME_COUNT, MAX_OUTCOMES_PER_MARKET)` 校验。
 - `BUNDLE_DUE_MARKETS=1`、`MAX_BATCH_STAKE_USDT=100`：同一 `startDate` 的多个 due Event Markets 会合并成一笔 `FTRouterProxy.multicall`，用批次上限控制总风险。
 - `EVENT_OUTCOME_SELECTION=lowest_odds`、`EVENT_OUTCOME_COUNT=5`：每个 Event Market 只买赔率最低的 5 个 outcome。链上日志缺少赔率字段时，程序会先用 42 单市场 REST 接口按地址补全 outcomes；赔率优先用 `payout` 排序，其次用 `price`，再按 `EVENT_OUTCOME_SELECTION_FALLBACK` 兜底。
