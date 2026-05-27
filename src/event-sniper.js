@@ -468,6 +468,8 @@ async function status(cfg, args) {
       eventBuyMode: cfg.eventBuyMode,
       watchFundingMode: cfg.watchFundingMode,
       bundleDueMarkets: cfg.bundleDueMarkets,
+      restDiscoveryEnabled: cfg.restDiscoveryEnabled,
+      restDiscoveryPollMs: cfg.restDiscoveryPollMs,
       stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
@@ -1238,6 +1240,8 @@ async function arm(cfg, args) {
     eventDiscovery: cfg.eventDiscovery,
     wsProvider: wsProviderLabel(cfg.wsUrl),
     eventBuyMode: cfg.eventBuyMode,
+    restDiscoveryEnabled: cfg.restDiscoveryEnabled,
+    restDiscoveryPollMs: cfg.restDiscoveryPollMs,
     stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
     eventOutcomeSelection: cfg.eventOutcomeSelection,
     eventOutcomeCount: cfg.eventOutcomeCount,
@@ -1569,6 +1573,8 @@ async function watch(cfg, options = {}) {
         eventOutcomeSelection: cfg.eventOutcomeSelection,
         eventOutcomeCount: cfg.eventOutcomeCount,
         eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+        restDiscoveryEnabled: cfg.restDiscoveryEnabled,
+        restDiscoveryPollMs: cfg.restDiscoveryPollMs,
         fastSkipPreflight: cfg.fastSkipPreflight,
         fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
         waitForReceipt: cfg.waitForReceipt,
@@ -2158,6 +2164,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
   const queue = [];
   const txBuffers = new Map();
   const wakeSignal = createWakeSignal();
+  const restDiscovery = createRestDiscoveryState();
   let wsFailed = false;
   let consecutiveErrors = 0;
 
@@ -2195,6 +2202,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
     try {
       await preSignHotPendingMarkets(cfg, pending, runtime);
       await drainDuePendingMarkets(cfg, seen, pending, runtime);
+      await maybePollRestDiscovery(cfg, seen, pending, runtime, restDiscovery);
 
       while (queue.length > 0) addBufferedControllerLog(txBuffers, queue.shift());
       await drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pending, runtime);
@@ -2249,6 +2257,57 @@ async function watchRest(cfg, seen, runtime = null, initialPending = new Map()) 
   }
 }
 
+function createRestDiscoveryState() {
+  return {
+    nextPollAt: 0,
+    running: false
+  };
+}
+
+async function maybePollRestDiscovery(cfg, seen, pending, runtime, state) {
+  if (!cfg.restDiscoveryEnabled || cfg.eventDiscovery === "rest") return;
+  const now = Date.now();
+  if (state.running || now < state.nextPollAt) return;
+
+  state.running = true;
+  try {
+    const markets = await loadEventMarkets(cfg, { limit: cfg.watchScanLimit });
+    const candidates = markets.filter((market) => {
+      const key = eventSeenKey(market, cfg);
+      return !seen.has(key) && !pending.has(key);
+    });
+    if (candidates.length > 0) {
+      console.log(JSON.stringify({
+        level: "rest-discovery-poll",
+        candidates: candidates.length,
+        at: new Date().toISOString()
+      }));
+      await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(candidates), runtime, {
+        hydrateDueOdds: true,
+        hydrationSkipReason: "rest_discovery_poll"
+      });
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "rest-discovery-poll",
+      message: errorMessage(error),
+      retryInMs: cfg.restDiscoveryPollMs,
+      at: new Date().toISOString()
+    }));
+    notifyFeishu(cfg, {
+      title: "REST 补漏异常",
+      level: "warn",
+      fields: { message: errorMessage(error) },
+      dedupeKey: "rest-discovery-error",
+      cooldownMs: cfg.feishuAlertCooldownMs
+    });
+  } finally {
+    state.nextPollAt = Date.now() + cfg.restDiscoveryPollMs;
+    state.running = false;
+  }
+}
+
 async function watchChain(cfg, seen, runtime = null, initialPending = new Map()) {
   const { publicClient } = makeClients(cfg);
   let fromBlock = await waitForInitialChainBlock(cfg, publicClient);
@@ -2257,6 +2316,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
   }
   let consecutiveErrors = 0;
   const pending = new Map(initialPending);
+  const restDiscovery = createRestDiscoveryState();
 
   console.log(JSON.stringify({ level: "chain-watch", fromBlock: fromBlock.toString() }));
 
@@ -2264,6 +2324,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
     try {
       await preSignHotPendingMarkets(cfg, pending, runtime);
       await drainDuePendingMarkets(cfg, seen, pending, runtime);
+      await maybePollRestDiscovery(cfg, seen, pending, runtime, restDiscovery);
 
       const toBlock = await publicClient.getBlockNumber();
       if (toBlock >= fromBlock) {
@@ -3056,17 +3117,25 @@ function markSkippedIfExpired(cfg, seen, market, source) {
   seen.add(key);
   appendJsonl(cfg.fillsFile, row);
   console.error(JSON.stringify(row));
-  notifyFeishu(cfg, {
-    title: "开盘窗口已跳过",
-    level: "warn",
-    fields: {
-      source,
-      market: market.address,
-      question: market.question,
-      reason: row.reason
-    }
-  });
+  if (shouldNotifyOpenWindowSkip(source)) {
+    notifyFeishu(cfg, {
+      title: "开盘窗口已跳过",
+      level: "warn",
+      fields: {
+        source,
+        market: market.address,
+        question: market.question,
+        reason: row.reason
+      },
+      dedupeKey: `open-window-skip:${market.address}`,
+      cooldownMs: cfg.feishuAlertCooldownMs
+    });
+  }
   return true;
+}
+
+function shouldNotifyOpenWindowSkip(source) {
+  return !String(source ?? "").startsWith("startup-");
 }
 
 function isPastEventOpenWindow(cfg, market) {

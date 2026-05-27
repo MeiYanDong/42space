@@ -60,6 +60,8 @@ export function readConfig() {
     eventOutcomeSelectionFallback: envString("EVENT_OUTCOME_SELECTION_FALLBACK", "token_order"),
     eventBuyMode: envString("EVENT_BUY_MODE", "fast"),
     eventDiscovery: envString("EVENT_DISCOVERY", "ws"),
+    restDiscoveryEnabled: envBool("REST_DISCOVERY_ENABLED", true),
+    restDiscoveryPollMs: envInteger("REST_DISCOVERY_POLL_MS", 1000),
     watchFundingMode: envString("WATCH_FUNDING_MODE", "next_batch"),
     bundleDueMarkets: envBool("BUNDLE_DUE_MARKETS", true),
     fastSkipPreflight: envBool("FAST_SKIP_PREFLIGHT", true),
@@ -152,6 +154,9 @@ export function readConfig() {
   }
   if (!["ws", "chain", "rest"].includes(cfg.eventDiscovery)) {
     throw new Error("EVENT_DISCOVERY must be ws, chain, or rest");
+  }
+  if (cfg.restDiscoveryPollMs <= 0) {
+    throw new Error("REST_DISCOVERY_POLL_MS must be positive");
   }
   if (!["next_batch", "upper_bound"].includes(cfg.watchFundingMode)) {
     throw new Error("WATCH_FUNDING_MODE must be next_batch or upper_bound");
