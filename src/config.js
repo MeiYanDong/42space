@@ -87,7 +87,7 @@ export function readConfig() {
     fastGasLimit: envInteger("FAST_GAS_LIMIT", 5000000),
     bundleFastGasLimit: envInteger("BUNDLE_FAST_GAS_LIMIT", 12000000),
     logChunkBlocks: envInteger("LOG_CHUNK_BLOCKS", 5000),
-    watchScanLimit: envInteger("WATCH_SCAN_LIMIT", 25),
+    watchScanLimit: envInteger("WATCH_SCAN_LIMIT", 500),
     eventLogLookbackBlocks: envInteger("EVENT_LOG_LOOKBACK_BLOCKS", 50000),
     replayLookbackBlocks: envInteger("REPLAY_LOOKBACK_BLOCKS", 50000),
     marketCategoryAllowlist: envList("MARKET_CATEGORY_ALLOWLIST", ""),
