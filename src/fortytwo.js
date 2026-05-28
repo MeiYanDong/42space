@@ -31,6 +31,12 @@ export const ADDRESSES = {
 const INTEGRATOR_FEE_BPS = 40n;
 const DEFAULT_MAX_ITERATIONS_EXECUTE = 50n;
 const MAX_UINT256 = (1n << 256n) - 1n;
+const SINGLE_FAST_GAS_BASE = 1600000n;
+const SINGLE_FAST_GAS_PER_OUTCOME = 600000n;
+const BUNDLE_FAST_GAS_BASE = 1500000n;
+const BUNDLE_FAST_GAS_PER_MARKET = 400000n;
+const BUNDLE_FAST_GAS_PER_OUTCOME = 600000n;
+const BPS_DENOMINATOR = 10_000n;
 
 const erc20Abi = parseAbi([
   "function allowance(address owner, address spender) view returns (uint256)",
@@ -212,23 +218,38 @@ export async function getWalletStatusForAddress(publicClient, address) {
 }
 
 export async function estimateFastGasReserve(publicClient, cfg, funding = {}) {
+  const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
+  return calculateFastGasReserve(cfg, funding, gasPrice);
+}
+
+export function calculateFastGasReserve(cfg, funding = {}, gasPrice = null) {
+  const effectiveGasPrice = gasPrice ?? (cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : null);
+  if (!effectiveGasPrice) throw new Error("GAS_PRICE_GWEI is required for synchronous gas reserve calculation");
   const useBundleGas = Boolean(cfg.bundleDueMarkets && Number(funding.nextBatchMarketCount ?? 0) > 1);
   const gasLimit = useBundleGas
     ? resolveBundleFastGasLimit(cfg, {
         marketCount: funding.nextBatchMarketCount,
         outcomeCount: funding.nextBatchOutcomeCount
       })
-    : BigInt(cfg.fastGasLimit);
+    : resolveSingleFastGasLimit(cfg, funding.nextBatchOutcomeCount || cfg.eventOutcomeCount || 1);
   if (gasLimit <= 0n) throw new Error("FAST_GAS_LIMIT/BUNDLE_FAST_GAS_LIMIT must be positive for gas reserve estimation");
-  const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
-  const required = gasLimit * gasPrice;
+  const required = gasLimit * effectiveGasPrice;
   return {
     mode: useBundleGas ? "bundle_fast_dynamic" : "single_fast",
     gasLimit: gasLimit.toString(),
-    gasPriceWei: gasPrice.toString(),
-    gasPriceGwei: formatUnits(gasPrice, 9),
+    gasPriceWei: effectiveGasPrice.toString(),
+    gasPriceGwei: formatUnits(effectiveGasPrice, 9),
     requiredBnb: formatUnits(required, 18)
   };
+}
+
+function resolveSingleFastGasLimit(cfg, outcomeCount = 1) {
+  const configured = BigInt(cfg.fastGasLimit || 0);
+  if (configured <= 0n) return configured;
+
+  const outcomes = BigInt(Math.max(1, Number(outcomeCount ?? 1)));
+  const dynamic = SINGLE_FAST_GAS_BASE + SINGLE_FAST_GAS_PER_OUTCOME * outcomes;
+  return dynamic > configured ? configured : dynamic;
 }
 
 function resolveBundleFastGasLimit(cfg, { marketCount, outcomeCount } = {}) {
@@ -237,8 +258,54 @@ function resolveBundleFastGasLimit(cfg, { marketCount, outcomeCount } = {}) {
 
   const markets = BigInt(Math.max(1, Number(marketCount ?? 1)));
   const outcomes = BigInt(Math.max(1, Number(outcomeCount ?? 1)));
-  const dynamic = 750000n + 250000n * markets + 320000n * outcomes;
+  const dynamic = BUNDLE_FAST_GAS_BASE + BUNDLE_FAST_GAS_PER_MARKET * markets + BUNDLE_FAST_GAS_PER_OUTCOME * outcomes;
   return dynamic > configured ? configured : dynamic;
+}
+
+export function resolveWalletBudgetGasLimit(cfg, { desiredGasLimit, walletBalance, gasPrice, blockGasLimit = 0n } = {}) {
+  const desired = BigInt(desiredGasLimit ?? 0);
+  if (!cfg.fastGasWalletBudget) return desired;
+
+  const balance = BigInt(walletBalance ?? 0);
+  const price = BigInt(gasPrice ?? 0);
+  if (balance <= 0n || price <= 0n) {
+    throw new Error("BNB balance and gas price are required for wallet-budget gas limit");
+  }
+
+  const walletBps = BigInt(cfg.fastGasWalletBudgetBps ?? 10000);
+  let limit = ((balance * walletBps) / BPS_DENOMINATOR) / price;
+  const blockLimit = BigInt(blockGasLimit ?? 0);
+  if (blockLimit > 0n) {
+    const blockBps = BigInt(cfg.fastGasBlockLimitBps ?? 10000);
+    const blockCap = (blockLimit * blockBps) / BPS_DENOMINATOR;
+    if (blockCap > 0n && limit > blockCap) limit = blockCap;
+  }
+  if (limit <= 0n) throw new Error("BNB balance is too low to sign a fast transaction");
+  return limit;
+}
+
+async function resolveExecutionGasLimit(publicClient, accountAddress, cfg, desiredGasLimit, gasPrice) {
+  const desired = BigInt(desiredGasLimit ?? 0);
+  if (!cfg.fastGasWalletBudget) return desired;
+
+  const [walletBalance, block] = await Promise.all([
+    getPendingBalance(publicClient, accountAddress),
+    publicClient.getBlock().catch(() => null)
+  ]);
+  return resolveWalletBudgetGasLimit(cfg, {
+    desiredGasLimit: desired,
+    walletBalance,
+    gasPrice,
+    blockGasLimit: block?.gasLimit ?? 0n
+  });
+}
+
+async function getPendingBalance(publicClient, address) {
+  try {
+    return await publicClient.getBalance({ address, blockTag: "pending" });
+  } catch {
+    return publicClient.getBalance({ address });
+  }
 }
 
 export async function approveRouterMax(cfg, { requiredUsdt = cfg.maxMarketStakeUsdt } = {}) {
@@ -765,9 +832,9 @@ export async function preSignFastBuyTransaction(cfg, plan, runtime = null) {
   const market = getAddress(plan.market.address);
   const prebuilt = getReusablePrebuiltFastExecution(plan, market, receiver);
   const calls = prebuilt?.calls ?? buildOutcomeSwapCalls(plan, market, receiver);
-  const gas = BigInt(cfg.fastGasLimit);
-  if (!gas || gas <= 0n) throw new Error("FAST_GAS_LIMIT is required for pre-signed fast transactions");
   const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
+  const gas = await resolveExecutionGasLimit(publicClient, account.address, cfg, resolveFastPlanGasLimit(cfg, plan), gasPrice);
+  if (!gas || gas <= 0n) throw new Error("FAST_GAS_LIMIT is required for pre-signed fast transactions");
   const nonce = runtime?.nextNonce !== undefined
     ? runtime.nextNonce
     : await publicClient.getTransactionCount({
@@ -811,9 +878,9 @@ export async function preSignFastBundleTransaction(cfg, bundle, runtime = null) 
   }
 
   const { publicClient, account } = makeClients(cfg);
-  const gas = resolveBundleFastGasLimit(cfg, bundle);
-  if (!gas || gas <= 0n) throw new Error("BUNDLE_FAST_GAS_LIMIT is required for pre-signed bundle transactions");
   const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
+  const gas = await resolveExecutionGasLimit(publicClient, account.address, cfg, resolveBundleFastGasLimit(cfg, bundle), gasPrice);
+  if (!gas || gas <= 0n) throw new Error("BUNDLE_FAST_GAS_LIMIT is required for pre-signed bundle transactions");
   const nonce = runtime?.nextNonce !== undefined
     ? runtime.nextNonce
     : await publicClient.getTransactionCount({
@@ -862,13 +929,14 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
 
   if (!broadcast) {
     const { publicClient, walletClient, account } = makeClients(cfg);
+    const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
     const request = {
       address: ADDRESSES.routerProxy,
       abi: routerAbi,
       functionName: "multicall",
       args: [bundle.calls],
-      gas: resolveBundleFastGasLimit(cfg, bundle),
-      ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+      gas: await resolveExecutionGasLimit(publicClient, account.address, cfg, resolveBundleFastGasLimit(cfg, bundle), gasPrice),
+      gasPrice
     };
     const reusePreSignedNonce = shouldReusePreSignedNonce(preSignedError) &&
       bundle.preSignedFastBundleTransaction?.nonce !== undefined;
@@ -913,6 +981,15 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
     broadcastMode: broadcast.mode,
     broadcastRpcCount: broadcast.rpcCount,
     firstBroadcastProvider: broadcast.firstProvider ?? null,
+    broadcastStartedAt: broadcast.broadcastStartedAt ?? null,
+    firstAcceptedAt: broadcast.firstAcceptedAt ?? null,
+    firstAcceptedLatencyMs: broadcast.firstAcceptedLatencyMs ?? null,
+    gas: broadcast.gas ?? null,
+    gasPrice: broadcast.gasPrice ?? null,
+    gasPriceGwei: broadcast.gasPriceGwei ?? null,
+    nonce: broadcast.nonce ?? null,
+    rebroadcastIntervalMs: broadcast.rebroadcastIntervalMs ?? null,
+    rebroadcastDurationMs: broadcast.rebroadcastDurationMs ?? null,
     usedPreSignedTransaction: Boolean(bundle.preSignedFastBundleTransaction && !preSignedError),
     preSignedError,
     preSignedNonceStale: Boolean(preSignedError && !shouldReusePreSignedNonce(preSignedError)),
@@ -966,13 +1043,17 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
   const prebuilt = broadcast ? null : getReusablePrebuiltFastExecution(plan, market, receiver);
   const calls = broadcast ? null : (prebuilt?.calls ?? buildOutcomeSwapCalls(plan, market, receiver));
 
-  const request = {
-    address: ADDRESSES.routerProxy,
-    abi: routerAbi,
-    functionName: "multicall",
-    args: [calls],
-    ...fastTransactionOptions(cfg, isFastPlan)
-  };
+  let request = null;
+  if (!broadcast) {
+    const fastOptions = await fastTransactionOptions(cfg, publicClient, account, isFastPlan, plan);
+    request = {
+      address: ADDRESSES.routerProxy,
+      abi: routerAbi,
+      functionName: "multicall",
+      args: [calls],
+      ...fastOptions
+    };
+  }
   if (!broadcast && !isFastPlan) {
     const simulated = await publicClient.simulateContract({
       address: ADDRESSES.routerProxy,
@@ -1021,6 +1102,15 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
     broadcastMode: broadcast.mode,
     broadcastRpcCount: broadcast.rpcCount,
     firstBroadcastProvider: broadcast.firstProvider ?? null,
+    broadcastStartedAt: broadcast.broadcastStartedAt ?? null,
+    firstAcceptedAt: broadcast.firstAcceptedAt ?? null,
+    firstAcceptedLatencyMs: broadcast.firstAcceptedLatencyMs ?? null,
+    gas: broadcast.gas ?? null,
+    gasPrice: broadcast.gasPrice ?? null,
+    gasPriceGwei: broadcast.gasPriceGwei ?? null,
+    nonce: broadcast.nonce ?? null,
+    rebroadcastIntervalMs: broadcast.rebroadcastIntervalMs ?? null,
+    rebroadcastDurationMs: broadcast.rebroadcastDurationMs ?? null,
     skippedPreflight: isFastPlan && cfg.fastSkipPreflight,
     usedPreSignedTransaction: Boolean(plan.preSignedFastTransaction && !preSignedError),
     preSignedError,
@@ -1103,8 +1193,9 @@ async function writeFastMulticallFanout(cfg, publicClient, account, request, cal
   });
 
   const txHash = keccak256(serializedTransaction);
+  const broadcastStartedAt = Date.now();
   const attempts = cfg.broadcastRpcUrls.map((url) =>
-    sendRawTransactionVia(url, serializedTransaction, txHash, cfg.broadcastTimeoutMs)
+    sendRawTransactionVia(url, serializedTransaction, txHash, cfg.broadcastTimeoutMs, broadcastStartedAt)
   );
 
   try {
@@ -1113,7 +1204,14 @@ async function writeFastMulticallFanout(cfg, publicClient, account, request, cal
       txHash: first.txHash,
       mode: "fanout_raw",
       rpcCount: cfg.broadcastRpcUrls.length,
-      firstProvider: first.provider
+      firstProvider: first.provider,
+      broadcastStartedAt: new Date(broadcastStartedAt).toISOString(),
+      firstAcceptedAt: first.acceptedAt,
+      firstAcceptedLatencyMs: first.latencyMs,
+      gas: gas.toString(),
+      gasPrice: gasPrice.toString(),
+      gasPriceGwei: formatUnits(gasPrice, 9),
+      nonce
     };
   } catch {
     const settled = await Promise.allSettled(attempts);
@@ -1128,17 +1226,29 @@ async function broadcastPreSignedFastTransaction(cfg, signed) {
   if (!signed?.serializedTransaction || !signed?.txHash) {
     throw new Error("Missing pre-signed fast transaction");
   }
-  if (cfg.fanoutBroadcast && cfg.broadcastRpcUrls.length > 1) {
-    const attempts = cfg.broadcastRpcUrls.map((url) =>
-      sendRawTransactionVia(url, signed.serializedTransaction, signed.txHash, cfg.broadcastTimeoutMs)
+  const urls = cfg.broadcastRpcUrls?.length ? cfg.broadcastRpcUrls : [cfg.rpcUrl];
+  if (cfg.fanoutBroadcast && urls.length > 1) {
+    const broadcastStartedAt = Date.now();
+    const attempts = urls.map((url) =>
+      sendRawTransactionVia(url, signed.serializedTransaction, signed.txHash, cfg.broadcastTimeoutMs, broadcastStartedAt)
     );
     try {
       const first = await Promise.any(attempts);
+      scheduleRawTransactionRebroadcast(cfg, signed, urls, first.provider);
       return {
         txHash: first.txHash,
         mode: "presigned_fanout_raw",
-        rpcCount: cfg.broadcastRpcUrls.length,
-        firstProvider: first.provider
+        rpcCount: urls.length,
+        firstProvider: first.provider,
+        broadcastStartedAt: new Date(broadcastStartedAt).toISOString(),
+        firstAcceptedAt: first.acceptedAt,
+        firstAcceptedLatencyMs: first.latencyMs,
+        gas: signed.gas ?? null,
+        gasPrice: signed.gasPrice ?? null,
+        gasPriceGwei: signed.gasPrice ? formatUnits(BigInt(signed.gasPrice), 9) : null,
+        nonce: signed.nonce ?? null,
+        rebroadcastIntervalMs: cfg.rebroadcastIntervalMs,
+        rebroadcastDurationMs: cfg.rebroadcastDurationMs
       };
     } catch {
       const settled = await Promise.allSettled(attempts);
@@ -1149,18 +1259,75 @@ async function broadcastPreSignedFastTransaction(cfg, signed) {
     }
   }
 
+  const broadcastStartedAt = Date.now();
   const first = await sendRawTransactionVia(
-    cfg.rpcUrl,
+    urls[0],
     signed.serializedTransaction,
     signed.txHash,
-    cfg.broadcastTimeoutMs
+    cfg.broadcastTimeoutMs,
+    broadcastStartedAt
   );
+  scheduleRawTransactionRebroadcast(cfg, signed, [urls[0]], first.provider);
   return {
     txHash: first.txHash,
     mode: "presigned_single_raw",
     rpcCount: 1,
-    firstProvider: first.provider
+    firstProvider: first.provider,
+    broadcastStartedAt: new Date(broadcastStartedAt).toISOString(),
+    firstAcceptedAt: first.acceptedAt,
+    firstAcceptedLatencyMs: first.latencyMs,
+    gas: signed.gas ?? null,
+    gasPrice: signed.gasPrice ?? null,
+    gasPriceGwei: signed.gasPrice ? formatUnits(BigInt(signed.gasPrice), 9) : null,
+    nonce: signed.nonce ?? null,
+    rebroadcastIntervalMs: cfg.rebroadcastIntervalMs,
+    rebroadcastDurationMs: cfg.rebroadcastDurationMs
   };
+}
+
+function scheduleRawTransactionRebroadcast(cfg, signed, urls, firstProvider) {
+  const intervalMs = Number(cfg.rebroadcastIntervalMs ?? 0);
+  const durationMs = Number(cfg.rebroadcastDurationMs ?? 0);
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return;
+
+  const startedAt = Date.now();
+  const deadline = startedAt + durationMs;
+  let round = 0;
+  const activeUrls = [...new Set(urls.filter(Boolean))];
+
+  const tick = () => {
+    if (Date.now() >= deadline) {
+      console.log(JSON.stringify({
+        level: "raw-tx-rebroadcast-done",
+        txHash: signed.txHash,
+        rounds: round,
+        durationMs,
+        firstProvider
+      }));
+      return;
+    }
+    round += 1;
+    void Promise.allSettled(activeUrls.map((url) =>
+      sendRawTransactionVia(url, signed.serializedTransaction, signed.txHash, cfg.broadcastTimeoutMs)
+    )).then((settled) => {
+      const accepted = settled.filter((item) => item.status === "fulfilled").length;
+      const rejected = settled.length - accepted;
+      if (round === 1 || rejected > 0) {
+        console.log(JSON.stringify({
+          level: "raw-tx-rebroadcast",
+          txHash: signed.txHash,
+          round,
+          accepted,
+          rejected,
+          rpcCount: activeUrls.length
+        }));
+      }
+    });
+    setTimeout(tick, intervalMs).unref?.();
+  };
+
+  setTimeout(tick, intervalMs).unref?.();
 }
 
 function shouldReusePreSignedNonce(preSignedError) {
@@ -1205,7 +1372,7 @@ async function getFreshPendingNonce(publicClient, account, runtime = null) {
   return nonce;
 }
 
-async function sendRawTransactionVia(url, serializedTransaction, txHash, timeoutMs) {
+async function sendRawTransactionVia(url, serializedTransaction, txHash, timeoutMs, broadcastStartedAt = Date.now()) {
   const client = getBroadcastClient(url);
   try {
     const sentHash = await withTimeout(
@@ -1213,16 +1380,22 @@ async function sendRawTransactionVia(url, serializedTransaction, txHash, timeout
       timeoutMs,
       `sendRawTransaction timeout after ${timeoutMs}ms`
     );
+    const acceptedAt = Date.now();
     return {
       txHash: sentHash,
-      provider: providerLabel(url)
+      provider: providerLabel(url),
+      acceptedAt: new Date(acceptedAt).toISOString(),
+      latencyMs: acceptedAt - broadcastStartedAt
     };
   } catch (error) {
     if (/already known|already imported|known transaction|transaction already/i.test(error?.message ?? "")) {
+      const acceptedAt = Date.now();
       return {
         txHash,
         provider: providerLabel(url),
-        alreadyKnown: true
+        alreadyKnown: true,
+        acceptedAt: new Date(acceptedAt).toISOString(),
+        latencyMs: acceptedAt - broadcastStartedAt
       };
     }
     throw error;
@@ -1338,6 +1511,47 @@ export async function quoteSellOutcome(publicClient, { market, tokenId, owner, a
   };
 }
 
+export async function buildDirectSellPlan(publicClient, { market, tokenId, owner, amountOt, percent = 100 }) {
+  const marketAddress = getAddress(market);
+  const ownerAddress = getAddress(owner);
+  const id = BigInt(tokenId);
+  const balance = await publicClient.readContract({
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "balanceOf",
+    args: [ownerAddress, id]
+  });
+  const amount = amountOt === undefined || amountOt === null || amountOt === ""
+    ? applyPercent(balance, percent)
+    : parseUnits(String(amountOt), 18);
+  if (amount <= 0n) throw new Error("Sell amount is zero");
+  if (amount > balance) {
+    throw new Error(`Sell amount ${formatUnits(amount, 18)} exceeds outcome balance ${formatUnits(balance, 18)}`);
+  }
+  const operatorApproved = await publicClient.readContract({
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "isOperator",
+    args: [ownerAddress, ADDRESSES.routerProxy]
+  });
+
+  return {
+    market: marketAddress,
+    owner: ownerAddress,
+    tokenId: id.toString(),
+    balance,
+    amount,
+    percent: Number(percent),
+    operatorApproved,
+    collateralOutBeforeIntegrator: 0n,
+    collateralToIntegrator: 0n,
+    expectedCollateralToUser: 0n,
+    minCollateralOut: 1n,
+    slippageBps: 10000,
+    directNoQuote: true
+  };
+}
+
 export async function sellOutcome(cfg, sellPlan) {
   assertSellExecutionAllowed(cfg, sellPlan);
   const { publicClient, walletClient, account } = makeClients(cfg);
@@ -1416,6 +1630,107 @@ export async function sellOutcome(cfg, sellPlan) {
     minCollateralOut: formatUnits(minOut, 18),
     expectedCollateralToUser: formatUnits(sellPlan.expectedCollateralToUser, 18),
     slippageBps: sellPlan.slippageBps
+  };
+}
+
+export async function sellOutcomesBatch(cfg, sellPlans) {
+  assertSellExecutionAllowed(cfg);
+  const plans = Array.isArray(sellPlans) ? sellPlans : [];
+  if (plans.length === 0) throw new Error("sellOutcomesBatch requires at least one sell plan");
+
+  const { publicClient, walletClient, account } = makeClients(cfg);
+  const receiver = getAddress(cfg.walletAddress || account.address);
+  const markets = [...new Set(plans.map((plan) => getAddress(plan.market)))];
+
+  const approvals = [];
+  for (const market of markets) {
+    let approved = await publicClient.readContract({
+      address: market,
+      abi: marketV2Abi,
+      functionName: "isOperator",
+      args: [account.address, ADDRESSES.routerProxy]
+    });
+    let operatorApprovalHash = null;
+    if (!approved) {
+      operatorApprovalHash = await walletClient.writeContract({
+        address: market,
+        abi: marketV2Abi,
+        functionName: "setOperator",
+        args: [ADDRESSES.routerProxy, true],
+        ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+      });
+      await publicClient.waitForTransactionReceipt({ hash: operatorApprovalHash });
+      approved = true;
+    }
+    approvals.push({ market, operatorApproved: approved, operatorApprovalHash });
+  }
+
+  const calls = [];
+  const positions = [];
+  for (const plan of plans) {
+    const market = getAddress(plan.market);
+    const tokenId = BigInt(plan.tokenId);
+    const amount = plan.amount;
+    const currentBalance = await publicClient.readContract({
+      address: market,
+      abi: marketV2Abi,
+      functionName: "balanceOf",
+      args: [account.address, tokenId]
+    });
+    if (currentBalance < amount) {
+      throw new Error(`Outcome balance ${formatUnits(currentBalance, 18)} is below sell amount ${formatUnits(amount, 18)}`);
+    }
+
+    const minOut = plan.minCollateralOut > 0n ? plan.minCollateralOut : 1n;
+    calls.push({
+      allowFailure: false,
+      callData: encodeFunctionData({
+        abi: routerAbi,
+        functionName: "swap",
+        args: [
+          market,
+          receiver,
+          tokenId,
+          [false, amount, true, minOut],
+          "0x",
+          "0x",
+          ADDRESSES.integrator,
+          INTEGRATOR_FEE_BPS
+        ]
+      })
+    });
+    positions.push({
+      market,
+      tokenId: tokenId.toString(),
+      amountOt: formatUnits(amount, 18),
+      minCollateralOut: formatUnits(minOut, 18),
+      expectedCollateralToUser: formatUnits(plan.expectedCollateralToUser ?? 0n, 18),
+      directNoQuote: Boolean(plan.directNoQuote)
+    });
+  }
+
+  const gas = 1500000n + 1000000n * BigInt(plans.length);
+  const txHash = await walletClient.writeContract({
+    address: ADDRESSES.routerProxy,
+    abi: routerAbi,
+    functionName: "multicall",
+    args: [calls],
+    account,
+    gas,
+    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+
+  return {
+    txHash,
+    status: receipt.status,
+    blockNumber: receipt.blockNumber?.toString() ?? null,
+    receiver,
+    approvals,
+    positions,
+    gas: gas.toString(),
+    marketCount: markets.length,
+    positionCount: positions.length
   };
 }
 
@@ -1617,11 +1932,19 @@ function smartEps(amountUsdt) {
   return BigInt(Math.floor((1 / amount) * 1e18));
 }
 
-function fastTransactionOptions(cfg, isFastPlan) {
+function resolveFastPlanGasLimit(cfg, plan) {
+  return resolveSingleFastGasLimit(cfg, plan?.outcomes?.length ?? cfg.eventOutcomeCount ?? 1);
+}
+
+async function fastTransactionOptions(cfg, publicClient, account, isFastPlan, plan = null) {
   if (!isFastPlan) return {};
   const options = {};
-  if (cfg.fastGasLimit > 0) options.gas = BigInt(cfg.fastGasLimit);
-  if (cfg.gasPriceGwei) options.gasPrice = parseGwei(String(cfg.gasPriceGwei));
+  const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
+  const desiredGasLimit = plan ? resolveFastPlanGasLimit(cfg, plan) : BigInt(cfg.fastGasLimit);
+  if (desiredGasLimit > 0n) {
+    options.gas = await resolveExecutionGasLimit(publicClient, account.address, cfg, desiredGasLimit, gasPrice);
+  }
+  options.gasPrice = gasPrice;
   return options;
 }
 

@@ -122,9 +122,16 @@
 
           <section id="marketsView" class="view" data-view="markets">
             <div class="viewToolbar">
+              <div class="segmented" aria-label="开盘时间">
+                <button type="button" class="isActive" data-market-time="all">全部时间</button>
+                <button type="button" data-market-time="past">过去</button>
+                <button type="button" data-market-time="future">未来</button>
+              </div>
               <div class="segmented" aria-label="市场筛选">
                 <button type="button" class="isActive" data-market-filter="all">全部</button>
                 <button type="button" data-market-filter="pending">待处理</button>
+                <button type="button" data-market-filter="funding">资金不足</button>
+                <button type="button" data-market-filter="filtered">已过滤</button>
                 <button type="button" data-market-filter="bought">已买</button>
                 <button type="button" data-market-filter="skipped">已跳过</button>
               </div>

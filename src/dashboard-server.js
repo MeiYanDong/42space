@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readConfig } from "./config.js";
 import { fetchActivity, fetchMarkets } from "./fortytwo.js";
-import { isEventMarket, isPriceMarket } from "./event-strategy.js";
+import { eventDurationMs, getEventMarketDecision, isEventMarket, isPriceMarket } from "./event-strategy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -75,7 +75,7 @@ async function buildOverview() {
     fetchNewMarketsFeed(),
     getBotState()
   ]);
-  const holdings = normalizeHoldings(positions);
+  const holdings = normalizeHoldings(positions, walletActivity);
   const recentRows = readRecentActivity();
   return {
     ok: true,
@@ -83,6 +83,7 @@ async function buildOverview() {
     bot: normalizeBot(bot, status),
     wallet: normalizeWallet(status.wallet),
     next: normalizeNext(status),
+    manualSell: manualSellState(status, cfg),
     newMarkets: normalizeNewMarkets(newMarkets, status, walletActivity, recentRows),
     holdings,
     analytics: buildAnalytics(positions, walletActivity),
@@ -98,12 +99,35 @@ async function buildOverview() {
 function autoSellText(watchConfig, cfg) {
   const enabled = Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled);
   if (!enabled) return "关闭";
-  return `${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x / 卖 ${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`;
+  const strategy = watchConfig?.autoSellStrategy ?? cfg.autoSellStrategy;
+  if (strategy === "ladder") {
+    const delay = watchConfig?.autoSellStartDelaySeconds ?? cfg.autoSellStartDelaySeconds;
+    const interval = watchConfig?.autoSellIntervalSeconds ?? cfg.autoSellIntervalSeconds;
+    const chunk = watchConfig?.autoSellChunkPercent ?? cfg.autoSellChunkPercent;
+    const stop = watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent;
+    return `${delay}s 后每 ${interval}s 卖 ${chunk}% / 亏 ${stop}% 全卖`;
+  }
+  const takeProfit = `${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x 卖 ${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`;
+  const stopLossEnabled = Boolean(watchConfig?.autoSellStopLossEnabled ?? cfg.autoSellStopLossEnabled);
+  if (!stopLossEnabled) return takeProfit;
+  return `${takeProfit} / 亏 ${watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent}% 卖 ${watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent}%`;
 }
 
 async function sellQuote(body) {
+  await assertManualSellAllowed();
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--wallet", botWallet, ...args], { timeoutMs: 30000 });
+  const result = await runEvent(["sell", "--wallet", botWallet, ...args], {
+    timeoutMs: 30000,
+    env: {
+      DRY_RUN: "1",
+      EXECUTE: "0",
+      AUTO_SELL_ENABLED: "0",
+      NO_GUI_PROMPT: "1"
+    }
+  });
+  if (result.mode !== "dry-run" || (result.executions?.length ?? 0) > 0) {
+    throw new Error("Quote safety violation: quote returned executable sell result");
+  }
   return {
     ok: true,
     quote: normalizeSellQuote(result)
@@ -111,8 +135,9 @@ async function sellQuote(body) {
 }
 
 async function sellExecute(body) {
+  await assertManualSellAllowed();
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--wallet", botWallet, ...args], {
+  const result = await runEvent(["sell", "--execute", "--wallet", botWallet, ...args], {
     timeoutMs: 120000,
     env: {
       DRY_RUN: "0",
@@ -125,17 +150,75 @@ async function sellExecute(body) {
   const summary = normalizeSellExecution(result);
   appendJsonl(actionsFile, {
     type: "sell",
+    source: "manual-dashboard",
     at: new Date().toISOString(),
     question: summary.title,
     outcome: summary.outcome,
     amount: summary.receivedText,
-    status: summary.status
+    status: summary.status,
+    txHash: summary.txHash,
+    txHashes: summary.txHashes,
+    operatorApprovalHash: summary.operatorApprovalHash,
+    blockNumber: summary.blockNumber,
+    market: summary.market,
+    tokenId: summary.tokenId
   });
   overviewCache = null;
   return {
     ok: true,
     sell: summary
   };
+}
+
+async function assertManualSellAllowed() {
+  const status = await runEvent(["status", "--wallet", botWallet], { timeoutMs: 30000 });
+  const state = manualSellState(status, readConfig());
+  if (state.blocked) throw new Error(state.message);
+}
+
+function manualSellState(status, cfg) {
+  const block = findManualSellBlock(status, cfg);
+  if (!block) {
+    return {
+      blocked: false,
+      label: "可手动卖出",
+      message: "当前不在买入保护期"
+    };
+  }
+  const seconds = Math.max(0, Math.ceil(block.msUntilStart / 1000));
+  const label = block.msUntilStart >= 0 ? "开盘前保护" : "开盘后保护";
+  return {
+    blocked: true,
+    label,
+    message: block.msUntilStart >= 0
+      ? `下一场 ${seconds} 秒内开盘，已暂停手动卖出`
+      : "当前处于开盘买入保护期，已暂停手动卖出",
+    market: block.market?.question ?? null,
+    startsAt: block.market?.startDate ?? null,
+    msUntilStart: block.msUntilStart,
+    guardBeforeMs: block.beforeMs,
+    guardAfterMs: block.afterMs
+  };
+}
+
+function findManualSellBlock(status, cfg) {
+  const markets = status.future ?? [];
+  if (!markets.length) return null;
+  const preSignWindowMs = Number(status.watchConfig?.preSignWindowMs ?? cfg.preSignWindowMs ?? 60000);
+  const openWindowMs = Number(status.watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 5) * 1000;
+  const guardMs = Number(process.env.DASHBOARD_MANUAL_SELL_HOT_GUARD_MS ?? 15000);
+  const beforeMs = preSignWindowMs + guardMs;
+  const afterMs = openWindowMs + guardMs;
+  const now = Date.now();
+  return markets
+    .map((market) => {
+      const startMs = new Date(market.startDate).getTime();
+      if (!Number.isFinite(startMs)) return null;
+      return { market, msUntilStart: startMs - now, beforeMs, afterMs };
+    })
+    .filter(Boolean)
+    .filter((item) => item.msUntilStart <= beforeMs && item.msUntilStart >= -afterMs)
+    .sort((a, b) => Math.abs(a.msUntilStart) - Math.abs(b.msUntilStart))[0] ?? null;
 }
 
 function sellArgs(body) {
@@ -153,30 +236,51 @@ function sellArgs(body) {
 }
 
 function normalizeBot(bot, status) {
-  const waitingFunds = status.wallet && (!status.wallet.balanceReady || !status.wallet.bnbReady);
+  const wallet = normalizeWallet(status.wallet);
+  const waitingFunds = wallet && wallet.state === "blocked";
+  const partialFunding = wallet?.state === "partial";
   return {
     running: bot.running,
-    label: bot.running ? (waitingFunds ? "等待资金" : "运行中") : "未运行",
+    label: bot.running ? (waitingFunds ? "等待资金" : (partialFunding ? "部分可买" : "运行中")) : "未运行",
     tone: bot.running && !waitingFunds ? "good" : "warn",
-    message: waitingFunds ? fundingMessage(status.wallet) : bot.message
+    message: waitingFunds || partialFunding ? wallet.message : bot.message
   };
 }
 
 function normalizeWallet(wallet) {
   if (!wallet) return null;
+  const executableMarketCount = Number(wallet.executableMarketCount ?? 0);
+  const hasExecutableFunds = Boolean((wallet.balanceReady || executableMarketCount > 0) && wallet.bnbReady);
+  const partial = Boolean(wallet.partialFunding);
+  const state = hasExecutableFunds ? (partial ? "partial" : "all") : "blocked";
+  const label = state === "all" ? "全部可买" : (state === "partial" ? "部分可买" : "不可买");
   return {
     busdt: money(wallet.busdtBalance),
     bnb: Number(wallet.bnbBalance ?? 0).toFixed(6),
-    ready: Boolean(wallet.balanceReady && wallet.bnbReady),
+    ready: hasExecutableFunds,
+    partial,
+    state,
+    label,
+    tone: state === "blocked" ? "warn" : "good",
+    executableMarketCount,
+    unfundedMarketCount: Number(wallet.unfundedMarketCount ?? 0),
     message: fundingMessage(wallet)
   };
 }
 
 function fundingMessage(wallet) {
   if (!wallet) return "";
-  if (wallet.balanceReady && wallet.bnbReady) return "资金够";
-  const missing = Math.max(0, Number(wallet.requiredBusdt ?? 0) - Number(wallet.busdtBalance ?? 0));
-  if (missing > 0) return `差 ${money(missing)} U`;
+  if ((wallet.balanceReady || wallet.executableMarketCount > 0) && wallet.bnbReady) {
+    if (wallet.partialFunding) {
+      const executable = Number(wallet.executableMarketCount ?? 0);
+      const total = executable + Number(wallet.unfundedMarketCount ?? 0);
+      const missing = money(Math.max(0, Number(wallet.requiredBusdt ?? 0) - Number(wallet.busdtBalance ?? 0)));
+      return total > 0 ? `可买 ${executable}/${total} 场，全买还差 ${missing} U` : `部分可买，全买还差 ${missing} U`;
+    }
+    return "当前可买";
+  }
+  const missing = Math.max(0, Number(wallet.minimumExecutableBusdt ?? wallet.requiredBusdt ?? 0) - Number(wallet.busdtBalance ?? 0));
+  if (missing > 0) return `至少差 ${money(missing)} U`;
   return "需要补 BNB";
 }
 
@@ -185,70 +289,152 @@ function normalizeNext(status) {
   const next = markets[0] ?? null;
   return {
     count: markets.length,
-    items: markets.slice(0, 6).map((market) => ({
-      title: market.question,
-      startsAt: market.startDate,
-      stake: money(market.totalStakeUsdt),
-      choices: market.outcomeCount,
-      ready: Boolean(market.prepared)
-    })),
+    items: markets.slice(0, 20).map((market) => normalizeQueueMarket(market)),
     first: next ? {
       title: next.question,
       startsAt: next.startDate,
+      endsAt: next.endDate,
+      duration: next.durationText || durationText(next),
       stake: money(next.totalStakeUsdt),
       choices: next.outcomeCount,
+      fundingState: next.fundingState,
       ready: Boolean(next.prepared)
     } : null
   };
 }
 
+function normalizeQueueMarket(market) {
+  return {
+    title: market.question,
+    address: market.address,
+    startsAt: market.startDate,
+    endsAt: market.endDate,
+    duration: market.durationText || durationText(market),
+    stake: money(market.totalStakeUsdt),
+    choices: market.outcomeCount,
+    fundingState: market.fundingState ?? "future",
+    state: queueMarketState(market),
+    ready: Boolean(market.prepared)
+  };
+}
+
+function queueMarketState(market) {
+  if (market.fundingState === "funded") return "待买";
+  if (market.fundingState === "insufficient-funds") return "资金不足";
+  return market.prepared ? "已准备" : "待准备";
+}
+
 function normalizeNewMarkets(markets, status, walletRows, localRows) {
   const cfg = readConfig();
   const openWindowSeconds = Number(status.watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 60);
-  const bought = boughtMarketSet(walletRows, localRows);
+  const bought = boughtMarketSummary(walletRows, localRows);
   const skipped = skippedMarketSet(localRows);
   const future = new Map((status.future ?? []).map((market) => [normAddress(market.address), market]));
   const rows = [];
   let excluded = 0;
+  const plannedChoices = Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5);
+  const plannedStakePerOutcome = Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5);
 
   for (const market of markets) {
-    if (isPriceMarket(market, cfg)) {
-      excluded += 1;
-      continue;
-    }
-    if (!isEventMarket(market, cfg)) continue;
+    const decision = getEventMarketDecision(market, cfg);
+    if (!decision.eligible && !["short-duration", "missing-time", "price-market"].includes(decision.reason)) continue;
     const key = normAddress(market.address);
     const pending = future.get(key);
+    if (!decision.eligible) excluded += 1;
+    const state = marketState(market, { bought, skipped, pending, openWindowSeconds, decision });
+    const boughtInfo = bought.get(key);
+    const choices = state === "已买" && boughtInfo?.outcomeCount > 0
+      ? boughtInfo.outcomeCount
+      : Math.min(plannedChoices, market.outcomes?.length ?? 0);
+    const plannedStake = plannedStakePerOutcome * Math.min(plannedChoices, market.outcomes?.length ?? 0);
+    const stake = state === "已买" && boughtInfo?.amount > 0 ? boughtInfo.amount : plannedStake;
     rows.push({
       title: market.question,
+      address: market.address,
       category: firstCategory(market),
+      createdAt: market.createdAt,
       startsAt: market.startDate,
-      choices: Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), market.outcomes?.length ?? 0),
-      stake: money(Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5) *
-        Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), market.outcomes?.length ?? 0)),
-      state: marketState(market, { bought, skipped, pending, openWindowSeconds }),
-      tone: marketTone(market, { bought, skipped, pending, openWindowSeconds })
+      endsAt: market.endDate,
+      timeGroup: marketTimeGroup(market),
+      duration: durationText(market),
+      tags: marketTags(market, decision, pending, cfg),
+      filterReason: decision.eligible ? "" : decision.reasonText,
+      choices,
+      stake: money(stake),
+      stakeValue: stake,
+      state,
+      tone: marketTone(state),
+      eligible: decision.eligible
     });
   }
 
   return {
     count: rows.length,
     excluded,
-    items: rows.slice(0, 8)
+    items: rows
+      .sort(compareDashboardMarketRows)
+      .slice(0, Number(process.env.DASHBOARD_MARKET_ROWS ?? 80))
   };
 }
 
-function boughtMarketSet(walletRows, localRows) {
-  const set = new Set();
+function boughtMarketSummary(walletRows, localRows) {
+  const chain = new Map();
+  const local = new Map();
   for (const row of walletRows) {
     if (String(row.type ?? "").toUpperCase() === "MINT" && row.marketAddress) {
-      set.add(normAddress(row.marketAddress));
+      const item = ensureBoughtSummary(chain, row.marketAddress);
+      item.amount += num(row.collateral);
+      if (row.tokenId !== undefined && row.tokenId !== null) item.outcomes.add(String(row.tokenId));
+      const tx = normHash(row.transactionHash ?? row.tx);
+      if (tx) item.txs.add(tx);
     }
   }
   for (const row of localRows) {
-    if (row.label === "买入成功" && row.market) set.add(normAddress(row.market));
+    if (!["买入成功", "等待确认"].includes(row.label) || !row.market) continue;
+    const item = ensureBoughtSummary(local, row.market);
+    const tx = normHash(row.tx);
+    const entryKey = tx || `${row.label}:${row.at}:${row.amount}`;
+    const entry = item.entries.get(entryKey) ?? { tx, amount: 0, confirmed: false };
+    entry.amount = Math.max(entry.amount, parseUsdtAmount(row.amount));
+    entry.confirmed = entry.confirmed || row.label === "买入成功";
+    item.entries.set(entryKey, entry);
+    item.outcomeCount = Math.max(item.outcomeCount, Number(row.outcomeCount ?? 0));
   }
-  return set;
+  const result = new Map();
+  for (const key of new Set([...chain.keys(), ...local.keys()])) {
+    const chainItem = chain.get(key);
+    const localItem = local.get(key);
+    const chainAmount = chainItem?.amount ?? 0;
+    const localAmount = [...(localItem?.entries.values() ?? [])].reduce((total, entry) => {
+      if (entry.confirmed || (entry.tx && chainItem?.txs.has(entry.tx))) return total + entry.amount;
+      return total;
+    }, 0);
+    if (chainAmount <= 0 && localAmount <= 0) continue;
+    result.set(key, {
+      amount: localAmount > 0 ? localAmount : chainAmount,
+      outcomeCount: chainItem?.outcomes.size || localItem?.outcomeCount || 0
+    });
+  }
+  return result;
+}
+
+function ensureBoughtSummary(map, market) {
+  const key = normAddress(market);
+  if (!map.has(key)) {
+    map.set(key, {
+      amount: 0,
+      outcomes: new Set(),
+      txs: new Set(),
+      entries: new Map(),
+      outcomeCount: 0
+    });
+  }
+  return map.get(key);
+}
+
+function parseUsdtAmount(value) {
+  const parsed = String(value ?? "").match(/-?\d+(?:\.\d+)?/u)?.[0];
+  return num(parsed);
 }
 
 function skippedMarketSet(localRows) {
@@ -259,10 +445,13 @@ function skippedMarketSet(localRows) {
   return set;
 }
 
-function marketState(market, { bought, skipped, pending, openWindowSeconds }) {
+function marketState(market, { bought, skipped, pending, openWindowSeconds, decision }) {
   const key = normAddress(market.address);
   if (bought.has(key)) return "已买";
   if (skipped.has(key)) return "已跳过";
+  if (!decision?.eligible) return "已过滤";
+  if (pending?.fundingState === "funded") return "待买";
+  if (pending?.fundingState === "insufficient-funds") return "资金不足";
   if (pending) return pending.prepared ? "已准备" : "待准备";
   const ageMs = Date.now() - new Date(market.startDate).getTime();
   if (!Number.isFinite(ageMs)) return "观察";
@@ -271,20 +460,97 @@ function marketState(market, { bought, skipped, pending, openWindowSeconds }) {
   return "已错过";
 }
 
-function marketTone(market, context) {
-  const state = marketState(market, context);
-  if (state === "已买" || state === "已准备") return "good";
-  if (state === "窗口内" || state === "待准备") return "warn";
+function marketTone(state) {
+  if (state === "已买" || state === "已准备" || state === "待买") return "good";
+  if (state === "窗口内" || state === "待准备" || state === "资金不足") return "warn";
   if (state === "已错过") return "bad";
   return "neutral";
+}
+
+function marketTags(market, decision, pending, cfg) {
+  const tags = [];
+  if (decision.reason === "short-duration") tags.push(`短于${minDurationLabel(cfg)}`);
+  if (decision.reason === "missing-time") tags.push("缺少时间");
+  if (decision.reason === "price-market" || isPriceMarket(market, cfg)) tags.push("Price");
+  if (decision.eligible) tags.push("符合买入");
+  if (pending?.fundingState === "funded") tags.push("当前可买");
+  if (pending?.fundingState === "insufficient-funds") tags.push("资金不足");
+  const category = firstCategory(market);
+  if (category) tags.push(category);
+  return [...new Set(tags)];
+}
+
+function minDurationLabel(cfg) {
+  const hours = Number(cfg.minEventDurationHours ?? 0);
+  if (!Number.isFinite(hours) || hours <= 0) return "";
+  if (hours % 24 === 0 && hours > 72) return `${hours / 24}天`;
+  return `${roundDisplay(hours, 0)}h`;
+}
+
+function compareDashboardMarketRows(a, b) {
+  const groupDelta = marketTimeGroupRank(a.timeGroup) - marketTimeGroupRank(b.timeGroup);
+  if (groupDelta !== 0) return groupDelta;
+
+  const startDelta = a.timeGroup === "future"
+    ? safeTime(a.startsAt) - safeTime(b.startsAt)
+    : safeTime(b.startsAt) - safeTime(a.startsAt);
+  if (startDelta !== 0) return startDelta;
+
+  const stateRank = {
+    "待买": 0,
+    "已准备": 1,
+    "待准备": 2,
+    "资金不足": 3,
+    "窗口内": 4,
+    "已过滤": 5,
+    "已买": 6,
+    "已跳过": 7,
+    "已错过": 8
+  };
+  const rankDelta = (stateRank[a.state] ?? 9) - (stateRank[b.state] ?? 9);
+  if (rankDelta !== 0) return rankDelta;
+  return safeTime(b.createdAt) - safeTime(a.createdAt);
+}
+
+function marketTimeGroup(market) {
+  const startsAt = safeTime(market?.startDate ?? market?.startsAt);
+  if (!startsAt) return "unknown";
+  return startsAt > Date.now() ? "future" : "past";
+}
+
+function marketTimeGroupRank(group) {
+  if (group === "past") return 0;
+  if (group === "future") return 1;
+  return 2;
+}
+
+function safeTime(value) {
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : 0;
 }
 
 function firstCategory(market) {
   return market.categories?.find((item) => item !== "Price") ?? market.tags?.[0] ?? "";
 }
 
-function normalizeHoldings(raw) {
+function durationText(market) {
+  const duration = eventDurationMs(market);
+  if (!Number.isFinite(duration) || duration <= 0) return "--";
+  const hours = duration / 3600000;
+  if (hours >= 24) {
+    const days = hours / 24;
+    return `${roundDisplay(days, days >= 10 ? 0 : 1)} 天`;
+  }
+  return `${roundDisplay(hours, 1)} 小时`;
+}
+
+function roundDisplay(value, decimals = 2) {
+  return Number(value).toFixed(decimals).replace(/\.0+$|(\.\d*?)0+$/u, "$1");
+}
+
+function normalizeHoldings(raw, activityRows = []) {
   const rows = raw.positions ?? [];
+  const ledger = buildTradeLedger(activityRows);
   const groups = new Map();
   for (const row of rows) {
     const key = row.marketAddress;
@@ -292,52 +558,123 @@ function normalizeHoldings(raw) {
       groups.set(key, {
         market: row.marketAddress,
         title: row.question,
-        cost: 0,
+        invested: 0,
+        remainingCost: 0,
+        sold: 0,
         value: 0,
-        pnl: 0,
+        realized: 0,
+        unrealized: 0,
+        totalPnl: 0,
         items: []
       });
     }
     const group = groups.get(key);
-    group.cost += Number(row.costBasisUsdt ?? 0);
-    group.value += Number(row.markValueUsdt ?? 0);
-    group.pnl += Number(row.cashPnlUsdt ?? 0);
+    const trade = ledger.outcomes.get(outcomeLedgerKey(row.marketAddress, row.tokenId));
+    const remainingCost = num(row.costBasisUsdt);
+    const value = num(row.markValueUsdt);
+    const unrealized = num(row.cashPnlUsdt);
+    const invested = trade?.bought > 0 ? trade.bought : remainingCost;
+    const sold = trade?.sold ?? 0;
+    const realized = trade?.realized ?? num(row.realizedPnlUsdt);
+    const totalPnl = realized + unrealized;
+    group.invested += invested;
+    group.remainingCost += remainingCost;
+    group.sold += sold;
+    group.value += value;
+    group.realized += realized;
+    group.unrealized += unrealized;
+    group.totalPnl += totalPnl;
     group.items.push({
       market: row.marketAddress,
       tokenId: row.tokenId,
       title: row.question,
       outcome: row.outcome,
+      chips: chips(row.size),
       buyPrice: price(row.avgPrice),
       nowPrice: price(row.curPrice),
-      cost: money(row.costBasisUsdt),
-      value: money(row.markValueUsdt),
-      pnl: money(row.cashPnlUsdt, { sign: true }),
-      pnlPct: pct(row.percentPnl),
-      positive: Number(row.cashPnlUsdt ?? 0) >= 0,
+      cost: money(invested),
+      remainingCost: money(remainingCost),
+      sold: money(sold),
+      value: money(value),
+      realized: money(realized, { sign: true }),
+      unrealized: money(unrealized, { sign: true }),
+      pnl: money(totalPnl, { sign: true }),
+      pnlPct: pct(invested > 0 ? (totalPnl / invested) * 100 : 0),
+      positive: totalPnl >= 0,
       sellable: !row.isFinalized
     });
   }
+  const finalizedGroups = [...groups.values()].map((group) => finalizeHoldingGroup(group, ledger));
+  const totals = finalizedGroups.reduce((acc, group) => {
+    acc.invested += group.invested;
+    acc.remainingCost += group.remainingCost;
+    acc.sold += group.sold;
+    acc.value += group.value;
+    acc.realized += group.realized;
+    acc.unrealized += group.unrealized;
+    acc.totalPnl += group.totalPnl;
+    return acc;
+  }, {
+    invested: 0,
+    remainingCost: 0,
+    sold: 0,
+    value: 0,
+    realized: 0,
+    unrealized: 0,
+    totalPnl: 0
+  });
   return {
     count: rows.length,
     totals: {
-      cost: money(raw.totals?.costBasisUsdt),
-      value: money(raw.totals?.markValueUsdt),
-      pnl: money(raw.totals?.cashPnlUsdt, { sign: true }),
-      positive: Number(raw.totals?.cashPnlUsdt ?? 0) >= 0
+      cost: money(totals.invested),
+      remainingCost: money(totals.remainingCost),
+      sold: money(totals.sold),
+      value: money(totals.value),
+      realized: money(totals.realized, { sign: true }),
+      unrealized: money(totals.unrealized, { sign: true }),
+      pnl: money(totals.totalPnl, { sign: true }),
+      positive: totals.totalPnl >= 0
     },
-    groups: [...groups.values()].map((group) => ({
-      ...group,
-      cost: money(group.cost),
-      value: money(group.value),
-      pnl: money(group.pnl, { sign: true }),
-      positive: group.pnl >= 0
-    }))
+    groups: finalizedGroups.map(formatHoldingGroup)
+  };
+}
+
+function finalizeHoldingGroup(group, ledger) {
+  const marketTrade = ledger.markets.get(normAddress(group.market));
+  const invested = marketTrade?.bought > 0 ? marketTrade.bought : group.invested;
+  const sold = marketTrade?.sold ?? group.sold;
+  const realized = marketTrade ? marketTrade.realized : group.realized;
+  const totalPnl = realized + group.unrealized;
+  return {
+    ...group,
+    invested,
+    sold,
+    realized,
+    totalPnl
+  };
+}
+
+function formatHoldingGroup(group) {
+  const sellableCount = group.items.filter((item) => item.sellable).length;
+  return {
+    ...group,
+    cost: money(group.invested),
+    remainingCost: money(group.remainingCost),
+    sold: money(group.sold),
+    value: money(group.value),
+    realized: money(group.realized, { sign: true }),
+    unrealized: money(group.unrealized, { sign: true }),
+    pnl: money(group.totalPnl, { sign: true }),
+    positive: group.totalPnl >= 0,
+    sellable: sellableCount > 0,
+    sellableCount
   };
 }
 
 function buildAnalytics(rawPositions, activityRows) {
   const positions = rawPositions.positions ?? [];
   const projects = new Map();
+  const ledger = buildTradeLedger(activityRows);
   const totals = {
     bought: 0,
     sold: 0,
@@ -360,26 +697,20 @@ function buildAnalytics(rawPositions, activityRows) {
     totals.openPnl += openPnl;
   }
 
-  for (const row of activityRows) {
-    const type = String(row.type ?? "").toUpperCase();
-    if (type !== "MINT" && type !== "REDEEM") continue;
-    const project = getProject(projects, row.marketAddress, row.title);
-    const collateral = num(row.collateral);
-    const realized = num(row.realizedPnlDelta);
-    if (type === "MINT") {
-      project.bought += collateral;
-      totals.bought += collateral;
-    } else {
-      project.sold += collateral;
-      project.realized += realized;
-      totals.sold += collateral;
-      totals.realized += realized;
-    }
+  for (const trade of ledger.markets.values()) {
+    const project = getProject(projects, trade.marketAddress, trade.title);
+    project.bought += trade.bought;
+    project.sold += trade.sold;
+    project.realized += trade.realized;
+    totals.bought += trade.bought;
+    totals.sold += trade.sold;
+    totals.realized += trade.realized;
   }
 
   const totalPnl = totals.realized + totals.openPnl;
-  const totalCost = estimatedTotalCost(totals.sold, totals.realized, totals.openCost, totals.bought);
+  const invested = totals.bought > 0 ? totals.bought : totals.openCost;
   const cards = {
+    invested: money(invested),
     openCost: money(totals.openCost),
     openValue: money(totals.openValue),
     openPnl: money(totals.openPnl, { sign: true }),
@@ -387,9 +718,12 @@ function buildAnalytics(rawPositions, activityRows) {
     totalBought: money(totals.bought),
     totalSold: money(totals.sold),
     realizedPnl: money(totals.realized, { sign: true }),
+    unrealizedPnl: money(totals.openPnl, { sign: true }),
     totalPnl: money(totalPnl, { sign: true }),
     totalPositive: totalPnl >= 0,
-    totalRoi: pct(totalCost > 0 ? (totalPnl / totalCost) * 100 : 0)
+    realizedPositive: totals.realized >= 0,
+    unrealizedPositive: totals.openPnl >= 0,
+    totalRoi: pct(invested > 0 ? (totalPnl / invested) * 100 : 0)
   };
 
   return {
@@ -421,35 +755,89 @@ function getProject(projects, key, title) {
 
 function normalizeProject(project) {
   const pnl = project.realized + project.openPnl;
-  const totalCost = estimatedTotalCost(project.sold, project.realized, project.openCost, project.bought);
+  const invested = project.bought > 0 ? project.bought : project.openCost;
   return {
     title: project.title,
     bought: money(project.bought),
     sold: money(project.sold),
     openCost: money(project.openCost),
     openValue: money(project.openValue),
+    realized: money(project.realized, { sign: true }),
+    unrealized: money(project.openPnl, { sign: true }),
     pnl: money(pnl, { sign: true }),
     pnlValue: pnl,
     positive: pnl >= 0,
-    roi: pct(totalCost > 0 ? (pnl / totalCost) * 100 : 0)
+    realizedPositive: project.realized >= 0,
+    unrealizedPositive: project.openPnl >= 0,
+    roi: pct(invested > 0 ? (pnl / invested) * 100 : 0)
   };
 }
 
-function estimatedTotalCost(sold, realized, openCost, bought) {
-  const closedCost = Math.max(0, sold - realized);
-  const basis = closedCost + openCost;
-  return basis > 0 ? basis : bought;
+function buildTradeLedger(activityRows = []) {
+  const markets = new Map();
+  const outcomes = new Map();
+  for (const row of activityRows) {
+    const type = String(row.type ?? "").toUpperCase();
+    if (type !== "MINT" && type !== "REDEEM") continue;
+    const marketKey = normAddress(row.marketAddress ?? row.market);
+    if (!marketKey) continue;
+    const market = ensureTradeRecord(markets, marketKey, {
+      marketAddress: row.marketAddress,
+      title: row.title
+    });
+    const outcomeKey = outcomeLedgerKey(row.marketAddress, row.tokenId);
+    const outcome = ensureTradeRecord(outcomes, outcomeKey, {
+      marketAddress: row.marketAddress,
+      title: row.title,
+      tokenId: row.tokenId,
+      outcome: row.outcome
+    });
+    const collateral = num(row.collateral);
+    const realized = num(row.realizedPnlDelta);
+    if (type === "MINT") {
+      market.bought += collateral;
+      outcome.bought += collateral;
+    } else {
+      market.sold += collateral;
+      market.realized += realized;
+      outcome.sold += collateral;
+      outcome.realized += realized;
+    }
+  }
+  return { markets, outcomes };
+}
+
+function ensureTradeRecord(map, key, initial = {}) {
+  if (!map.has(key)) {
+    map.set(key, {
+      ...initial,
+      bought: 0,
+      sold: 0,
+      realized: 0
+    });
+  }
+  const record = map.get(key);
+  if (!record.title && initial.title) record.title = initial.title;
+  if (!record.outcome && initial.outcome) record.outcome = initial.outcome;
+  return record;
+}
+
+function outcomeLedgerKey(market, tokenId) {
+  return `${normAddress(market)}:${String(tokenId ?? "")}`;
 }
 
 function normalizeSellQuote(result) {
-  const item = result.positions?.[0];
+  const positions = result.positions ?? [];
+  const item = positions[0];
   const quote = item?.quote ?? {};
+  const isAll = positions.length > 1;
   return {
     title: item?.question ?? "持仓",
-    outcome: item?.outcome ?? "",
-    balanceOt: money(quote.balanceOt),
-    sellAmountOt: money(quote.sellAmountOt),
+    outcome: isAll ? `${positions.length} 个选项` : item?.outcome ?? "",
+    balanceOt: isAll ? "" : money(quote.balanceOt),
+    sellAmountOt: isAll ? "" : money(quote.sellAmountOt),
     percent: quote.percent ?? null,
+    positionCount: positions.length,
     expected: money(result.totals?.expectedCollateralToUserUsdt),
     minimum: money(result.totals?.minCollateralOutUsdt),
     fee: money(result.totals?.collateralToIntegratorUsdt),
@@ -458,13 +846,22 @@ function normalizeSellQuote(result) {
 }
 
 function normalizeSellExecution(result) {
-  const item = result.positions?.[0];
-  const execution = result.executions?.[0] ?? {};
+  const positions = result.positions ?? [];
+  const executions = result.executions ?? [];
+  const item = positions[0];
+  const execution = executions[0] ?? {};
+  const successCount = executions.filter((row) => row.status === "success" || row.txHash).length;
   return {
-    status: execution.status === "success" || execution.txHash ? "已提交" : "已处理",
+    status: successCount > 0 ? "已提交" : "已处理",
     title: item?.question ?? "持仓",
-    outcome: item?.outcome ?? "",
-    receivedText: money(result.totals?.expectedCollateralToUserUsdt)
+    outcome: positions.length > 1 ? `${positions.length} 个选项` : item?.outcome ?? "",
+    receivedText: money(result.totals?.expectedCollateralToUserUsdt),
+    txHash: execution.txHash ?? null,
+    txHashes: executions.map((row) => row.txHash).filter(Boolean),
+    operatorApprovalHash: execution.operatorApprovalHash ?? null,
+    blockNumber: execution.blockNumber ?? null,
+    market: execution.market ?? item?.marketAddress ?? null,
+    tokenId: execution.tokenId ?? item?.tokenId ?? null
   };
 }
 
@@ -551,7 +948,7 @@ function activityAmount(value) {
 
 function readRecentActivity() {
   const rows = [];
-  for (const row of readJsonl(fillsFile, 120)) {
+  for (const row of readJsonl(fillsFile, Number(process.env.DASHBOARD_FILL_HISTORY_LIMIT ?? 2000))) {
     if (row.level === "event-skip-open-window") {
       rows.push({ at: row.at, label: "已跳过", title: row.question, market: row.market, amount: "" });
       continue;
@@ -566,6 +963,7 @@ function readRecentActivity() {
         label: row.status === "success" ? "买入成功" : "未成交",
         title: row.context?.question ?? "交易",
         market: row.context?.market,
+        tx: row.txHash,
         amount: ""
       });
       continue;
@@ -576,15 +974,40 @@ function readRecentActivity() {
         label: row.result.status === "success" ? "买入成功" : "等待确认",
         title: row.plan.market?.question,
         market: row.plan.market?.address,
+        tx: row.result.txHash,
+        outcomeCount: row.plan.outcomes?.length,
         amount: row.plan.totalStakeUsdt ? `${money(row.plan.totalStakeUsdt)} U` : ""
+      });
+      continue;
+    }
+    if (row.bundle && row.result && !row.result.dryRun) {
+      rows.push({
+        at: row.at,
+        label: row.result.status === "success" ? "买入成功" : "等待确认",
+        title: `${row.bundle.marketCount ?? row.result.marketCount ?? 0} 场批量买入`,
+        tx: row.result.txHash,
+        amount: row.bundle.totalStakeUsdt ? `${money(row.bundle.totalStakeUsdt)} U` : ""
+      });
+      continue;
+    }
+    if (row.level === "event-auto-sell") {
+      const actions = Array.isArray(row.actions) ? row.actions : (row.action ? [row.action] : []);
+      const first = actions[0] ?? {};
+      rows.push({
+        at: row.at,
+        label: "自动卖出",
+        title: [first.question ?? "持仓", actions.length > 1 ? `${actions.length} 个选项` : first.outcome].filter(Boolean).join(" / "),
+        tx: row.execution?.txHash,
+        amount: actions.length > 1 ? `${actions.length} 个选项` : first.sellAmountOt ?? first.percent ?? ""
       });
     }
   }
   for (const row of readJsonl(actionsFile, 80)) {
     rows.push({
       at: row.at,
-      label: row.type === "sell" ? "卖出" : "操作",
+      label: row.type === "sell" ? (row.source === "manual-dashboard" ? "手动卖出" : "卖出") : "操作",
       title: [row.question, row.outcome].filter(Boolean).join(" / "),
+      tx: row.txHash,
       amount: row.amount
     });
   }
@@ -644,11 +1067,11 @@ async function fetchNewMarketsFeed() {
   try {
     const cfg = readConfig();
     return await fetchMarkets(cfg, {
-      status: "live",
+      status: "all",
       topic: "",
-      order: "start_timestamp",
+      order: "created_at",
       ascending: false,
-      limit: Number(process.env.DASHBOARD_NEW_MARKETS_LIMIT ?? 24)
+      limit: Number(process.env.DASHBOARD_NEW_MARKETS_LIMIT ?? 500)
     });
   } catch {
     return [];
@@ -792,6 +1215,14 @@ function price(value) {
   return num.toFixed(2).replace(/\.?0+$/, "");
 }
 
+function chips(value) {
+  const num = Number(value ?? 0);
+  if (!Number.isFinite(num) || num <= 0) return "0";
+  if (num >= 1000) return num.toFixed(0);
+  if (num >= 10) return num.toFixed(2).replace(/\.?0+$/, "");
+  return num.toFixed(4).replace(/\.?0+$/, "");
+}
+
 function pct(value) {
   const num = Number(value ?? 0);
   const prefix = num > 0 ? "+" : "";
@@ -805,6 +1236,10 @@ function num(value) {
 
 function normAddress(value) {
   return String(value ?? "").toLowerCase();
+}
+
+function normHash(value) {
+  return value ? String(value).toLowerCase() : "";
 }
 
 function cleanError(error) {
