@@ -22,6 +22,7 @@ import {
   describeFastBundlePlan,
   describeEventPlan,
   describeSellPlan,
+  ensureMarketOperatorApproval,
   executeFastBuyBundle,
   estimateFastGasReserve,
   estimateMaxSelectedOutcomeCount,
@@ -59,6 +60,9 @@ const PUBLIC_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5
 const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const alertCooldowns = new Map();
 const marketDecisionDedupe = new Set();
+const WILL_BUY_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const SELL_BATCH_BASE_GAS = 1_500_000;
+const SELL_BATCH_PER_OUTCOME_GAS = 1_000_000;
 
 async function main() {
   const [command = "scan", ...rest] = process.argv.slice(2);
@@ -533,6 +537,13 @@ async function status(cfg, args) {
       autoSellStopLossPercent: cfg.autoSellStopLossPercent,
       autoSellStopLossSellPercent: cfg.autoSellStopLossSellPercent,
       autoSellPollMs: cfg.autoSellPollMs,
+      autoSellBuyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
+      autoSellBuyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
+      autoSellPreapproveOperator: cfg.autoSellPreapproveOperator,
+      autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
+      autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
+      autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+      autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
       minEventDurationHours: cfg.minEventDurationHours,
@@ -543,6 +554,11 @@ async function status(cfg, args) {
       preSignFastTx: cfg.preSignFastTx,
       preSignWindowMs: cfg.preSignWindowMs,
       preSignRetryMs: cfg.preSignRetryMs,
+      allowPreopenBroadcast: cfg.allowPreopenBroadcast,
+      prebroadcastMs: cfg.prebroadcastMs,
+      openBroadcastDelayMs: cfg.openBroadcastDelayMs,
+      openBroadcastScheduleAheadMs: cfg.openBroadcastScheduleAheadMs,
+      openBroadcastSpinMs: cfg.openBroadcastSpinMs,
       nonceSyncBeforePreSign: cfg.nonceSyncBeforePreSign,
       nonceSyncMinIntervalMs: cfg.nonceSyncMinIntervalMs,
       asyncReceiptWatch: cfg.asyncReceiptWatch,
@@ -567,7 +583,14 @@ async function status(cfg, args) {
       autoSellStopLossEnabled: cfg.autoSellStopLossEnabled,
       autoSellStopLossPercent: cfg.autoSellStopLossPercent,
       autoSellStopLossSellPercent: cfg.autoSellStopLossSellPercent,
-      autoSellPollMs: cfg.autoSellPollMs
+      autoSellPollMs: cfg.autoSellPollMs,
+      autoSellBuyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
+      autoSellBuyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
+      autoSellPreapproveOperator: cfg.autoSellPreapproveOperator,
+      autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
+      autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
+      autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+      autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick
     },
     live: {
       count: liveMarkets.length,
@@ -765,12 +788,22 @@ async function presignTest(cfg, args) {
   const { chain, batch, startDate, testCfg, runtime, records } = await buildPresignTestRecords(cfg, args);
 
   const signStart = performance.now();
-  await attachPreSignedFastBundleTransaction(testCfg, records, runtime);
+  const preSignMode = records.length > 1 ? "bundle" : "single";
+  if (preSignMode === "bundle") {
+    await attachPreSignedFastBundleTransaction(testCfg, records, runtime);
+  } else {
+    await attachPreSignedFastTransaction(testCfg, records[0], runtime);
+  }
   const signMs = performance.now() - signStart;
   const cachedStart = performance.now();
-  const cachedBundle = reusablePreSignedBundle(records);
+  const cachedBundle = preSignMode === "bundle" ? reusablePreSignedBundle(records) : null;
   const cachedLookupMs = performance.now() - cachedStart;
-  const signed = records[0]?.preSignedFastBundleTransaction ?? null;
+  const signed = preSignMode === "bundle"
+    ? records[0]?.preSignedFastBundleTransaction ?? null
+    : records[0]?.preSignedFastTransaction ?? null;
+  if (!signed || (preSignMode === "bundle" && !cachedBundle)) {
+    throw new Error(`Pre-sign test expected a reusable pre-signed ${preSignMode} transaction`);
+  }
 
   console.log(JSON.stringify({
     level: "event-presign-test",
@@ -798,18 +831,21 @@ async function presignTest(cfg, args) {
     prebuiltRecordCount: records.filter((record) => record.prebuiltCalldata).length,
     signed: signed
       ? {
+          mode: preSignMode,
           txHash: signed.txHash,
           nonce: signed.nonce,
           rawLength: signed.serializedTransaction.length,
-          marketCount: signed.marketCount,
-          outcomeCount: signed.outcomeCount
+          marketCount: signed.marketCount ?? records.length,
+          outcomeCount: signed.outcomeCount ?? batchSelectedOutcomeCount(batch, testCfg)
         }
       : null,
     cache: {
-      reusable: Boolean(cachedBundle),
-      sameTxHash: Boolean(cachedBundle && signed && cachedBundle.preSignedFastBundleTransaction.txHash === signed.txHash),
-      marketCount: cachedBundle?.marketCount ?? null,
-      outcomeCount: cachedBundle?.outcomeCount ?? null
+      reusable: preSignMode === "bundle" ? Boolean(cachedBundle) : Boolean(signed),
+      sameTxHash: preSignMode === "bundle"
+        ? Boolean(cachedBundle && signed && cachedBundle.preSignedFastBundleTransaction.txHash === signed.txHash)
+        : Boolean(signed),
+      marketCount: cachedBundle?.marketCount ?? records.length,
+      outcomeCount: cachedBundle?.outcomeCount ?? batchSelectedOutcomeCount(batch, testCfg)
     },
     runtime: {
       startNonce: 1000,
@@ -824,9 +860,17 @@ async function presignTest(cfg, args) {
 
 async function dueTest(cfg, args) {
   const { chain, batch, startDate, testCfg, runtime, records } = await buildPresignTestRecords(cfg, args);
-  await attachPreSignedFastBundleTransaction(testCfg, records, runtime);
-  const cachedBundle = reusablePreSignedBundle(records);
-  if (!cachedBundle) throw new Error("Due test expected a reusable pre-signed bundle");
+  const preSignMode = records.length > 1 ? "bundle" : "single";
+  if (preSignMode === "bundle") {
+    await attachPreSignedFastBundleTransaction(testCfg, records, runtime);
+  } else {
+    await attachPreSignedFastTransaction(testCfg, records[0], runtime);
+  }
+  const cachedBundle = preSignMode === "bundle" ? reusablePreSignedBundle(records) : null;
+  const signed = preSignMode === "bundle"
+    ? cachedBundle?.preSignedFastBundleTransaction ?? null
+    : records[0]?.preSignedFastTransaction ?? null;
+  if (!signed) throw new Error(`Due test expected a reusable pre-signed ${preSignMode} transaction`);
 
   const dueCfg = {
     ...testCfg,
@@ -865,10 +909,11 @@ async function dueTest(cfg, args) {
       totalStakeUsdt: batchSelectedStakeUsdt(batch, dueCfg)
     },
     preSigned: {
-      txHash: cachedBundle.preSignedFastBundleTransaction.txHash,
-      nonce: cachedBundle.preSignedFastBundleTransaction.nonce,
-      marketCount: cachedBundle.marketCount,
-      outcomeCount: cachedBundle.outcomeCount
+      mode: preSignMode,
+      txHash: signed.txHash,
+      nonce: signed.nonce,
+      marketCount: cachedBundle?.marketCount ?? records.length,
+      outcomeCount: cachedBundle?.outcomeCount ?? batchSelectedOutcomeCount(batch, dueCfg)
     },
     duePath: {
       pendingRemaining: pending.size,
@@ -876,7 +921,7 @@ async function dueTest(cfg, args) {
       dryRun: dueCfg.dryRun,
       fillsFile: dueCfg.fillsFile,
       stateFile: dueCfg.stateFile,
-      usedCachedBundleBeforeDrain: true
+      usedCachedBundleBeforeDrain: Boolean(cachedBundle)
     },
     runtime: {
       startNonce: 1000,
@@ -991,13 +1036,13 @@ async function retryTest(cfg, args) {
     broadcast: executionMarksSeen({ status: "broadcast" }),
     reverted: executionMarksSeen({ status: "reverted" })
   };
-  if (!marks.dryRun || !marks.success || marks.broadcast || marks.reverted) {
+  if (!marks.dryRun || !marks.success || !marks.broadcast || marks.reverted) {
     throw new Error(`Retry test completion classifier failed: ${JSON.stringify(marks)}`);
   }
 
   console.log(JSON.stringify({
     level: "event-retry-test",
-    note: "offline retry classifier test only; no broadcast",
+    note: "offline retry classifier test only; broadcast is treated as submitted",
     chainLoad: {
       head: chain.head,
       fromBlock: chain.fromBlock
@@ -1089,8 +1134,8 @@ async function selfTest(cfg) {
     marketTagBlocklist: ["8 hour", "automated"],
     minEventDurationHours: 48,
     autoSellStrategy: "ladder",
-    autoSellStartDelaySeconds: 30,
-    autoSellIntervalSeconds: 15,
+    autoSellStartDelaySeconds: 10,
+    autoSellIntervalSeconds: 10,
     autoSellChunkPercent: 10,
     autoSellStopLossEnabled: true,
     autoSellStopLossPercent: 10,
@@ -1192,6 +1237,44 @@ async function selfTest(cfg) {
   assertSelfTest(!noAutoSellTrigger, `expected no auto-sell trigger, got ${JSON.stringify(noAutoSellTrigger)}`);
   passed.push("auto-sell disables take-profit and keeps 10% stop-loss");
 
+  const hotRuntime = {
+    pendingBuyRecords: new Map([
+      ["hot", { market: mockEventMarket({ startDate: new Date(Date.now() + 30000).toISOString() }) }]
+    ])
+  };
+  assertSelfTest(
+    runtimeBuyHotWindowInfo(testCfg, hotRuntime)?.reason === "buy-hot-window",
+    "auto-sell should detect the buy hot window before open"
+  );
+  const coldRuntime = {
+    pendingBuyRecords: new Map([
+      ["cold", { market: mockEventMarket({ startDate: new Date(Date.now() + 10 * 60000).toISOString() }) }]
+    ])
+  };
+  assertSelfTest(!runtimeBuyHotWindowInfo(testCfg, coldRuntime), "auto-sell should not block far-future openings");
+  const sampleSellEntries = Array.from({ length: 14 }, (_, index) => ({
+    item: {
+      plan: { market: `0x${String(index % 7).padStart(40, "0")}` },
+      marketAddress: `0x${String(index % 7).padStart(40, "0")}`
+    },
+    action: {}
+  }));
+  const sellChunks = chunkAutoSellItems(testCfg, sampleSellEntries);
+  assertSelfTest(
+    sellChunks.length > 1 &&
+      sellChunks.every((chunk) =>
+        chunk.length <= testCfg.autoSellMaxOutcomesPerTx &&
+        new Set(chunk.map((entry) => String(entry.item.plan.market).toLowerCase())).size <= testCfg.autoSellMaxMarketsPerTx &&
+        estimateAutoSellBatchGas(chunk.length) <= testCfg.autoSellMaxGasPerTx
+      ),
+    `auto-sell should chunk 14 outcomes into capped batches, got ${sellChunks.map((chunk) => chunk.length).join(",")}`
+  );
+  assertSelfTest(
+    isSuccessfulBuyFill({ result: { dryRun: false, status: "broadcast" }, plan: { market: { address: "0x0000000000000000000000000000000000000001" } } }),
+    "broadcast buy fills should make positions eligible for auto-sell monitoring"
+  );
+  passed.push("auto-sell buy guard, chunking, and broadcast eligibility are enforced");
+
   assertSelfTest(
     effectivePrebroadcastMs({ ...testCfg, prebroadcastMs: 750, allowPreopenBroadcast: false }) === 0,
     "pre-open broadcast must be disabled unless explicitly allowed"
@@ -1199,6 +1282,28 @@ async function selfTest(cfg) {
   assertSelfTest(
     effectivePrebroadcastMs({ ...testCfg, prebroadcastMs: 750, allowPreopenBroadcast: true }) === 750,
     "pre-open broadcast explicit opt-in should preserve configured lead time"
+  );
+  const fixedStart = "2030-01-01T00:00:00.000Z";
+  const fixedStartMs = Date.parse(fixedStart);
+  assertSelfTest(
+    marketActionTimeMs({ startDate: fixedStart }, { ...testCfg, allowPreopenBroadcast: false, openBroadcastDelayMs: 25 }) === fixedStartMs + 25,
+    "post-open action time should be start plus configured delay"
+  );
+  assertSelfTest(
+    marketActionTimeMs({ startDate: fixedStart }, { ...testCfg, allowPreopenBroadcast: true, prebroadcastMs: 750, openBroadcastDelayMs: 25 }) === fixedStartMs - 750,
+    "explicit pre-open action time should ignore post-open delay"
+  );
+  assertSelfTest(
+    isTerminalMinedFailure({ usedPreSignedTransaction: true, status: "reverted", blockNumber: "100" }),
+    "mined reverted pre-signed tx should be treated as terminal"
+  );
+  assertSelfTest(
+    !isTerminalMinedFailure({ usedPreSignedTransaction: true, status: "broadcast", blockNumber: null }),
+    "broadcast-only tx should not be treated as terminal"
+  );
+  assertSelfTest(
+    executionMarksSeen({ status: "broadcast" }),
+    "RPC-accepted broadcast should be treated as submitted"
   );
   passed.push("pre-open broadcast is opt-in after boundary-block revert");
 
@@ -1235,7 +1340,13 @@ async function selfTest(cfg) {
     `15-outcome bundle fast gas limit too low: ${bundleGasReserve.gasLimit}`
   );
   const walletBudgetGasLimit = resolveWalletBudgetGasLimit(
-    { ...testCfg, fastGasWalletBudget: true, fastGasWalletBudgetBps: 10000, fastGasBlockLimitBps: 10000 },
+    {
+      ...testCfg,
+      fastGasWalletBudget: true,
+      fastGasWalletBudgetBps: 10000,
+      fastGasBlockLimitBps: 10000,
+      fastGasTxLimit: 16777216
+    },
     {
       desiredGasLimit: 7000000n,
       walletBalance: 37_000_000_000_000_000n,
@@ -1244,10 +1355,18 @@ async function selfTest(cfg) {
     }
   );
   assertSelfTest(
-    walletBudgetGasLimit === 18_500_000n,
-    `wallet-budget gas limit should use available BNB, got ${walletBudgetGasLimit}`
+    walletBudgetGasLimit === 16_777_216n,
+    `wallet-budget gas limit should cap to BSC tx max, got ${walletBudgetGasLimit}`
   );
-  passed.push("fast gas limit uses wallet BNB budget for opening buys");
+  const fixedGasLimit = resolveWalletBudgetGasLimit(
+    { ...testCfg, fastGasWalletBudget: false, fastGasTxLimit: 16777216 },
+    { desiredGasLimit: 20_000_000n }
+  );
+  assertSelfTest(
+    fixedGasLimit === 16_777_216n,
+    `fixed fast gas limit should cap to BSC tx max, got ${fixedGasLimit}`
+  );
+  passed.push("fast gas limit uses wallet BNB budget capped by BSC tx max");
 
   const priceMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000044",
@@ -1376,6 +1495,10 @@ async function selfTest(cfg) {
   };
   assertSelfTest(reusablePreSignedBundle([preSignedRecordA, preSignedRecordB]), "matching pre-signed bundle should be reusable");
   assertSelfTest(!reusablePreSignedBundle([preSignedRecordA, changedRecord]), "changed pre-signed bundle should not be reusable");
+  assertSelfTest(
+    groupPreSignedBundleRecords([preSignedRecordA, preSignedRecordB]).length === 1,
+    "due path should isolate reusable pre-signed bundle records"
+  );
   passed.push("stale pre-signed bundles are not reused after market set changes");
 
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-self-test-"));
@@ -1474,9 +1597,6 @@ async function buildPresignTestRecords(cfg, args) {
   const startDate = args.startDate ?? futureMarkets[0]?.startDate;
   if (!startDate) throw new Error("No future Event Market found for pre-sign test");
   const startMs = new Date(startDate).getTime();
-  const batch = futureMarkets.filter((market) => new Date(market.startDate).getTime() === startMs);
-  if (batch.length <= 1) throw new Error(`Need at least 2 same-start Event Markets for bundle pre-sign test at ${startDate}`);
-
   const testCfg = {
     ...cfg,
     privateKey: PUBLIC_TEST_PRIVATE_KEY,
@@ -1485,8 +1605,16 @@ async function buildPresignTestRecords(cfg, args) {
     riskAck: "YES",
     eligibilityAck: "YES",
     eventBuyMode: "fast",
-    preSignFastTx: true
+    preSignFastTx: true,
+    fastGasWalletBudget: false
   };
+  const sameStartBatch = futureMarkets.filter((market) => new Date(market.startDate).getTime() === startMs);
+  const batch = selectBatchWithinStakeCap(sameStartBatch, testCfg);
+  if (batch.length === 0) {
+    throw new Error(
+      `No same-start Event Market fits MAX_BATCH_STAKE_USDT ${testCfg.maxBatchStakeUsdt} for pre-sign test at ${startDate}`
+    );
+  }
   const runtime = { receiverAddress: PUBLIC_TEST_RECEIVER, nextNonce: 1000 };
   const records = await Promise.all(batch.map((market) => preparePendingRecord(testCfg, market, runtime)));
   const prepareErrors = records.filter((record) => record.prepareError).map((record) => ({
@@ -1497,6 +1625,18 @@ async function buildPresignTestRecords(cfg, args) {
     throw new Error(`Pre-sign test prepare failed: ${JSON.stringify(prepareErrors)}`);
   }
   return { chain, batch, startDate, testCfg, runtime, records };
+}
+
+function selectBatchWithinStakeCap(markets, cfg) {
+  let remaining = cfg.maxBatchStakeUsdt;
+  const selected = [];
+  for (const market of sortMarketsByStartAsc(markets)) {
+    const stake = selectedStakeUsdt(market, cfg);
+    if (stake <= 0 || stake > remaining) continue;
+    selected.push(market);
+    remaining = roundUsd(remaining - stake);
+  }
+  return selected;
 }
 
 async function buy(cfg, args) {
@@ -1602,6 +1742,11 @@ async function arm(cfg, args) {
     preSignFastTx: cfg.preSignFastTx,
     preSignWindowMs: cfg.preSignWindowMs,
     preSignRetryMs: cfg.preSignRetryMs,
+    allowPreopenBroadcast: cfg.allowPreopenBroadcast,
+    prebroadcastMs: cfg.prebroadcastMs,
+    openBroadcastDelayMs: cfg.openBroadcastDelayMs,
+    openBroadcastScheduleAheadMs: cfg.openBroadcastScheduleAheadMs,
+    openBroadcastSpinMs: cfg.openBroadcastSpinMs,
     armWaitForFunding: cfg.armWaitForFunding,
     armFundingRetryMs: cfg.armFundingRetryMs,
     armFundingHotRetryMs: cfg.armFundingHotRetryMs,
@@ -1619,6 +1764,13 @@ async function arm(cfg, args) {
     autoSellStopLossPercent: cfg.autoSellStopLossPercent,
     autoSellStopLossSellPercent: cfg.autoSellStopLossSellPercent,
     autoSellPollMs: cfg.autoSellPollMs,
+    autoSellBuyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
+    autoSellBuyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
+    autoSellPreapproveOperator: cfg.autoSellPreapproveOperator,
+    autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
+    autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
+    autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+    autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick,
     note: "private key is held only in this process; it is not written to disk"
   }, null, 2));
 
@@ -1897,6 +2049,8 @@ async function createRuntime(cfg) {
   if (!account) return null;
   const runtime = {
     receiverAddress: cfg.walletAddress || account.address,
+    pendingBuyRecords: null,
+    autoSellOperatorReadyMarkets: new Set(),
     txLock: {
       owner: null,
       since: null
@@ -1943,6 +2097,63 @@ function runtimeAutoSellPauseInfo(runtime) {
   };
 }
 
+function attachRuntimePendingBuyRecords(runtime, pending) {
+  if (!runtime) return;
+  runtime.pendingBuyRecords = pending ?? null;
+}
+
+function runtimeBuyHotWindowInfo(cfg, runtime) {
+  const pending = runtime?.pendingBuyRecords;
+  if (!pending || pending.size === 0) return null;
+  const now = Date.now();
+  const beforeMs = Number(cfg.autoSellBuyGuardBeforeMs ?? 0);
+  const afterMs = Number(cfg.autoSellBuyGuardAfterMs ?? 0);
+
+  for (const record of pending.values()) {
+    const market = pendingMarket(record);
+    const startMs = Date.parse(market?.startDate ?? "");
+    if (!Number.isFinite(startMs)) continue;
+    const guardStart = startMs - beforeMs;
+    const guardEnd = startMs + eventOpenWindowMs(cfg) + afterMs;
+    if (now < guardStart || now > guardEnd) continue;
+    return {
+      reason: "buy-hot-window",
+      market: market.address ?? null,
+      question: market.question ?? null,
+      startDate: market.startDate ?? null,
+      msUntilOpen: startMs - now,
+      guardBeforeMs: beforeMs,
+      guardAfterMs: afterMs,
+      openWindowSeconds: cfg.eventOpenWindowSeconds
+    };
+  }
+  return null;
+}
+
+function runtimeAutoSellBlockInfo(cfg, runtime) {
+  if (runtimeTransactionBusy(runtime)) {
+    return {
+      skippedReason: "transaction-busy",
+      lock: runtimeTransactionLockInfo(runtime)
+    };
+  }
+  const pause = runtimeAutoSellPauseInfo(runtime);
+  if (pause) {
+    return {
+      skippedReason: "open-buy-window",
+      pause
+    };
+  }
+  const hotWindow = runtimeBuyHotWindowInfo(cfg, runtime);
+  if (hotWindow) {
+    return {
+      skippedReason: "buy-hot-window",
+      hotWindow
+    };
+  }
+  return null;
+}
+
 async function withRuntimeTransactionLock(runtime, owner, fn) {
   if (!runtime?.txLock) return fn();
   if (runtime.txLock.owner) {
@@ -1966,14 +2177,16 @@ async function watch(cfg, options = {}) {
   const watchPreflight = await validateWatchFunding(cfg);
   const broadcastWarmup = await maybeWarmBroadcastRpcs(cfg);
   const runtime = await createRuntime(cfg);
-  const autoSellMonitor = startAutoSellMonitor(cfg, runtime);
   const initialPending = new Map();
+  attachRuntimePendingBuyRecords(runtime, initialPending);
   const startupWarnings = [];
   const wsStartupSeedDeferred = cfg.eventDiscovery === "ws" && !cfg.watchBuyExisting;
 
   if (!wsStartupSeedDeferred) {
     startupWarnings.push(...(await seedStartupMarkets(cfg, seen, initialPending, runtime, options)));
   }
+
+  const autoSellMonitor = startAutoSellMonitor(cfg, runtime);
 
   console.log(
     JSON.stringify(
@@ -2014,6 +2227,7 @@ async function watch(cfg, options = {}) {
         receiptWatchPollingMs: cfg.receiptWatchPollingMs,
         executionRetryMs: cfg.executionRetryMs,
         eventOpenWindowSeconds: cfg.eventOpenWindowSeconds,
+        allowPreopenBroadcast: cfg.allowPreopenBroadcast,
         receiverReady: Boolean(runtime?.receiverAddress || cfg.walletAddress),
         watchPreflight,
         broadcastWarmup,
@@ -2024,6 +2238,9 @@ async function watch(cfg, options = {}) {
         hotPollMs: cfg.hotPollMs,
         preopenHotMs: cfg.preopenHotMs,
         prebroadcastMs: cfg.prebroadcastMs,
+        openBroadcastDelayMs: cfg.openBroadcastDelayMs,
+        openBroadcastScheduleAheadMs: cfg.openBroadcastScheduleAheadMs,
+        openBroadcastSpinMs: cfg.openBroadcastSpinMs,
         rpcKeepaliveMs: cfg.rpcKeepaliveMs,
         rebroadcastIntervalMs: cfg.rebroadcastIntervalMs,
         rebroadcastDurationMs: cfg.rebroadcastDurationMs,
@@ -2039,7 +2256,14 @@ async function watch(cfg, options = {}) {
               stopLossEnabled: cfg.autoSellStopLossEnabled,
               stopLossPercent: cfg.autoSellStopLossPercent,
               stopLossSellPercent: cfg.autoSellStopLossSellPercent,
-              pollMs: cfg.autoSellPollMs
+              pollMs: cfg.autoSellPollMs,
+              buyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
+              buyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
+              preapproveOperator: cfg.autoSellPreapproveOperator,
+              requirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
+              maxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
+              maxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+              maxTxPerTick: cfg.autoSellMaxTxPerTick
             }
           : { enabled: false }
       },
@@ -2123,7 +2347,6 @@ function startAutoSellMonitor(cfg, runtime = null) {
   };
 
   const timer = setInterval(tick, cfg.autoSellPollMs);
-  void tick();
   return timer;
 }
 
@@ -2146,15 +2369,9 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     errors: [],
     actions: []
   };
-  if (runtimeTransactionBusy(runtime)) {
-    result.skippedReason = "transaction-busy";
-    result.lock = runtimeTransactionLockInfo(runtime);
-    return result;
-  }
-  const pause = runtimeAutoSellPauseInfo(runtime);
-  if (pause) {
-    result.skippedReason = "open-buy-window";
-    result.pause = pause;
+  const startupBlock = runtimeAutoSellBlockInfo(cfg, runtime);
+  if (startupBlock) {
+    Object.assign(result, startupBlock);
     return result;
   }
 
@@ -2165,7 +2382,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
   const eligibleMarkets = loadAutoSellEligibleMarkets(cfg);
   const ladderState = loadAutoSellPositionState(cfg.autoSellPositionStateFile);
   const now = Date.now();
-  const marketActions = new Map();
+  const allItems = [];
 
   for (const position of openPositions) {
     if (!isAutoSellablePosition(position)) {
@@ -2193,9 +2410,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
       if (!action) continue;
 
       result.triggered += 1;
-      const items = marketActions.get(marketKey) ?? [];
-      items.push({ key, entry, position, ...action });
-      marketActions.set(marketKey, items);
+      allItems.push({ key, entry, position, ...action });
     } catch (error) {
       const item = {
         marketAddress: position.marketAddress,
@@ -2214,58 +2429,120 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     }
   }
 
-  for (const [market, items] of marketActions.entries()) {
+  let txsSent = 0;
+  if (!cfg.dryRun && cfg.execute && cfg.autoSellPreapproveOperator) {
+    txsSent += await preapproveAutoSellOperators(cfg, {
+      openPositions,
+      eligibleMarkets,
+      runtime,
+      result,
+      source,
+      walletAddress
+    });
+  }
+
+  const allActions = allItems.map(({ plan, entry, position, ...action }) => ({
+    ...action,
+    status: cfg.dryRun || !cfg.execute ? "dry-run" : "pending"
+  }));
+  if (cfg.dryRun || !cfg.execute) {
+    result.actions.push(...allActions);
+    if (allActions.length > 0) {
+      appendAutoSellBatchLog(cfg, { source, walletAddress, markets: marketsFromItems(allItems), actions: allActions, execution: null });
+    }
+    return result;
+  }
+
+  const readyItems = [];
+  const waitingForApproval = [];
+  for (let index = 0; index < allItems.length; index += 1) {
+    const item = allItems[index];
+    const action = allActions[index];
+    if (cfg.autoSellRequirePreapprovedOperator && !item.plan.operatorApproved) {
+      action.status = "skipped-operator-approval-needed";
+      waitingForApproval.push(action);
+      continue;
+    }
+    readyItems.push({ item, action });
+  }
+  if (waitingForApproval.length > 0) {
+    result.skipped += waitingForApproval.length;
+    result.actions.push(...waitingForApproval);
+    appendAutoSellBatchLog(cfg, {
+      source,
+      walletAddress,
+      markets: [...new Set(waitingForApproval.map((action) => action.marketAddress))],
+      actions: waitingForApproval,
+      execution: { status: "skipped-operator-approval-needed" }
+    });
+  }
+
+  const chunks = chunkAutoSellItems(cfg, readyItems);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const items = chunk.map((entry) => entry.item);
+    const actions = chunk.map((entry) => entry.action);
     let execution = null;
-    const actions = items.map(({ plan, entry, position, ...action }) => ({
-      ...action,
-      status: cfg.dryRun || !cfg.execute ? "dry-run" : "pending"
-    }));
 
     try {
-      if (!cfg.dryRun && cfg.execute) {
-        const executionPause = runtimeAutoSellPauseInfo(runtime);
-        if (executionPause) {
-          for (const action of actions) {
-            action.status = "skipped-open-buy-window";
-            action.pause = executionPause;
-          }
-          result.skipped += actions.length;
-          result.actions.push(...actions);
-          appendAutoSellBatchLog(cfg, { source, walletAddress, market, actions, execution });
-          continue;
-        }
-        if (runtimeTransactionBusy(runtime)) {
-          const lock = runtimeTransactionLockInfo(runtime);
-          for (const action of actions) {
-            action.status = "skipped-transaction-busy";
-            action.lock = lock;
-          }
-          result.skipped += actions.length;
-          result.actions.push(...actions);
-          appendAutoSellBatchLog(cfg, { source, walletAddress, market, actions, execution });
-          continue;
-        }
-
-        execution = await withRuntimeTransactionLock(runtime, "auto-sell-batch", () =>
-          sellOutcomesBatch(cfg, items.map((item) => item.plan))
-        );
-        await syncRuntimeNonceAfterExternalTx(cfg, runtime, "auto-sell-batch");
+      const block = runtimeAutoSellBlockInfo(cfg, runtime);
+      if (block) {
         for (const action of actions) {
-          action.txHash = execution.txHash;
-          action.status = execution.status;
+          action.status = `skipped-${block.skippedReason}`;
+          if (block.lock) action.lock = block.lock;
+          if (block.pause) action.pause = block.pause;
+          if (block.hotWindow) action.hotWindow = block.hotWindow;
         }
-        if (execution.status === "success" || execution.status === "broadcast") {
-          for (const item of items) markAutoSellActionApplied(cfg, item.entry, item);
-          saveAutoSellPositionState(cfg.autoSellPositionStateFile, ladderState);
-          result.executed += actions.length;
-        }
+        result.skipped += actions.length;
+        result.actions.push(...actions);
+        appendAutoSellBatchLog(cfg, { source, walletAddress, markets: marketsFromItems(items), actions, execution: block });
+        continue;
+      }
+
+      if (txsSent >= cfg.autoSellMaxTxPerTick) {
+        for (const action of actions) action.status = "deferred-tx-limit";
+        result.skipped += actions.length;
+        result.actions.push(...actions);
+        appendAutoSellBatchLog(cfg, {
+          source,
+          walletAddress,
+          markets: marketsFromItems(items),
+          actions,
+          execution: { status: "deferred-tx-limit", maxTxPerTick: cfg.autoSellMaxTxPerTick }
+        });
+        continue;
+      }
+
+      execution = await withRuntimeTransactionLock(runtime, "auto-sell-batch", () =>
+        sellOutcomesBatch(
+          cfg,
+          items.map((item) => item.plan),
+          { requirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator }
+        )
+      );
+      txsSent += 1;
+      await syncRuntimeNonceAfterExternalTx(cfg, runtime, "auto-sell-batch");
+      for (const action of actions) {
+        action.txHash = execution.txHash;
+        action.status = execution.status;
+      }
+      if (execution.status === "success") {
+        for (const item of items) markAutoSellActionApplied(cfg, item.entry, item);
+        saveAutoSellPositionState(cfg.autoSellPositionStateFile, ladderState);
+        result.executed += actions.length;
+      } else {
+        result.errors.push({
+          markets: marketsFromItems(items),
+          count: items.length,
+          message: `auto-sell receipt status ${execution.status}`
+        });
       }
 
       result.actions.push(...actions);
-      appendAutoSellBatchLog(cfg, { source, walletAddress, market, actions, execution });
+      appendAutoSellBatchLog(cfg, { source, walletAddress, markets: marketsFromItems(items), actions, execution });
     } catch (error) {
       const item = {
-        marketAddress: market,
+        markets: marketsFromItems(items),
         count: items.length,
         message: errorMessage(error)
       };
@@ -2276,10 +2553,124 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         ...item,
         at: new Date().toISOString()
       }));
+      for (const action of actions) {
+        action.status = "error";
+        action.message = errorMessage(error);
+      }
+      result.actions.push(...actions);
+      appendAutoSellBatchLog(cfg, { source, walletAddress, markets: marketsFromItems(items), actions, execution });
     }
   }
 
   return result;
+}
+
+async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets, runtime, result, source, walletAddress }) {
+  if (cfg.autoSellApprovalsPerTick <= 0) return 0;
+  const markets = [];
+  const seenMarkets = new Set();
+  for (const position of openPositions) {
+    if (!isAutoSellablePosition(position)) continue;
+    const marketKey = String(position.marketAddress).toLowerCase();
+    if (!eligibleMarkets.has(marketKey) || seenMarkets.has(marketKey)) continue;
+    if (runtime?.autoSellOperatorReadyMarkets?.has(marketKey)) continue;
+    seenMarkets.add(marketKey);
+    markets.push(position.marketAddress);
+  }
+
+  let sent = 0;
+  for (const market of markets) {
+    if (sent >= cfg.autoSellApprovalsPerTick) break;
+    const block = runtimeAutoSellBlockInfo(cfg, runtime);
+    if (block) {
+      result.operatorApprovalSkipped = block;
+      break;
+    }
+    try {
+      const execution = await withRuntimeTransactionLock(runtime, "operator-preapproval", () =>
+        ensureMarketOperatorApproval(cfg, market)
+      );
+      if (execution.txHash) {
+        sent += 1;
+        await syncRuntimeNonceAfterExternalTx(cfg, runtime, "operator-preapproval");
+      }
+      if (execution.operatorApproved) {
+        runtime?.autoSellOperatorReadyMarkets?.add(String(market).toLowerCase());
+      }
+      const row = {
+        level: "event-operator-preapproval",
+        source,
+        wallet: walletAddress,
+        market,
+        execution,
+        at: new Date().toISOString()
+      };
+      appendJsonl(cfg.fillsFile, row);
+      if (!result.operatorApprovals) result.operatorApprovals = [];
+      result.operatorApprovals.push({
+        market,
+        status: execution.status,
+        txHash: execution.txHash ?? null,
+        approved: execution.operatorApproved
+      });
+      if (execution.status !== "ready" && execution.status !== "success") {
+        result.errors.push({
+          marketAddress: market,
+          message: `operator approval status ${execution.status}`
+        });
+      }
+    } catch (error) {
+      const item = {
+        marketAddress: market,
+        message: errorMessage(error)
+      };
+      result.errors.push(item);
+      console.error(JSON.stringify({
+        level: "event-operator-preapproval-error",
+        source,
+        ...item,
+        at: new Date().toISOString()
+      }));
+    }
+  }
+  return sent;
+}
+
+function chunkAutoSellItems(cfg, entries) {
+  const chunks = [];
+  let current = [];
+  let currentMarkets = new Set();
+
+  for (const entry of entries) {
+    const market = String(entry.item.plan.market).toLowerCase();
+    const nextMarkets = new Set(currentMarkets);
+    nextMarkets.add(market);
+    const nextCount = current.length + 1;
+    const nextGas = estimateAutoSellBatchGas(nextCount);
+    const shouldSplit = current.length > 0 && (
+      nextCount > cfg.autoSellMaxOutcomesPerTx ||
+      nextMarkets.size > cfg.autoSellMaxMarketsPerTx ||
+      nextGas > cfg.autoSellMaxGasPerTx
+    );
+
+    if (shouldSplit) {
+      chunks.push(current);
+      current = [];
+      currentMarkets = new Set();
+    }
+    current.push(entry);
+    currentMarkets.add(market);
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+function estimateAutoSellBatchGas(outcomeCount) {
+  return SELL_BATCH_BASE_GAS + SELL_BATCH_PER_OUTCOME_GAS * Number(outcomeCount);
+}
+
+function marketsFromItems(items) {
+  return [...new Set(items.map((item) => item.marketAddress ?? item.plan?.market).filter(Boolean))];
 }
 
 async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
@@ -2375,13 +2766,14 @@ async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, posit
   };
 }
 
-function appendAutoSellBatchLog(cfg, { source, walletAddress, market, actions, execution }) {
+function appendAutoSellBatchLog(cfg, { source, walletAddress, market = null, markets = null, actions, execution }) {
   appendJsonl(cfg.fillsFile, {
     level: "event-auto-sell",
     source,
     mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
     wallet: walletAddress,
     market,
+    markets,
     strategy: cfg.autoSellStrategy,
     actions,
     execution,
@@ -2485,8 +2877,14 @@ function loadAutoSellEligibleMarkets(cfg) {
 }
 
 function isSuccessfulBuyFill(row) {
-  if (!row?.result || row.result.dryRun || row.result.status !== "success") return false;
-  return Boolean(row?.plan?.market?.address || row?.bundle?.markets?.length);
+  if (row?.result && !row.result.dryRun) {
+    if (row.result.status !== "success" && row.result.status !== "broadcast") return false;
+    return Boolean(row?.plan?.market?.address || row?.bundle?.markets?.length);
+  }
+  if (row?.level === "event-receipt" && row.status === "success") {
+    return Boolean(row?.context?.market || row?.context?.markets?.length);
+  }
+  return false;
 }
 
 function boughtMarketsFromFill(row) {
@@ -2494,6 +2892,8 @@ function boughtMarketsFromFill(row) {
   if (Array.isArray(row?.bundle?.markets)) {
     return row.bundle.markets.map((market) => market.address).filter(Boolean);
   }
+  if (row?.context?.market) return [row.context.market];
+  if (Array.isArray(row?.context?.markets)) return row.context.markets.filter(Boolean);
   return [];
 }
 
@@ -2949,11 +3349,13 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
   const { publicClient } = makeClients(cfg);
   const wsClient = makeWsClient(cfg);
   const pending = new Map(initialPending);
+  attachRuntimePendingBuyRecords(runtime, pending);
   const queue = [];
   const txBuffers = new Map();
   const wakeSignal = createWakeSignal();
   const restDiscovery = createRestDiscoveryState();
   const rpcKeepalive = createRpcKeepaliveState();
+  const dueExecution = createDueExecutionState();
   let wsFailed = false;
   let consecutiveErrors = 0;
 
@@ -2980,6 +3382,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
 
   if (seedStartup) {
     const warnings = await seedStartupMarkets(cfg, seen, pending, runtime, options);
+    scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
     console.log(JSON.stringify({
       level: "startup-after-ws-subscribe",
       pendingFutureMarkets: pending.size,
@@ -2990,13 +3393,16 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
   while (true) {
     try {
       await preSignHotPendingMarkets(cfg, pending, runtime);
-      await drainDuePendingMarkets(cfg, seen, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
+      await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "ws-loop");
 
       while (queue.length > 0) addBufferedControllerLog(txBuffers, queue.shift());
       await drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pending, runtime);
       await preSignHotPendingMarkets(cfg, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       maybeStartBroadcastRpcKeepalive(cfg, pending, rpcKeepalive);
       await drainRestDiscoveryCandidates(cfg, seen, pending, runtime, restDiscovery);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       maybeStartRestDiscoveryPoll(cfg, seen, pending, restDiscovery, wakeSignal);
 
       if (wsFailed) throw new Error("WebSocket event subscription failed");
@@ -3031,6 +3437,112 @@ function createRpcKeepaliveState() {
     nextRunAt: 0,
     running: false
   };
+}
+
+function createDueExecutionState() {
+  return {
+    timers: new Map(),
+    running: false,
+    rerun: false
+  };
+}
+
+async function drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, state, source = "due-loop") {
+  if (!state) return drainDuePendingMarkets(cfg, seen, pending, runtime);
+  if (state.running) {
+    state.rerun = true;
+    return false;
+  }
+  state.running = true;
+  try {
+    let didWork = false;
+    do {
+      state.rerun = false;
+      didWork = (await drainDuePendingMarkets(cfg, seen, pending, runtime)) || didWork;
+    } while (state.rerun);
+    return didWork;
+  } finally {
+    state.running = false;
+    scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source);
+  }
+}
+
+function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = "due-scheduler") {
+  if (!state?.timers || !pending) return;
+  const now = Date.now();
+  const scheduleAheadMs = Number(cfg.openBroadcastScheduleAheadMs ?? 0);
+  const activeKeys = new Set();
+
+  for (const [key, record] of pending.entries()) {
+    activeKeys.add(key);
+    if (seen.has(key)) continue;
+    const targetMs = marketActionTimeMs(pendingMarket(record), cfg);
+    if (!Number.isFinite(targetMs)) continue;
+    const waitMs = targetMs - now;
+    if (waitMs < -eventOpenWindowMs(cfg)) continue;
+    if (scheduleAheadMs > 0 && waitMs > scheduleAheadMs) continue;
+
+    const existing = state.timers.get(key);
+    if (existing?.targetMs === targetMs) continue;
+    if (existing?.timer) clearTimeout(existing.timer);
+
+    const delayMs = Math.max(0, waitMs - Number(cfg.openBroadcastSpinMs ?? 0));
+    const timer = setTimeout(() => {
+      void waitUntilBroadcastTarget(targetMs, Number(cfg.openBroadcastSpinMs ?? 0))
+        .then(() => {
+          if (!pending.has(key) || seen.has(key)) return false;
+          return drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, state, "open-timer");
+        })
+        .catch((error) => {
+          console.error(JSON.stringify({
+            level: "warn",
+            source: "open-broadcast-timer",
+            message: errorMessage(error),
+            market: pendingMarket(record)?.address,
+            at: new Date().toISOString()
+          }));
+        })
+        .finally(() => {
+          state.timers.delete(key);
+        });
+    }, delayMs);
+    timer.unref?.();
+    state.timers.set(key, { targetMs, timer });
+    console.log(JSON.stringify({
+      level: "open-broadcast-scheduled",
+      source,
+      market: pendingMarket(record)?.address,
+      question: pendingMarket(record)?.question,
+      startDate: pendingMarket(record)?.startDate,
+      targetAt: new Date(targetMs).toISOString(),
+      waitMs: Math.max(0, waitMs),
+      delayMs,
+      spinMs: cfg.openBroadcastSpinMs,
+      postOpenDelayMs: effectivePostOpenBroadcastDelayMs(cfg)
+    }));
+  }
+
+  for (const [key, scheduled] of [...state.timers.entries()]) {
+    if (activeKeys.has(key) && !seen.has(key)) continue;
+    clearTimeout(scheduled.timer);
+    state.timers.delete(key);
+  }
+}
+
+async function waitUntilBroadcastTarget(targetMs, spinMs) {
+  const spinBudgetMs = Math.max(0, Number(spinMs ?? 0));
+  while (Date.now() < targetMs) {
+    const remaining = targetMs - Date.now();
+    if (remaining > spinBudgetMs) {
+      await sleep(Math.max(1, remaining - spinBudgetMs));
+      continue;
+    }
+    const spinStart = Date.now();
+    while (Date.now() < targetMs && Date.now() - spinStart <= spinBudgetMs) {
+      // Busy spin only inside the final configured milliseconds before open.
+    }
+    if (Date.now() < targetMs) await sleep(0);
+  }
 }
 
 function maybeStartBroadcastRpcKeepalive(cfg, pending, state) {
@@ -3079,10 +3591,13 @@ function hasHotPendingMarket(cfg, pending) {
 
 async function watchRest(cfg, seen, runtime = null, initialPending = new Map()) {
   const pending = new Map(initialPending);
+  attachRuntimePendingBuyRecords(runtime, pending);
+  const dueExecution = createDueExecutionState();
   while (true) {
     try {
       await preSignHotPendingMarkets(cfg, pending, runtime);
-      await drainDuePendingMarkets(cfg, seen, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
+      await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "rest-loop");
 
       const markets = await loadEventMarkets(cfg, { limit: cfg.watchScanLimit });
       for (const market of [...markets].reverse()) {
@@ -3092,6 +3607,7 @@ async function watchRest(cfg, seen, runtime = null, initialPending = new Map()) 
         }
       }
       await preSignHotPendingMarkets(cfg, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
     } catch (error) {
       console.error(JSON.stringify({ level: "error", message: errorMessage(error), at: new Date().toISOString() }));
     }
@@ -3278,15 +3794,19 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
   }
   let consecutiveErrors = 0;
   const pending = new Map(initialPending);
+  attachRuntimePendingBuyRecords(runtime, pending);
   const restDiscovery = createRestDiscoveryState();
+  const dueExecution = createDueExecutionState();
 
   console.log(JSON.stringify({ level: "chain-watch", fromBlock: fromBlock.toString() }));
 
   while (true) {
     try {
       await preSignHotPendingMarkets(cfg, pending, runtime);
-      await drainDuePendingMarkets(cfg, seen, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
+      await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "chain-loop");
       await drainRestDiscoveryCandidates(cfg, seen, pending, runtime, restDiscovery);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       maybeStartRestDiscoveryPoll(cfg, seen, pending, restDiscovery);
 
       const toBlock = await publicClient.getBlockNumber();
@@ -3303,6 +3823,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
           console.error(JSON.stringify({ level: "warn", source: "chain-decode", ...error }));
         }
         await preSignHotPendingMarkets(cfg, pending, runtime);
+        scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
         fromBlock = toBlock + 1n;
         consecutiveErrors = 0;
       }
@@ -3390,12 +3911,26 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
   const dueRecords = [...pending.values()].filter((record) => {
     return msUntilRecordAction(record, cfg) <= 0;
   });
-  if (dueRecords.length === 0) return;
+  if (dueRecords.length === 0) return false;
 
+  let didWork = false;
   const fundingBlockedKeys = new Set();
   if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
-    const grouped = groupRecordsByStartDate(dueRecords);
     const handled = new Set();
+    const preSignedGroups = groupPreSignedBundleRecords(dueRecords);
+    for (const records of preSignedGroups) {
+      const ok = await executeDueBundle(cfg, seen, pending, runtime, records);
+      didWork = true;
+      if (ok || records.every((record) => seen.has(eventSeenKey(pendingMarket(record), cfg)))) {
+        for (const record of records) handled.add(eventSeenKey(pendingMarket(record), cfg));
+      }
+    }
+    for (const key of handled) pending.delete(key);
+
+    const grouped = groupRecordsByStartDate(dueRecords.filter((record) => {
+      const key = eventSeenKey(pendingMarket(record), cfg);
+      return !handled.has(key) && !hasPreSignedBundle(record);
+    }));
     for (const records of grouped.values()) {
       if (!records.every((record) => record.preparedPlan)) continue;
       const affordable = await selectAffordableDueRecords(cfg, records, "due-bundle");
@@ -3405,6 +3940,7 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
       markFundingBlockedRecords(cfg, affordable.skipped, affordable.walletStatus, "due-bundle");
       if (affordable.selected.length <= 1) continue;
       const ok = await executeDueBundle(cfg, seen, pending, runtime, affordable.selected);
+      didWork = true;
       if (ok) {
         for (const record of affordable.selected) handled.add(eventSeenKey(pendingMarket(record), cfg));
       }
@@ -3416,10 +3952,13 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
     const market = pendingMarket(record);
     if (fundingBlockedKeys.has(eventSeenKey(market, cfg))) continue;
     if (msUntilRecordAction(record, cfg) > 0) continue;
-    const affordable = await selectAffordableDueRecords(cfg, [record], "due-single");
-    if (affordable.selected.length === 0) {
-      markFundingBlockedRecords(cfg, affordable.skipped, affordable.walletStatus, "due-single");
-      continue;
+    if (hasPreSignedBundle(record)) continue;
+    if (!hasPreSignedSingle(record)) {
+      const affordable = await selectAffordableDueRecords(cfg, [record], "due-single");
+      if (affordable.selected.length === 0) {
+        markFundingBlockedRecords(cfg, affordable.skipped, affordable.walletStatus, "due-single");
+        continue;
+      }
     }
     const executed = await maybeExecuteMarket(cfg, seen, market, {
       allowFuturePending: false,
@@ -3430,10 +3969,23 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
       hydrationSkipReason: "due_pending_record",
       retryRecord: record
     });
+    didWork = true;
     if (executed || seen.has(eventSeenKey(market, cfg))) {
       pending.delete(eventSeenKey(market, cfg));
     }
   }
+  return didWork;
+}
+
+function groupPreSignedBundleRecords(records) {
+  const byHash = new Map();
+  for (const record of records) {
+    const hash = record?.preSignedFastBundleTransaction?.txHash;
+    if (!hash) continue;
+    if (!byHash.has(hash)) byHash.set(hash, []);
+    byHash.get(hash).push(record);
+  }
+  return [...byHash.values()].filter((group) => reusablePreSignedBundle(group));
 }
 
 async function executeDueBundle(cfg, seen, pending, runtime, records) {
@@ -3462,7 +4014,18 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
       at: new Date().toISOString()
     });
     if (!executionMarksSeen(result)) {
-      for (const record of records) markExecutionRetry(record, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
+      const terminal = isTerminalMinedFailure(result);
+      const preopen = terminal && records.some((record) => isPreopenBroadcastResult(result, pendingMarket(record)));
+      if (terminal && preopen && records.some((record) => !isPastEventOpenWindow(cfg, pendingMarket(record)))) {
+        clearPreSignedBundleRecords(records, `terminal_${result.status}_preopen`);
+        await resetRuntimeNonceToPending(cfg, runtime, `bundle_terminal_${result.status}_preopen`);
+      } else if (terminal) {
+        for (const market of markets) seen.add(eventSeenKey(market, cfg));
+        saveSeen(cfg.stateFile, seen);
+      }
+      if (!terminal || preopen) {
+        for (const record of records) markExecutionRetry(record, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
+      }
       for (const market of markets) {
         recordMarketDecision(cfg, market, "execution-unconfirmed", {
           source: "bundle-execution",
@@ -3475,7 +4038,7 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
         source: "bundle-execution",
         message: `Execution not confirmed successful: ${result.status ?? "unknown"}`,
         markets: markets.map((market) => market.address),
-        retryInMs: cfg.executionRetryMs,
+        retryInMs: terminal && !preopen ? null : cfg.executionRetryMs,
         at: new Date().toISOString()
       }));
       return false;
@@ -3483,7 +4046,7 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
     for (const record of records) clearExecutionRetry(record);
     for (const market of markets) {
       seen.add(eventSeenKey(market, cfg));
-      recordMarketDecision(cfg, market, result?.dryRun ? "dry-run-bought" : "bought", {
+      recordMarketDecision(cfg, market, buyDecisionAction(result), {
         source: "bundle-execution",
         mode: result?.dryRun ? "dry-run" : "execute",
         txHash: result.txHash ?? null
@@ -3491,10 +4054,11 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
     }
     saveSeen(cfg.stateFile, seen);
     notifyFeishu(cfg, {
-      title: "买入成功",
+      title: result?.status === "broadcast" ? "买入已广播" : "买入成功",
       fields: {
         type: "bundle",
         markets: markets.length,
+        status: result?.status ?? "",
         stake: `${bundle.totalStakeUsdt}U`,
         rankSource: [...new Set(bundle.markets.map((market) => market.selection?.rankSource).filter(Boolean))].join(","),
         fallback: [...new Set(bundle.markets.map((market) => market.selection?.fallbackReason).filter(Boolean))].join(","),
@@ -3715,6 +4279,29 @@ function clearPreSignedBundleRecords(records, reason) {
   }));
 }
 
+function hasPreSignedSingle(record) {
+  return Boolean(record?.preSignedFastTransaction);
+}
+
+function clearPreSignedSingleRecord(record, reason, result = null) {
+  if (!hasPreSignedSingle(record)) return;
+  const market = pendingMarket(record);
+  record.preSignedFastTransaction = null;
+  record.preSignedAt = null;
+  record.preSignDiscardReason = reason;
+  console.error(JSON.stringify({
+    level: "warn",
+    source: "pre-sign-single-discarded",
+    reason,
+    market: market?.address,
+    question: market?.question,
+    txHash: result?.txHash ?? null,
+    status: result?.status ?? null,
+    blockNumber: result?.blockNumber ?? null,
+    at: new Date().toISOString()
+  }));
+}
+
 async function resetRuntimeNonceToPending(cfg, runtime, reason) {
   if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
   const { publicClient, account } = makeClients(cfg);
@@ -3777,6 +4364,10 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
         rankSource: record.preparedPlan?.selection?.rankSource ?? null,
         fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null
       });
+      notifyWillBuyMarket(cfg, pendingMarket(record), record, {
+        source,
+        state: "立即买入"
+      });
       immediateRecords.push(record);
       continue;
     }
@@ -3795,6 +4386,10 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
         decision,
         rankSource: record.preparedPlan?.selection?.rankSource ?? null,
         fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null
+      });
+      notifyWillBuyMarket(cfg, pendingMarket(record), record, {
+        source,
+        state: "待开盘"
       });
     }
   }
@@ -3842,6 +4437,40 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
     });
     if (!executed && !seen.has(key)) pending.set(key, record);
   }
+}
+
+function notifyWillBuyMarket(cfg, market, record, { source, state } = {}) {
+  if (cfg.dryRun || !cfg.execute) return;
+  if (!record?.preparedPlan) return;
+  if (!shouldNotifyWillBuySource(source)) return;
+  const plan = record.preparedPlan;
+  notifyFeishu(cfg, {
+    title: "新盘准备买入",
+    fields: {
+      状态: state,
+      来源: formatAlertSource(source),
+      事件: market.question,
+      开盘: market.startDate,
+      结束: market.endDate,
+      时长: formatDuration(market),
+      买入: `${plan.outcomes?.length ?? selectedOutcomeCount(market, cfg)}档 / ${roundUsd(plan.totalStakeUsdt ?? selectedStakeUsdt(market, cfg))}U`,
+      排序: plan.selection?.rankSource ?? "",
+      兜底: plan.selection?.fallbackReason ?? ""
+    },
+    dedupeKey: `will-buy:${String(market.address).toLowerCase()}`,
+    cooldownMs: WILL_BUY_ALERT_COOLDOWN_MS
+  });
+}
+
+function shouldNotifyWillBuySource(source) {
+  return !String(source ?? "").startsWith("startup-");
+}
+
+function formatAlertSource(source) {
+  const value = String(source ?? "");
+  if (value.includes("rest")) return "官网";
+  if (value.includes("ws") || value.includes("chain") || value.includes("controller")) return "链上";
+  return value || "监控";
 }
 
 async function decodeControllerMarketLogs(publicClient, logs, { createdAt, fallback = true } = {}) {
@@ -4545,25 +5174,7 @@ function markSkippedIfExpired(cfg, seen, market, source) {
     dedupeKey: `${String(market.address).toLowerCase()}:skipped-open-window`
   });
   console.error(JSON.stringify(row));
-  if (shouldNotifyOpenWindowSkip(source)) {
-    notifyFeishu(cfg, {
-      title: "开盘窗口已跳过",
-      level: "warn",
-      fields: {
-        source,
-        market: market.address,
-        question: market.question,
-        reason: row.reason
-      },
-      dedupeKey: `open-window-skip:${market.address}`,
-      cooldownMs: cfg.feishuAlertCooldownMs
-    });
-  }
   return true;
-}
-
-function shouldNotifyOpenWindowSkip(source) {
-  return !String(source ?? "").startsWith("startup-");
 }
 
 function isPastEventOpenWindow(cfg, market) {
@@ -4598,7 +5209,13 @@ function clearExecutionRetry(record) {
 
 function executionMarksSeen(result) {
   if (result?.dryRun) return true;
-  return result?.status === "success";
+  return result?.status === "success" || result?.status === "broadcast";
+}
+
+function buyDecisionAction(result) {
+  if (result?.dryRun) return "dry-run-bought";
+  if (result?.status === "broadcast") return "broadcast";
+  return "bought";
 }
 
 function pendingMarket(record) {
@@ -4806,7 +5423,19 @@ async function maybeExecuteMarket(
     at: new Date().toISOString()
   });
   if (!executionMarksSeen(result)) {
-    markExecutionRetry(retryRecord, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
+    const terminal = isTerminalMinedFailure(result);
+    const preopen = terminal && isPreopenBroadcastResult(result, market);
+    if (terminal && preopen && !isPastEventOpenWindow(cfg, market)) {
+      clearPreSignedSingleRecord(retryRecord, `terminal_${result.status}_preopen`, result);
+      await resetRuntimeNonceToPending(cfg, runtime, `single_terminal_${result.status}_preopen`);
+      markExecutionRetry(retryRecord, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
+    } else if (terminal) {
+      seen.add(key);
+      saveSeen(cfg.stateFile, seen);
+      clearExecutionRetry(retryRecord);
+    } else {
+      markExecutionRetry(retryRecord, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
+    }
     recordMarketDecision(cfg, market, "execution-unconfirmed", {
       source: "single-execution",
       message: `execution status ${result.status ?? "unknown"}`,
@@ -4817,7 +5446,7 @@ async function maybeExecuteMarket(
       source: "single-execution",
       market: market.address,
       message: `Execution not confirmed successful: ${result.status ?? "unknown"}`,
-      retryInMs: cfg.executionRetryMs,
+      retryInMs: terminal && !preopen ? null : cfg.executionRetryMs,
       at: new Date().toISOString()
     }));
     notifyFeishu(cfg, {
@@ -4835,7 +5464,7 @@ async function maybeExecuteMarket(
   clearExecutionRetry(retryRecord);
   seen.add(key);
   saveSeen(cfg.stateFile, seen);
-  recordMarketDecision(cfg, market, result?.dryRun ? "dry-run-bought" : "bought", {
+  recordMarketDecision(cfg, market, buyDecisionAction(result), {
     source: "single-execution",
     mode: result?.dryRun ? "dry-run" : "execute",
     rankSource: eventPlan.selection?.rankSource ?? null,
@@ -4843,11 +5472,12 @@ async function maybeExecuteMarket(
     txHash: result.txHash ?? null
   });
   notifyFeishu(cfg, {
-    title: "买入成功",
+    title: result?.status === "broadcast" ? "买入已广播" : "买入成功",
     fields: {
       type: "single",
       market: market.address,
       question: market.question,
+      status: result?.status ?? "",
       stake: `${eventPlan.totalStakeUsdt}U`,
       rankSource: eventPlan.selection?.rankSource ?? "",
       fallback: eventPlan.selection?.fallbackReason ?? "",
@@ -4959,13 +5589,14 @@ async function executeOrPrint(eventPlan, cfg, runtime = null) {
   const result = await withRuntimeTransactionLock(
     runtime,
     "buy-single",
-    () => buyOutcomesBatch(cfg, eventPlan, runtime)
+    () => buyOutcomesBatch(broadcastOnlyExecutionCfg(cfg), eventPlan, runtime)
   );
   console.log(JSON.stringify({ level: "executed", plan: described, result }, null, 2));
   maybeTrackReceipt(cfg, result, {
     type: "single",
     market: eventPlan.market.address,
-    question: eventPlan.market.question
+    question: eventPlan.market.question,
+    marketDetails: [eventPlan.market]
   });
   return result;
 }
@@ -4983,16 +5614,25 @@ async function executeOrPrintBundle(bundle, cfg, runtime = null) {
   const result = await withRuntimeTransactionLock(
     runtime,
     "buy-bundle",
-    () => executeFastBuyBundle(cfg, bundle, runtime)
+    () => executeFastBuyBundle(broadcastOnlyExecutionCfg(cfg), bundle, runtime)
   );
   console.log(JSON.stringify({ level: "bundle-executed", bundle: described, result }, null, 2));
   maybeTrackReceipt(cfg, result, {
     type: "bundle",
     markets: bundle.markets.map((market) => market.address),
     marketCount: bundle.marketCount,
-    outcomeCount: bundle.outcomeCount
+    outcomeCount: bundle.outcomeCount,
+    marketDetails: bundle.markets
   });
   return result;
+}
+
+function broadcastOnlyExecutionCfg(cfg) {
+  return {
+    ...cfg,
+    waitForReceipt: false,
+    asyncReceiptWatch: true
+  };
 }
 
 function maybeTrackReceipt(cfg, result, context = {}) {
@@ -5011,7 +5651,7 @@ function maybeTrackReceipt(cfg, result, context = {}) {
       status: "error",
       txHash: result.txHash,
       message: errorMessage(error),
-      context,
+      context: receiptLogContext(context),
       at: new Date().toISOString()
     };
     appendJsonl(cfg.fillsFile, row);
@@ -5033,11 +5673,12 @@ async function trackReceipt(cfg, txHash, context) {
     blockNumber: receipt.blockNumber?.toString() ?? null,
     gasUsed: receipt.gasUsed?.toString() ?? null,
     effectiveGasPrice: receipt.effectiveGasPrice?.toString() ?? null,
-    context,
+    context: receiptLogContext(context),
     at: new Date().toISOString()
   };
   appendJsonl(cfg.fillsFile, row);
   console.log(JSON.stringify(row));
+  recordReceiptMarketDecisions(cfg, context, receipt, txHash);
   if (receipt.status !== "success") {
     notifyFeishu(cfg, {
       title: "交易 receipt 非成功",
@@ -5047,6 +5688,33 @@ async function trackReceipt(cfg, txHash, context) {
         status: receipt.status,
         context: context.type ?? ""
       }
+    });
+  } else {
+    notifyFeishu(cfg, {
+      title: "买入确认成功",
+      fields: {
+        tx: txHash,
+        block: receipt.blockNumber?.toString() ?? "",
+        context: context.type ?? ""
+      }
+    });
+  }
+}
+
+function receiptLogContext(context = {}) {
+  const { marketDetails, ...logContext } = context;
+  return logContext;
+}
+
+function recordReceiptMarketDecisions(cfg, context = {}, receipt, txHash) {
+  const markets = Array.isArray(context.marketDetails) ? context.marketDetails : [];
+  const action = receipt.status === "success" ? "receipt-success" : "receipt-failed";
+  for (const market of markets) {
+    recordMarketDecision(cfg, market, action, {
+      source: "receipt-watch",
+      txHash,
+      message: receipt.status === "success" ? null : `receipt status ${receipt.status}`,
+      once: false
     });
   }
 }
@@ -5275,7 +5943,7 @@ function msUntilStart(market) {
 }
 
 function msUntilAction(market, cfg) {
-  return Math.max(0, msUntilStart(market) - effectivePrebroadcastMs(cfg));
+  return Math.max(0, marketActionTimeMs(market, cfg) - Date.now());
 }
 
 function msUntilRecordAction(record, cfg) {
@@ -5284,8 +5952,32 @@ function msUntilRecordAction(record, cfg) {
   return Math.max(actionWaitMs, retryWaitMs);
 }
 
+function marketActionTimeMs(market, cfg) {
+  const start = new Date(market?.startDate).getTime();
+  if (!Number.isFinite(start)) return Date.now();
+  const prebroadcastMs = effectivePrebroadcastMs(cfg);
+  if (prebroadcastMs > 0) return start - prebroadcastMs;
+  return start + effectivePostOpenBroadcastDelayMs(cfg);
+}
+
 function effectivePrebroadcastMs(cfg) {
   return cfg.allowPreopenBroadcast ? Number(cfg.prebroadcastMs ?? 0) : 0;
+}
+
+function effectivePostOpenBroadcastDelayMs(cfg) {
+  return effectivePrebroadcastMs(cfg) > 0 ? 0 : Number(cfg.openBroadcastDelayMs ?? 0);
+}
+
+function isTerminalMinedFailure(result) {
+  if (!result?.usedPreSignedTransaction) return false;
+  if (!result.blockNumber) return false;
+  return result.status && result.status !== "success" && result.status !== "broadcast";
+}
+
+function isPreopenBroadcastResult(result, market) {
+  const broadcastAt = Date.parse(result?.broadcastStartedAt ?? "");
+  const startAt = Date.parse(market?.startDate ?? "");
+  return Number.isFinite(broadcastAt) && Number.isFinite(startAt) && broadcastAt < startAt;
 }
 
 function errorMessage(error) {

@@ -81,15 +81,18 @@ Show:
 
 Market source labels are still not simplified for operators. The next dashboard improvement is to show source as Website, Chain, or Both without exposing raw fields.
 
+## Analysis Tooling
+
+Daily volume markets need a reusable hourly heatmap before making a trading decision. The `volume:heatmap` command keeps a local Binance Futures 1h kline cache, prints dates horizontally and UTC hours vertically, compares today's completed or live hours against the prior 7 complete UTC days, and projects conservative, median, and hot final ranges.
+
 ## Alerting
 
 Feishu alerts should fire for:
 
 - service start
-- eligible market pending
+- eligible new market accepted for pending or immediate buy
 - buy success
 - buy failure
-- skipped because open window expired
 - auto-sell success or failure
 - low funds
 

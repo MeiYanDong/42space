@@ -2,12 +2,7 @@ const BINANCE_FAPI = "https://fapi.binance.com";
 const BINANCE_SPOT_API = "https://api.binance.com";
 
 export async function estimateFuturesDailyQuoteVolume(symbol = "BTCUSDT") {
-  const url = new URL("/fapi/v1/klines", BINANCE_FAPI);
-  url.searchParams.set("symbol", symbol);
-  url.searchParams.set("interval", "1d");
-  url.searchParams.set("limit", "8");
-
-  const rows = await getJson(url);
+  const rows = await getFuturesKlines(symbol, "1d", { limit: 8 });
   if (!Array.isArray(rows) || rows.length === 0) {
     throw new Error("Binance returned no klines");
   }
@@ -45,6 +40,17 @@ export async function estimateFuturesDailyQuoteVolume(symbol = "BTCUSDT") {
     openTime,
     closeTime
   };
+}
+
+export async function getFuturesKlines(symbol = "BTCUSDT", interval = "1d", options = {}) {
+  const url = new URL("/fapi/v1/klines", BINANCE_FAPI);
+  url.searchParams.set("symbol", symbol);
+  url.searchParams.set("interval", interval);
+  if (options.limit !== undefined) url.searchParams.set("limit", String(options.limit));
+  if (options.startTime !== undefined) url.searchParams.set("startTime", String(options.startTime));
+  if (options.endTime !== undefined) url.searchParams.set("endTime", String(options.endTime));
+
+  return getJson(url);
 }
 
 export async function getFuturesPrice(symbol = "BTCUSDT") {

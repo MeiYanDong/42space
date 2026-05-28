@@ -226,12 +226,13 @@ export function calculateFastGasReserve(cfg, funding = {}, gasPrice = null) {
   const effectiveGasPrice = gasPrice ?? (cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : null);
   if (!effectiveGasPrice) throw new Error("GAS_PRICE_GWEI is required for synchronous gas reserve calculation");
   const useBundleGas = Boolean(cfg.bundleDueMarkets && Number(funding.nextBatchMarketCount ?? 0) > 1);
-  const gasLimit = useBundleGas
+  const dynamicGasLimit = useBundleGas
     ? resolveBundleFastGasLimit(cfg, {
-        marketCount: funding.nextBatchMarketCount,
-        outcomeCount: funding.nextBatchOutcomeCount
-      })
+      marketCount: funding.nextBatchMarketCount,
+      outcomeCount: funding.nextBatchOutcomeCount
+    })
     : resolveSingleFastGasLimit(cfg, funding.nextBatchOutcomeCount || cfg.eventOutcomeCount || 1);
+  const gasLimit = capFastTxGasLimit(cfg, dynamicGasLimit);
   if (gasLimit <= 0n) throw new Error("FAST_GAS_LIMIT/BUNDLE_FAST_GAS_LIMIT must be positive for gas reserve estimation");
   const required = gasLimit * effectiveGasPrice;
   return {
@@ -264,7 +265,7 @@ function resolveBundleFastGasLimit(cfg, { marketCount, outcomeCount } = {}) {
 
 export function resolveWalletBudgetGasLimit(cfg, { desiredGasLimit, walletBalance, gasPrice, blockGasLimit = 0n } = {}) {
   const desired = BigInt(desiredGasLimit ?? 0);
-  if (!cfg.fastGasWalletBudget) return desired;
+  if (!cfg.fastGasWalletBudget) return capFastTxGasLimit(cfg, desired);
 
   const balance = BigInt(walletBalance ?? 0);
   const price = BigInt(gasPrice ?? 0);
@@ -280,13 +281,21 @@ export function resolveWalletBudgetGasLimit(cfg, { desiredGasLimit, walletBalanc
     const blockCap = (blockLimit * blockBps) / BPS_DENOMINATOR;
     if (blockCap > 0n && limit > blockCap) limit = blockCap;
   }
+  limit = capFastTxGasLimit(cfg, limit);
   if (limit <= 0n) throw new Error("BNB balance is too low to sign a fast transaction");
+  return limit;
+}
+
+function capFastTxGasLimit(cfg, gasLimit) {
+  let limit = BigInt(gasLimit ?? 0);
+  const txCap = BigInt(cfg.fastGasTxLimit ?? 16_777_216);
+  if (txCap > 0n && limit > txCap) limit = txCap;
   return limit;
 }
 
 async function resolveExecutionGasLimit(publicClient, accountAddress, cfg, desiredGasLimit, gasPrice) {
   const desired = BigInt(desiredGasLimit ?? 0);
-  if (!cfg.fastGasWalletBudget) return desired;
+  if (!cfg.fastGasWalletBudget) return capFastTxGasLimit(cfg, desired);
 
   const [walletBalance, block] = await Promise.all([
     getPendingBalance(publicClient, accountAddress),
@@ -1552,6 +1561,51 @@ export async function buildDirectSellPlan(publicClient, { market, tokenId, owner
   };
 }
 
+export async function isMarketOperatorApproved(publicClient, { owner, market }) {
+  return publicClient.readContract({
+    address: getAddress(market),
+    abi: marketV2Abi,
+    functionName: "isOperator",
+    args: [getAddress(owner), ADDRESSES.routerProxy]
+  });
+}
+
+export async function ensureMarketOperatorApproval(cfg, marketAddress) {
+  assertSellExecutionAllowed(cfg);
+  const { publicClient, walletClient, account } = makeClients(cfg);
+  const market = getAddress(marketAddress);
+  const alreadyApproved = await isMarketOperatorApproved(publicClient, {
+    owner: account.address,
+    market
+  });
+  if (alreadyApproved) {
+    return {
+      market,
+      operatorApproved: true,
+      approved: false,
+      txHash: null,
+      status: "ready"
+    };
+  }
+
+  const txHash = await walletClient.writeContract({
+    address: market,
+    abi: marketV2Abi,
+    functionName: "setOperator",
+    args: [ADDRESSES.routerProxy, true],
+    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  return {
+    market,
+    operatorApproved: receipt.status === "success",
+    approved: receipt.status === "success",
+    txHash,
+    status: receipt.status,
+    blockNumber: receipt.blockNumber?.toString() ?? null
+  };
+}
+
 export async function sellOutcome(cfg, sellPlan) {
   assertSellExecutionAllowed(cfg, sellPlan);
   const { publicClient, walletClient, account } = makeClients(cfg);
@@ -1633,10 +1687,11 @@ export async function sellOutcome(cfg, sellPlan) {
   };
 }
 
-export async function sellOutcomesBatch(cfg, sellPlans) {
+export async function sellOutcomesBatch(cfg, sellPlans, options = {}) {
   assertSellExecutionAllowed(cfg);
   const plans = Array.isArray(sellPlans) ? sellPlans : [];
   if (plans.length === 0) throw new Error("sellOutcomesBatch requires at least one sell plan");
+  const requirePreapprovedOperator = Boolean(options.requirePreapprovedOperator);
 
   const { publicClient, walletClient, account } = makeClients(cfg);
   const receiver = getAddress(cfg.walletAddress || account.address);
@@ -1644,13 +1699,14 @@ export async function sellOutcomesBatch(cfg, sellPlans) {
 
   const approvals = [];
   for (const market of markets) {
-    let approved = await publicClient.readContract({
-      address: market,
-      abi: marketV2Abi,
-      functionName: "isOperator",
-      args: [account.address, ADDRESSES.routerProxy]
+    let approved = await isMarketOperatorApproved(publicClient, {
+      owner: account.address,
+      market
     });
     let operatorApprovalHash = null;
+    if (!approved && requirePreapprovedOperator) {
+      throw new Error(`Operator approval missing for market ${market}`);
+    }
     if (!approved) {
       operatorApprovalHash = await walletClient.writeContract({
         address: market,
@@ -1730,7 +1786,8 @@ export async function sellOutcomesBatch(cfg, sellPlans) {
     positions,
     gas: gas.toString(),
     marketCount: markets.length,
-    positionCount: positions.length
+    positionCount: positions.length,
+    requirePreapprovedOperator
   };
 }
 

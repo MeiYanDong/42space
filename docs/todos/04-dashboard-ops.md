@@ -25,6 +25,8 @@
 - [x] Add one-click sell for all open outcomes in the same market.
 - [x] Label Dashboard manual sells separately in recent activity and keep tx metadata in action logs.
 - [x] Show and enforce Dashboard manual-sell protection during the buy hot window.
+- [x] Add reusable Binance Futures hourly volume heatmap analysis with local kline cache.
+- [x] Stop Feishu notifications for skipped markets; notify only eligible new markets that enter pending or immediate buy flow.
 
 ## Next
 

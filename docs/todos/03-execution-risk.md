@@ -42,6 +42,14 @@
 - [x] Block Dashboard manual sell quotes as well as execution during the hot window; default guard is `PRE_SIGN_WINDOW_MS + 15s` before open through `EVENT_OPEN_WINDOW_SECONDS + 15s` after open.
 - [x] 2026-05-27 change fast buy gas policy to wallet-budget mode: pre-sign and fallback signing use pending BNB balance / configured gas price as the effective gas limit, so fixed `FAST_GAS_LIMIT` values no longer cap opening buys when BNB can cover more.
 - [x] 2026-05-27 replace `2x sell 50%` with new-position ladder exit: buy+30s start, sell 10% of initial outcome tokens every 15s, single-outcome -10% stop-loss sells that outcome fully, and due sells use `minOut=1` without price binding.
+- [x] 2026-05-28 `$光源` incident: wallet-budget gas signed `18,012,201`, but BSC rejected tx gas above `16,777,216` before mempool entry; add `FAST_GAS_TX_LIMIT=16777216` and self-test coverage.
+- [x] 2026-05-28 tighten new-position ladder exit to buy+10s start and sell 10% of initial outcome tokens every 10s.
+- [x] 2026-05-28 `$GENIUS` incident: T-750ms pre-open broadcast landed in the previous BSC block and reverted before market open; make pre-open broadcast opt-in/off by default and discard mined reverted pre-signed raw tx instead of reusing it.
+- [x] 2026-05-28 optimize post-open first broadcast: add exact open-time scheduler, short final spin, and bypass the due-time funding RPC when a valid pre-signed raw tx already exists.
+- [x] 2026-05-28 detach receipt waiting from the buy transaction lock: fast buy marks RPC-accepted raw tx as submitted, releases the lock immediately, and records receipt success/failure in the background.
+- [x] 2026-05-28 fix `presign-test` and `due-test` to use a budget-capped same-start batch and fail hard if no reusable pre-signed transaction exists; tests now cover both single and bundled pre-sign shapes.
+- [x] 2026-05-29 harden auto-sell around buys: known pending openings pause operator approvals and sells, operator approval is prewarmed separately, due sells are cross-market chunked, and sell state updates only on successful receipt.
+- [x] 2026-05-29 include broadcast-accepted buys in auto-sell eligibility; the actual open-position pull still gates real sell actions, so failed broadcasts do not create sellable positions.
 
 ## Next
 
@@ -49,16 +57,19 @@
 - [x] Confirm production logs show `event-router-approval-startup`.
 - [ ] Re-run live buy-path verification on the next eligible opening after the speed-first fallback correction.
 - [ ] Compare next live buy against same-market first-block transactions and tune post-open broadcast/gas from evidence.
+- [ ] Record next post-open scheduled timer latency, broadcast start, first accepted RPC, and async receipt result after the broadcast-only lock deploy.
 - [ ] After US West cutover, compare first accepted RPC timing against the prior Hong Kong baseline.
 - [ ] Fix `event:bench` to use the production discovery model. Current benchmark command is chain-future-only and can miss REST future markets.
-- [ ] Update `presign-test` and `due-test` so they support single-market openings and budget-capped same-start batches instead of assuming every future opening is a multi-market bundle.
 - [x] Confirm current production env now matches `5 outcomes * 20U`.
 - [x] Confirm current production env now matches `5 outcomes * 50U`.
 - [x] Confirm current production env now matches `5 lowest-odds outcomes * 20U`.
 - [ ] Add explicit per-market max cost display to dashboard.
 - [ ] Make failed broadcast reasons visible in activity.
 - [ ] Add a live incident replay for out-of-gas opening revert + expired-window manual rescue to prevent repeating the GTA failure mode.
+- [ ] Add a replay for previous-block pre-open revert so `ALLOW_PREOPEN_BROADCAST=0` and terminal pre-signed discard cannot regress.
+- [ ] Add a replay for over-cap gas signing so wallet-budget mode cannot regress past the BSC single-transaction gas cap.
 - [x] Confirm auto-sell records partial sells clearly.
+- [ ] Promote the current transaction lock into a full priority Tx Scheduler after the next live buy/sell proof, so all chain-writing actions share explicit priority state instead of direct function calls.
 - [ ] Add a small replay covering duplicate prevention after restart.
 
 ## Update Rule

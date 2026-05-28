@@ -32,7 +32,8 @@
     "event:approve": "node src/event-sniper.js approve",
     "event:doctor": "node src/event-sniper.js doctor",
     "dashboard": "node src/dashboard-server.js",
-    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/config.js",
+    "volume:heatmap": "node src/binance-volume-heatmap.js",
+    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/binance-volume-heatmap.js && node --check src/config.js",
     "verify": "npm run check && npm run event:self-test"
   },
   "dependencies": {

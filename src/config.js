@@ -72,7 +72,7 @@ export function readConfig() {
     preSignRetryMs: envInteger("PRE_SIGN_RETRY_MS", 250),
     nonceSyncBeforePreSign: envBool("NONCE_SYNC_BEFORE_PRESIGN", true),
     nonceSyncMinIntervalMs: envInteger("NONCE_SYNC_MIN_INTERVAL_MS", 250),
-    waitForReceipt: envBool("WAIT_FOR_RECEIPT", true),
+    waitForReceipt: envBool("WAIT_FOR_RECEIPT", false),
     asyncReceiptWatch: envBool("ASYNC_RECEIPT_WATCH", true),
     receiptWatchTimeoutMs: envInteger("RECEIPT_WATCH_TIMEOUT_MS", 120000),
     receiptWatchPollingMs: envInteger("RECEIPT_WATCH_POLLING_MS", 1000),
@@ -92,6 +92,7 @@ export function readConfig() {
     fastGasWalletBudget: envBool("FAST_GAS_WALLET_BUDGET", true),
     fastGasWalletBudgetBps: envInteger("FAST_GAS_WALLET_BUDGET_BPS", 10000),
     fastGasBlockLimitBps: envInteger("FAST_GAS_BLOCK_LIMIT_BPS", 10000),
+    fastGasTxLimit: envInteger("FAST_GAS_TX_LIMIT", 16777216),
     logChunkBlocks: envInteger("LOG_CHUNK_BLOCKS", 5000),
     watchScanLimit: envInteger("WATCH_SCAN_LIMIT", 500),
     eventLogLookbackBlocks: envInteger("EVENT_LOG_LOOKBACK_BLOCKS", 50000),
@@ -107,7 +108,10 @@ export function readConfig() {
     hotPollMs: envInteger("HOT_POLL_MS", 25),
     preopenHotMs: envInteger("PREOPEN_HOT_MS", 60000),
     prebroadcastMs: envInteger("PREBROADCAST_MS", 750),
-    allowPreopenBroadcast: envBool("ALLOW_PREOPEN_BROADCAST", true),
+    allowPreopenBroadcast: envBool("ALLOW_PREOPEN_BROADCAST", false),
+    openBroadcastDelayMs: envInteger("OPEN_BROADCAST_DELAY_MS", 0),
+    openBroadcastScheduleAheadMs: envInteger("OPEN_BROADCAST_SCHEDULE_AHEAD_MS", 60000),
+    openBroadcastSpinMs: envInteger("OPEN_BROADCAST_SPIN_MS", 15),
     wsReceiptFallbackMs: envInteger("WS_RECEIPT_FALLBACK_MS", 0),
     wsReceiptFallbackRetries: envInteger("WS_RECEIPT_FALLBACK_RETRIES", 3),
     watchStartupRetryMs: envInteger("WATCH_STARTUP_RETRY_MS", 5000),
@@ -124,8 +128,8 @@ export function readConfig() {
     autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
     autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 5000),
     autoSellStrategy: envString("AUTO_SELL_STRATEGY", "ladder"),
-    autoSellStartDelaySeconds: envInteger("AUTO_SELL_START_DELAY_SECONDS", 30),
-    autoSellIntervalSeconds: envInteger("AUTO_SELL_INTERVAL_SECONDS", 15),
+    autoSellStartDelaySeconds: envInteger("AUTO_SELL_START_DELAY_SECONDS", 10),
+    autoSellIntervalSeconds: envInteger("AUTO_SELL_INTERVAL_SECONDS", 10),
     autoSellChunkPercent: envNumber("AUTO_SELL_CHUNK_PERCENT", 10),
     autoSellApplyAfterIso: envString("AUTO_SELL_APPLY_AFTER_ISO", ""),
     autoSellProfitMultiplier: envNumber("AUTO_SELL_PROFIT_MULTIPLIER", 2),
@@ -136,6 +140,15 @@ export function readConfig() {
     autoSellPositionLimit: envInteger("AUTO_SELL_POSITION_LIMIT", 500),
     autoSellStateFile: envString("AUTO_SELL_STATE_FILE", "data/auto-sell-seen.json"),
     autoSellPositionStateFile: envString("AUTO_SELL_POSITION_STATE_FILE", "data/auto-sell-positions.json"),
+    autoSellBuyGuardBeforeMs: envInteger("AUTO_SELL_BUY_GUARD_BEFORE_MS", 120000),
+    autoSellBuyGuardAfterMs: envInteger("AUTO_SELL_BUY_GUARD_AFTER_MS", 10000),
+    autoSellPreapproveOperator: envBool("AUTO_SELL_PREAPPROVE_OPERATOR", true),
+    autoSellApprovalsPerTick: envInteger("AUTO_SELL_APPROVALS_PER_TICK", 1),
+    autoSellRequirePreapprovedOperator: envBool("AUTO_SELL_REQUIRE_PREAPPROVED_OPERATOR", true),
+    autoSellMaxOutcomesPerTx: envInteger("AUTO_SELL_MAX_OUTCOMES_PER_TX", 8),
+    autoSellMaxMarketsPerTx: envInteger("AUTO_SELL_MAX_MARKETS_PER_TX", 4),
+    autoSellMaxGasPerTx: envInteger("AUTO_SELL_MAX_GAS_PER_TX", 12000000),
+    autoSellMaxTxPerTick: envInteger("AUTO_SELL_MAX_TX_PER_TICK", 1),
     scanLimit: envInteger("SCAN_LIMIT", 10),
     openWindowSeconds: envInteger("OPEN_WINDOW_SECONDS", 45),
     lookaheadSeconds: envInteger("LOOKAHEAD_SECONDS", 900),
@@ -192,6 +205,9 @@ export function readConfig() {
   if (cfg.fastGasBlockLimitBps <= 0 || cfg.fastGasBlockLimitBps > 10000) {
     throw new Error("FAST_GAS_BLOCK_LIMIT_BPS must be > 0 and <= 10000");
   }
+  if (cfg.fastGasTxLimit <= 0) {
+    throw new Error("FAST_GAS_TX_LIMIT must be positive");
+  }
   if (cfg.preSignWindowMs < 0) {
     throw new Error("PRE_SIGN_WINDOW_MS must be 0 or a positive integer");
   }
@@ -237,6 +253,27 @@ export function readConfig() {
   if (cfg.autoSellPositionLimit <= 0) {
     throw new Error("AUTO_SELL_POSITION_LIMIT must be positive");
   }
+  if (cfg.autoSellBuyGuardBeforeMs < 0) {
+    throw new Error("AUTO_SELL_BUY_GUARD_BEFORE_MS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellBuyGuardAfterMs < 0) {
+    throw new Error("AUTO_SELL_BUY_GUARD_AFTER_MS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellApprovalsPerTick < 0) {
+    throw new Error("AUTO_SELL_APPROVALS_PER_TICK must be 0 or a positive integer");
+  }
+  if (cfg.autoSellMaxOutcomesPerTx <= 0) {
+    throw new Error("AUTO_SELL_MAX_OUTCOMES_PER_TX must be positive");
+  }
+  if (cfg.autoSellMaxMarketsPerTx <= 0) {
+    throw new Error("AUTO_SELL_MAX_MARKETS_PER_TX must be positive");
+  }
+  if (cfg.autoSellMaxGasPerTx <= 0) {
+    throw new Error("AUTO_SELL_MAX_GAS_PER_TX must be positive");
+  }
+  if (cfg.autoSellMaxTxPerTick <= 0) {
+    throw new Error("AUTO_SELL_MAX_TX_PER_TICK must be positive");
+  }
   if (cfg.feishuAlertCooldownMs < 0) {
     throw new Error("FEISHU_ALERT_COOLDOWN_MS must be 0 or a positive integer");
   }
@@ -278,6 +315,15 @@ export function readConfig() {
   }
   if (cfg.prebroadcastMs < 0) {
     throw new Error("PREBROADCAST_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastDelayMs < 0) {
+    throw new Error("OPEN_BROADCAST_DELAY_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastScheduleAheadMs < 0) {
+    throw new Error("OPEN_BROADCAST_SCHEDULE_AHEAD_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastSpinMs < 0) {
+    throw new Error("OPEN_BROADCAST_SPIN_MS must be 0 or a positive integer");
   }
   if (cfg.wsReceiptFallbackMs < 0) {
     throw new Error("WS_RECEIPT_FALLBACK_MS must be 0 or a positive integer");
