@@ -543,6 +543,7 @@ async function status(cfg, args) {
       autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
       autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
       autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+      autoSellMaxGasPerTx: cfg.autoSellMaxGasPerTx,
       autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
@@ -590,6 +591,7 @@ async function status(cfg, args) {
       autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
       autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
       autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+      autoSellMaxGasPerTx: cfg.autoSellMaxGasPerTx,
       autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick
     },
     live: {
@@ -1770,6 +1772,7 @@ async function arm(cfg, args) {
     autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
     autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
     autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+    autoSellMaxGasPerTx: cfg.autoSellMaxGasPerTx,
     autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick,
     note: "private key is held only in this process; it is not written to disk"
   }, null, 2));
@@ -2263,6 +2266,7 @@ async function watch(cfg, options = {}) {
               requirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
               maxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
               maxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+              maxGasPerTx: cfg.autoSellMaxGasPerTx,
               maxTxPerTick: cfg.autoSellMaxTxPerTick
             }
           : { enabled: false }
