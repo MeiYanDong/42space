@@ -165,8 +165,9 @@ async function loadRuntimeConfig({ force = false } = {}) {
 
 function render(data) {
   const appName = data.settings?.appName || "42space";
-  if (els.appTitle) els.appTitle.textContent = `${appName} Bot Console`;
-  document.title = `${appName} Bot Console`;
+  const consoleTitle = formatConsoleTitle(appName);
+  if (els.appTitle) els.appTitle.textContent = consoleTitle;
+  document.title = consoleTitle;
   els.updated.textContent = `更新 ${formatTime(data.updatedAt)}`;
   els.botState.textContent = data.bot.label;
   els.botState.className = data.bot.tone;
@@ -180,6 +181,12 @@ function render(data) {
   renderExecution(data.activity);
   renderStrategy(data);
   updateCountdowns();
+}
+
+function formatConsoleTitle(appName) {
+  const name = String(appName || "42space").trim();
+  if (/\bConsole$/i.test(name)) return name;
+  return `${name} Bot Console`;
 }
 
 function renderOverview(data) {
