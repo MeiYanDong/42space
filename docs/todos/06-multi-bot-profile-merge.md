@@ -39,9 +39,9 @@
 
 ## Phase 4: Git Hygiene
 
-- [ ] Commit canonical migration changes to `MeiYanDong/42space`.
-- [ ] Push `main` to `origin`.
-- [ ] Leave unrelated dirty files untouched.
+- [x] Commit canonical migration changes to `MeiYanDong/42space`.
+- [x] Push `main` to `origin`.
+- [x] Leave unrelated dirty files untouched.
 
 ## Phase 5: A/B Bot Rollout
 
