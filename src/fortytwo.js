@@ -1478,7 +1478,7 @@ export async function quoteSellOutcome(publicClient, { market, tokenId, owner, a
   });
   const amount = amountOt === undefined || amountOt === null || amountOt === ""
     ? applyPercent(balance, percent)
-    : parseUnits(String(amountOt), 18);
+    : roundDownSellAmount(parseUnits(String(amountOt), 18));
   if (amount <= 0n) throw new Error("Sell amount is zero");
   if (amount > balance) {
     throw new Error(`Sell amount ${formatUnits(amount, 18)} exceeds outcome balance ${formatUnits(balance, 18)}`);
@@ -1532,7 +1532,7 @@ export async function buildDirectSellPlan(publicClient, { market, tokenId, owner
   });
   const amount = amountOt === undefined || amountOt === null || amountOt === ""
     ? applyPercent(balance, percent)
-    : parseUnits(String(amountOt), 18);
+    : roundDownSellAmount(parseUnits(String(amountOt), 18));
   if (amount <= 0n) throw new Error("Sell amount is zero");
   if (amount > balance) {
     throw new Error(`Sell amount ${formatUnits(amount, 18)} exceeds outcome balance ${formatUnits(balance, 18)}`);
@@ -1558,51 +1558,6 @@ export async function buildDirectSellPlan(publicClient, { market, tokenId, owner
     minCollateralOut: 1n,
     slippageBps: 10000,
     directNoQuote: true
-  };
-}
-
-export async function isMarketOperatorApproved(publicClient, { owner, market }) {
-  return publicClient.readContract({
-    address: getAddress(market),
-    abi: marketV2Abi,
-    functionName: "isOperator",
-    args: [getAddress(owner), ADDRESSES.routerProxy]
-  });
-}
-
-export async function ensureMarketOperatorApproval(cfg, marketAddress) {
-  assertSellExecutionAllowed(cfg);
-  const { publicClient, walletClient, account } = makeClients(cfg);
-  const market = getAddress(marketAddress);
-  const alreadyApproved = await isMarketOperatorApproved(publicClient, {
-    owner: account.address,
-    market
-  });
-  if (alreadyApproved) {
-    return {
-      market,
-      operatorApproved: true,
-      approved: false,
-      txHash: null,
-      status: "ready"
-    };
-  }
-
-  const txHash = await walletClient.writeContract({
-    address: market,
-    abi: marketV2Abi,
-    functionName: "setOperator",
-    args: [ADDRESSES.routerProxy, true],
-    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
-  return {
-    market,
-    operatorApproved: receipt.status === "success",
-    approved: receipt.status === "success",
-    txHash,
-    status: receipt.status,
-    blockNumber: receipt.blockNumber?.toString() ?? null
   };
 }
 
@@ -1684,6 +1639,51 @@ export async function sellOutcome(cfg, sellPlan) {
     minCollateralOut: formatUnits(minOut, 18),
     expectedCollateralToUser: formatUnits(sellPlan.expectedCollateralToUser, 18),
     slippageBps: sellPlan.slippageBps
+  };
+}
+
+export async function isMarketOperatorApproved(publicClient, { owner, market }) {
+  return publicClient.readContract({
+    address: getAddress(market),
+    abi: marketV2Abi,
+    functionName: "isOperator",
+    args: [getAddress(owner), ADDRESSES.routerProxy]
+  });
+}
+
+export async function ensureMarketOperatorApproval(cfg, marketAddress) {
+  assertSellExecutionAllowed(cfg);
+  const { publicClient, walletClient, account } = makeClients(cfg);
+  const market = getAddress(marketAddress);
+  const alreadyApproved = await isMarketOperatorApproved(publicClient, {
+    owner: account.address,
+    market
+  });
+  if (alreadyApproved) {
+    return {
+      market,
+      operatorApproved: true,
+      approved: false,
+      txHash: null,
+      status: "ready"
+    };
+  }
+
+  const txHash = await walletClient.writeContract({
+    address: market,
+    abi: marketV2Abi,
+    functionName: "setOperator",
+    args: [ADDRESSES.routerProxy, true],
+    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  return {
+    market,
+    operatorApproved: receipt.status === "success",
+    approved: receipt.status === "success",
+    txHash,
+    status: receipt.status,
+    blockNumber: receipt.blockNumber?.toString() ?? null
   };
 }
 
@@ -1927,14 +1927,14 @@ function applySlippage(value, bps) {
 function applyPercent(value, percent) {
   const bps = BigInt(Math.floor(Number(percent) * 100));
   if (bps <= 0n || bps > 10_000n) throw new Error("percent must be > 0 and <= 100");
-  if (bps === 10_000n) return value;
+  if (bps === 10_000n) return roundDownSellAmount(value);
   const amount = (value * bps) / 10_000n;
   return roundDownSellAmount(amount);
 }
 
-function roundDownSellAmount(amount) {
+export function roundDownSellAmount(amount) {
   const minStep = 10n ** 16n; // 0.01 outcome token; partial redeems revert below this precision.
-  if (amount < minStep) return amount;
+  if (amount < minStep) return 0n;
   return (amount / minStep) * minStep;
 }
 

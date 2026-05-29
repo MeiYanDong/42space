@@ -2,23 +2,31 @@
 
 import fs from "node:fs";
 import http from "node:http";
+import crypto from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { readConfig } from "./config.js";
+import { loadDotEnv, normalizeRuntimeConfig, readConfig, writeRuntimeConfig } from "./config.js";
 import { fetchActivity, fetchMarkets } from "./fortytwo.js";
 import { eventDurationMs, getEventMarketDecision, isEventMarket, isPriceMarket } from "./event-strategy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
-const botWallet = process.env.DASHBOARD_WALLET ?? "0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b";
+loadDotEnv(".env.local");
+loadDotEnv();
+
+const appName = process.env.BOT_NAME ?? "42space";
+const botWallet = process.env.DASHBOARD_WALLET ?? process.env.WALLET_ADDRESS ?? "";
 const host = process.env.DASHBOARD_HOST ?? "127.0.0.1";
 const port = Number(process.env.DASHBOARD_PORT ?? 4242);
-const launchLabel = "com.myandong.42space-event-arm";
+const launchLabel = process.env.BOT_LAUNCH_LABEL ?? "com.myandong.42space-event-arm";
 const systemdService = process.env.BOT_SYSTEMD_SERVICE ?? "42space-event-arm.service";
-const fillsFile = path.join(rootDir, "data/fills.jsonl");
+const fillsFile = path.resolve(rootDir, process.env.FILLS_FILE ?? "data/fills.jsonl");
 const actionsFile = path.join(rootDir, "data/dashboard-actions.jsonl");
+const overviewCacheMs = Number(process.env.DASHBOARD_OVERVIEW_CACHE_MS ?? 15000);
+const overviewStaleMs = Number(process.env.DASHBOARD_OVERVIEW_STALE_MS ?? 120000);
+const overviewRefreshMs = Number(process.env.DASHBOARD_OVERVIEW_REFRESH_MS ?? 5000);
 
 let overviewCache = null;
 let overviewPromise = null;
@@ -35,6 +43,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/overview" && req.method === "GET") {
       return sendJson(res, await getOverview());
     }
+    if (url.pathname === "/api/runtime-config" && req.method === "GET") {
+      return sendJson(res, runtimeConfigPayload());
+    }
+    if (url.pathname === "/api/runtime-config" && req.method === "PUT") {
+      return sendJson(res, await updateRuntimeConfig(req));
+    }
     if (url.pathname === "/api/sell/quote" && req.method === "POST") {
       return sendJson(res, await sellQuote(await readJsonBody(req)));
     }
@@ -49,11 +63,25 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`42 dashboard listening on http://${host}:${port}`);
+  void refreshOverviewCache().catch(logOverviewRefreshError);
+  if (overviewRefreshMs > 0) {
+    setInterval(() => {
+      void refreshOverviewCache().catch(logOverviewRefreshError);
+    }, overviewRefreshMs).unref();
+  }
 });
 
 async function getOverview() {
   const now = Date.now();
-  if (overviewCache && now - overviewCache.at < 4000) return overviewCache.data;
+  if (overviewCache && now - overviewCache.at < overviewCacheMs) return overviewCache.data;
+  if (overviewCache && now - overviewCache.at < overviewStaleMs) {
+    void refreshOverviewCache().catch(logOverviewRefreshError);
+    return overviewCache.data;
+  }
+  return refreshOverviewCache();
+}
+
+function refreshOverviewCache() {
   if (overviewPromise) return overviewPromise;
   overviewPromise = buildOverview()
     .then((data) => {
@@ -66,11 +94,20 @@ async function getOverview() {
   return overviewPromise;
 }
 
+function logOverviewRefreshError(error) {
+  console.error(JSON.stringify({
+    level: "warn",
+    source: "dashboard-overview-refresh",
+    message: cleanError(error),
+    at: new Date().toISOString()
+  }));
+}
+
 async function buildOverview() {
   const cfg = readConfig();
   const [status, positions, walletActivity, newMarkets, bot] = await Promise.all([
-    runEvent(["status", "--wallet", botWallet], { timeoutMs: 30000 }),
-    runEvent(["positions", "--wallet", botWallet], { timeoutMs: 30000 }),
+    runEvent(["status", ...walletArgs()], { timeoutMs: 30000 }),
+    runEvent(["positions", ...walletArgs()], { timeoutMs: 30000 }),
     fetchUserActivity(),
     fetchNewMarketsFeed(),
     getBotState()
@@ -89,11 +126,120 @@ async function buildOverview() {
     analytics: buildAnalytics(positions, walletActivity),
     activity: normalizeActivity(recentRows, walletActivity),
     settings: {
+      appName,
+      runtimeConfig: runtimeConfigSummary(cfg, status.watchConfig),
       stakeText: `${status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5} 档 / ${status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5}U`,
       windowText: `${status.watchConfig?.eventOpenWindowSeconds ?? 60}s`,
       autoSellText: autoSellText(status.watchConfig, cfg)
     }
   };
+}
+
+function runtimeConfigPayload() {
+  const cfg = readConfig();
+  return {
+    ok: true,
+    config: runtimeConfigSummary(cfg, null),
+    editable: {
+      filterModes: [
+        { value: "price_only_test", label: "只过滤 Price" },
+        { value: "production", label: "生产过滤" }
+      ],
+      limits: {
+        eventOutcomeCount: { min: 1, max: 12, step: 1 },
+        stakePerOutcomeUsdt: { min: 0.1, max: 100, step: 0.1 },
+        maxBatchStakeUsdt: { min: 0.1, max: 5000, step: 0.1 },
+        gasPriceGwei: { min: 0.01, max: 50, step: 0.01 },
+        autoSellStartDelaySeconds: { min: 0, max: 3600, step: 1 },
+        autoSellIntervalSeconds: { min: 1, max: 3600, step: 1 },
+        autoSellChunkPercent: { min: 0.1, max: 100, step: 0.1 },
+        autoSellStopLossPercent: { min: 0.1, max: 100, step: 0.1 },
+        autoSellStopLossSellPercent: { min: 0.1, max: 100, step: 0.1 }
+      }
+    },
+    writeProtected: Boolean(process.env.DASHBOARD_ADMIN_TOKEN)
+  };
+}
+
+function runtimeConfigSummary(cfg, watchConfig) {
+  return {
+    filterMode: watchConfig?.filterMode ?? cfg.filterMode ?? "production",
+    eventOutcomeCount: Number(watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount),
+    stakePerOutcomeUsdt: Number(watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt),
+    maxMarketStakeUsdt: Number(watchConfig?.maxMarketStakeUsdt ?? cfg.maxMarketStakeUsdt),
+    maxBatchStakeUsdt: Number(watchConfig?.maxBatchStakeUsdt ?? cfg.maxBatchStakeUsdt),
+    minEventDurationHours: Number(watchConfig?.minEventDurationHours ?? cfg.minEventDurationHours),
+    gasPriceGwei: String(watchConfig?.gasPriceGwei ?? cfg.gasPriceGwei),
+    autoSellEnabled: Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled),
+    autoSellStartDelaySeconds: Number(watchConfig?.autoSellStartDelaySeconds ?? cfg.autoSellStartDelaySeconds),
+    autoSellIntervalSeconds: Number(watchConfig?.autoSellIntervalSeconds ?? cfg.autoSellIntervalSeconds),
+    autoSellChunkPercent: Number(watchConfig?.autoSellChunkPercent ?? cfg.autoSellChunkPercent),
+    autoSellStopLossEnabled: Boolean(watchConfig?.autoSellStopLossEnabled ?? cfg.autoSellStopLossEnabled),
+    autoSellStopLossPercent: Number(watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent),
+    autoSellStopLossSellPercent: Number(watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent),
+    marketCategoryBlocklist: cfg.marketCategoryBlocklist ?? [],
+    marketTagBlocklist: cfg.marketTagBlocklist ?? [],
+    runtimeConfigFile: cfg.runtimeConfigFile
+  };
+}
+
+async function updateRuntimeConfig(req) {
+  const body = await readJsonBody(req);
+  requireAdminToken(req, body);
+  const isProduction = body.filterMode === "production";
+  const input = {
+    filterMode: body.filterMode,
+    eventOutcomeCount: body.eventOutcomeCount,
+    stakePerOutcomeUsdt: body.stakePerOutcomeUsdt,
+    maxBatchStakeUsdt: body.maxBatchStakeUsdt,
+    gasPriceGwei: body.gasPriceGwei,
+    autoSellEnabled: body.autoSellEnabled,
+    autoSellStartDelaySeconds: body.autoSellStartDelaySeconds,
+    autoSellIntervalSeconds: body.autoSellIntervalSeconds,
+    autoSellChunkPercent: body.autoSellChunkPercent,
+    autoSellStopLossEnabled: body.autoSellStopLossEnabled,
+    autoSellStopLossPercent: body.autoSellStopLossPercent,
+    autoSellStopLossSellPercent: body.autoSellStopLossSellPercent,
+    minEventDurationHours: isProduction ? (body.minEventDurationHours ?? 48) : 0,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: isProduction ? ["8 hour", "automated"] : []
+  };
+  input.maxMarketStakeUsdt = roundMoney(Number(input.eventOutcomeCount) * Number(input.stakePerOutcomeUsdt));
+  const config = normalizeRuntimeConfig(input, { partial: false });
+  const cfg = readConfig();
+  writeRuntimeConfig(cfg.runtimeConfigFile, config);
+  const restarted = await restartWorker();
+  overviewCache = null;
+  return {
+    ok: true,
+    config,
+    restarted,
+    message: restarted ? "配置已保存，worker 已重启" : "配置已保存"
+  };
+}
+
+function requireAdminToken(req, body = {}) {
+  const expected = process.env.DASHBOARD_ADMIN_TOKEN ?? "";
+  if (!expected) throw new Error("DASHBOARD_ADMIN_TOKEN is required before runtime config can be changed");
+  const provided = req.headers["x-admin-token"] ?? body.adminToken ?? "";
+  if (!safeEqual(String(provided), expected)) throw new Error("Invalid admin token");
+}
+
+function safeEqual(a, b) {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+async function restartWorker() {
+  if (process.env.DASHBOARD_RUNTIME_RESTART === "0") return false;
+  if (process.platform === "darwin") return false;
+  await execFileAsync("systemctl", ["restart", systemdService], { timeoutMs: 30000 });
+  return true;
+}
+
+function roundMoney(value) {
+  return Math.round(Number(value) * 1000000) / 1000000;
 }
 
 function autoSellText(watchConfig, cfg) {
@@ -116,7 +262,7 @@ function autoSellText(watchConfig, cfg) {
 async function sellQuote(body) {
   await assertManualSellAllowed();
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--wallet", botWallet, ...args], {
+  const result = await runEvent(["sell", ...requireWalletArgs(), ...args], {
     timeoutMs: 30000,
     env: {
       DRY_RUN: "1",
@@ -137,7 +283,7 @@ async function sellQuote(body) {
 async function sellExecute(body) {
   await assertManualSellAllowed();
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--execute", "--wallet", botWallet, ...args], {
+  const result = await runEvent(["sell", "--execute", ...requireWalletArgs(), ...args], {
     timeoutMs: 120000,
     env: {
       DRY_RUN: "0",
@@ -171,9 +317,18 @@ async function sellExecute(body) {
 }
 
 async function assertManualSellAllowed() {
-  const status = await runEvent(["status", "--wallet", botWallet], { timeoutMs: 30000 });
+  const status = await runEvent(["status", ...requireWalletArgs()], { timeoutMs: 30000 });
   const state = manualSellState(status, readConfig());
   if (state.blocked) throw new Error(state.message);
+}
+
+function walletArgs() {
+  return botWallet ? ["--wallet", botWallet] : [];
+}
+
+function requireWalletArgs() {
+  if (!botWallet) throw new Error("DASHBOARD_WALLET or WALLET_ADDRESS is required for dashboard sell actions");
+  return ["--wallet", botWallet];
 }
 
 function manualSellState(status, cfg) {
@@ -1052,6 +1207,7 @@ async function getSystemdBotState() {
 }
 
 async function fetchUserActivity() {
+  if (!botWallet) return [];
   try {
     const cfg = readConfig();
     return await fetchActivity(cfg, {
@@ -1151,7 +1307,10 @@ function parseLastJson(text) {
 
 function readJsonl(file, limit) {
   if (!fs.existsSync(file)) return [];
-  const lines = fs.readFileSync(file, "utf8").trim().split(/\r?\n/).filter(Boolean);
+  const lines = readTextTail(file, Number(process.env.DASHBOARD_JSONL_TAIL_BYTES ?? 4194304))
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean);
   return lines.slice(-limit).map((line) => {
     try {
       return JSON.parse(line);
@@ -1159,6 +1318,27 @@ function readJsonl(file, limit) {
       return null;
     }
   }).filter(Boolean);
+}
+
+function readTextTail(file, maxBytes) {
+  const stat = fs.statSync(file);
+  if (stat.size === 0) return "";
+  const bytes = Math.max(1024, Number(maxBytes) || 4194304);
+  const start = Math.max(0, stat.size - bytes);
+  const length = stat.size - start;
+  const buffer = Buffer.allocUnsafe(length);
+  const fd = fs.openSync(file, "r");
+  try {
+    fs.readSync(fd, buffer, 0, length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  let text = buffer.toString("utf8");
+  if (start > 0) {
+    const firstNewline = text.indexOf("\n");
+    text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+  }
+  return text;
 }
 
 function appendJsonl(file, row) {

@@ -28,8 +28,13 @@ export function readConfig() {
   loadDotEnv(".env.local");
   loadDotEnv();
   loadProviderEnv();
+  const runtimeConfigFile = envString("RUNTIME_CONFIG_FILE", "data/runtime-config.json");
+  const runtimeConfig = readRuntimeConfig(runtimeConfigFile);
 
   const cfg = {
+    botName: envString("BOT_NAME", "42space"),
+    runtimeConfigFile,
+    runtimeConfig,
     restUrl: envString("FORTYTWO_REST_URL", "https://rest.ft.42.space"),
     rpcUrl: envFirst(
       ["BSC_RPC_URL", "CHAINSTACK_BSC_RPC_URL", "ANKR_BSC_RPC_URL"],
@@ -140,6 +145,7 @@ export function readConfig() {
     autoSellPositionLimit: envInteger("AUTO_SELL_POSITION_LIMIT", 500),
     autoSellStateFile: envString("AUTO_SELL_STATE_FILE", "data/auto-sell-seen.json"),
     autoSellPositionStateFile: envString("AUTO_SELL_POSITION_STATE_FILE", "data/auto-sell-positions.json"),
+    autoSellCircuitStateFile: envString("AUTO_SELL_CIRCUIT_STATE_FILE", "data/auto-sell-circuit.json"),
     autoSellBuyGuardBeforeMs: envInteger("AUTO_SELL_BUY_GUARD_BEFORE_MS", 120000),
     autoSellBuyGuardAfterMs: envInteger("AUTO_SELL_BUY_GUARD_AFTER_MS", 10000),
     autoSellPreapproveOperator: envBool("AUTO_SELL_PREAPPROVE_OPERATOR", true),
@@ -149,6 +155,16 @@ export function readConfig() {
     autoSellMaxMarketsPerTx: envInteger("AUTO_SELL_MAX_MARKETS_PER_TX", 4),
     autoSellMaxGasPerTx: envInteger("AUTO_SELL_MAX_GAS_PER_TX", 12000000),
     autoSellMaxTxPerTick: envInteger("AUTO_SELL_MAX_TX_PER_TICK", 1),
+    autoSellMinBnbReserve: envNumber("AUTO_SELL_MIN_BNB_RESERVE", 0.003),
+    autoSellFailureCooldownMs: envInteger("AUTO_SELL_FAILURE_COOLDOWN_MS", 3600000),
+    autoSellMaxConsecutiveFailures: envInteger("AUTO_SELL_MAX_CONSECUTIVE_FAILURES", 2),
+    autoSellCircuitBreakerEnabled: envBool("AUTO_SELL_CIRCUIT_BREAKER_ENABLED", true),
+    autoSellCircuitFailureLimit: envInteger("AUTO_SELL_CIRCUIT_FAILURE_LIMIT", 2),
+    autoSellCircuitWindowMs: envInteger("AUTO_SELL_CIRCUIT_WINDOW_MS", 600000),
+    autoSellCircuitPauseMs: envInteger("AUTO_SELL_CIRCUIT_PAUSE_MS", 3600000),
+    autoSellErrorMessageMaxChars: envInteger("AUTO_SELL_ERROR_MESSAGE_MAX_CHARS", 500),
+    autoSellAlertCooldownMs: envInteger("AUTO_SELL_ALERT_COOLDOWN_MS", 3600000),
+    autoSellEligibleTailBytes: envInteger("AUTO_SELL_ELIGIBLE_TAIL_BYTES", 4194304),
     scanLimit: envInteger("SCAN_LIMIT", 10),
     openWindowSeconds: envInteger("OPEN_WINDOW_SECONDS", 45),
     lookaheadSeconds: envInteger("LOOKAHEAD_SECONDS", 900),
@@ -157,6 +173,7 @@ export function readConfig() {
     fillsFile: envString("FILLS_FILE", "data/fills.jsonl"),
     decisionFile: envString("MARKET_DECISIONS_FILE", "data/market-decisions.jsonl")
   };
+  applyRuntimeConfig(cfg, runtimeConfig);
   cfg.broadcastRpcUrls = resolveBroadcastRpcUrls(cfg.rpcUrl);
 
   if (cfg.stakeUsdt <= 0) throw new Error("STAKE_USDT must be positive");
@@ -274,6 +291,33 @@ export function readConfig() {
   if (cfg.autoSellMaxTxPerTick <= 0) {
     throw new Error("AUTO_SELL_MAX_TX_PER_TICK must be positive");
   }
+  if (cfg.autoSellMinBnbReserve < 0) {
+    throw new Error("AUTO_SELL_MIN_BNB_RESERVE must be 0 or a positive number");
+  }
+  if (cfg.autoSellFailureCooldownMs < 0) {
+    throw new Error("AUTO_SELL_FAILURE_COOLDOWN_MS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellMaxConsecutiveFailures <= 0) {
+    throw new Error("AUTO_SELL_MAX_CONSECUTIVE_FAILURES must be positive");
+  }
+  if (cfg.autoSellCircuitFailureLimit <= 0) {
+    throw new Error("AUTO_SELL_CIRCUIT_FAILURE_LIMIT must be positive");
+  }
+  if (cfg.autoSellCircuitWindowMs <= 0) {
+    throw new Error("AUTO_SELL_CIRCUIT_WINDOW_MS must be positive");
+  }
+  if (cfg.autoSellCircuitPauseMs < 0) {
+    throw new Error("AUTO_SELL_CIRCUIT_PAUSE_MS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellErrorMessageMaxChars <= 0) {
+    throw new Error("AUTO_SELL_ERROR_MESSAGE_MAX_CHARS must be positive");
+  }
+  if (cfg.autoSellAlertCooldownMs < 0) {
+    throw new Error("AUTO_SELL_ALERT_COOLDOWN_MS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellEligibleTailBytes <= 0) {
+    throw new Error("AUTO_SELL_ELIGIBLE_TAIL_BYTES must be positive");
+  }
   if (cfg.feishuAlertCooldownMs < 0) {
     throw new Error("FEISHU_ALERT_COOLDOWN_MS must be 0 or a positive integer");
   }
@@ -358,7 +402,156 @@ export function readConfig() {
   ensureParentDir(cfg.decisionFile);
   ensureParentDir(cfg.autoSellStateFile);
   ensureParentDir(cfg.autoSellPositionStateFile);
+  ensureParentDir(cfg.autoSellCircuitStateFile);
+  ensureParentDir(cfg.runtimeConfigFile);
   return cfg;
+}
+
+export function readRuntimeConfig(file = process.env.RUNTIME_CONFIG_FILE || "data/runtime-config.json") {
+  if (!fs.existsSync(file)) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`Failed to load runtime config ${file}: ${error.message}`);
+  }
+  return normalizeRuntimeConfig(parsed, { partial: true });
+}
+
+export function writeRuntimeConfig(file, input) {
+  const config = normalizeRuntimeConfig(input, { partial: false });
+  ensureParentDir(file);
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`);
+  fs.renameSync(tmp, file);
+  return config;
+}
+
+export function normalizeRuntimeConfig(input = {}, { partial = false } = {}) {
+  const raw = input && typeof input === "object" ? input : {};
+  const result = {};
+  const has = (key) => Object.prototype.hasOwnProperty.call(raw, key);
+  const take = (key, fallback, normalize) => {
+    if (!has(key)) {
+      if (!partial) result[key] = fallback;
+      return;
+    }
+    result[key] = normalize(raw[key], key);
+  };
+
+  take("filterMode", "price_only_test", (value, key) => {
+    const mode = String(value ?? "").trim();
+    if (!["production", "price_only_test"].includes(mode)) {
+      throw new Error(`${key} must be production or price_only_test`);
+    }
+    return mode;
+  });
+  take("eventOutcomeCount", 2, integerInRange(1, 12));
+  take("stakePerOutcomeUsdt", 1, numberInRange(0.1, 100));
+  take("maxMarketStakeUsdt", 2, numberInRange(0.1, 1000));
+  take("maxBatchStakeUsdt", 20, numberInRange(0.1, 5000));
+  take("minEventDurationHours", 0, numberInRange(0, 87600));
+  take("gasPriceGwei", "2.0", decimalStringInRange(0.01, 50));
+  take("autoSellEnabled", true, booleanValue);
+  take("autoSellStartDelaySeconds", 10, integerInRange(0, 3600));
+  take("autoSellIntervalSeconds", 10, integerInRange(1, 3600));
+  take("autoSellChunkPercent", 10, numberInRange(0.1, 100));
+  take("autoSellStopLossEnabled", true, booleanValue);
+  take("autoSellStopLossPercent", 10, numberInRange(0.1, 100));
+  take("autoSellStopLossSellPercent", 100, numberInRange(0.1, 100));
+
+  const mode = result.filterMode ?? (partial ? raw.filterMode : "price_only_test");
+  if (!partial || mode === "price_only_test") {
+    if (!has("marketCategoryBlocklist") && !partial) result.marketCategoryBlocklist = ["Price"];
+    if (!has("marketTagBlocklist") && !partial) result.marketTagBlocklist = [];
+  }
+  if (has("marketCategoryBlocklist")) result.marketCategoryBlocklist = stringList(raw.marketCategoryBlocklist, "marketCategoryBlocklist");
+  if (has("marketTagBlocklist")) result.marketTagBlocklist = stringList(raw.marketTagBlocklist, "marketTagBlocklist");
+
+  if (
+    result.maxMarketStakeUsdt !== undefined &&
+    result.eventOutcomeCount !== undefined &&
+    result.stakePerOutcomeUsdt !== undefined &&
+    result.maxMarketStakeUsdt < result.eventOutcomeCount * result.stakePerOutcomeUsdt
+  ) {
+    throw new Error("maxMarketStakeUsdt must cover eventOutcomeCount * stakePerOutcomeUsdt");
+  }
+  if (
+    result.maxBatchStakeUsdt !== undefined &&
+    result.maxMarketStakeUsdt !== undefined &&
+    result.maxBatchStakeUsdt < result.maxMarketStakeUsdt
+  ) {
+    throw new Error("maxBatchStakeUsdt must be >= maxMarketStakeUsdt");
+  }
+
+  return result;
+}
+
+function applyRuntimeConfig(cfg, runtimeConfig = {}) {
+  if (!runtimeConfig || Object.keys(runtimeConfig).length === 0) return;
+  if (runtimeConfig.filterMode) cfg.filterMode = runtimeConfig.filterMode;
+  if (runtimeConfig.eventOutcomeCount !== undefined) cfg.eventOutcomeCount = runtimeConfig.eventOutcomeCount;
+  if (runtimeConfig.stakePerOutcomeUsdt !== undefined) cfg.stakePerOutcomeUsdt = runtimeConfig.stakePerOutcomeUsdt;
+  if (runtimeConfig.maxMarketStakeUsdt !== undefined) cfg.maxMarketStakeUsdt = runtimeConfig.maxMarketStakeUsdt;
+  if (runtimeConfig.maxBatchStakeUsdt !== undefined) cfg.maxBatchStakeUsdt = runtimeConfig.maxBatchStakeUsdt;
+  if (runtimeConfig.minEventDurationHours !== undefined) cfg.minEventDurationHours = runtimeConfig.minEventDurationHours;
+  if (runtimeConfig.gasPriceGwei !== undefined) cfg.gasPriceGwei = runtimeConfig.gasPriceGwei;
+  if (runtimeConfig.autoSellEnabled !== undefined) cfg.autoSellEnabled = runtimeConfig.autoSellEnabled;
+  if (runtimeConfig.autoSellStartDelaySeconds !== undefined) cfg.autoSellStartDelaySeconds = runtimeConfig.autoSellStartDelaySeconds;
+  if (runtimeConfig.autoSellIntervalSeconds !== undefined) cfg.autoSellIntervalSeconds = runtimeConfig.autoSellIntervalSeconds;
+  if (runtimeConfig.autoSellChunkPercent !== undefined) cfg.autoSellChunkPercent = runtimeConfig.autoSellChunkPercent;
+  if (runtimeConfig.autoSellStopLossEnabled !== undefined) cfg.autoSellStopLossEnabled = runtimeConfig.autoSellStopLossEnabled;
+  if (runtimeConfig.autoSellStopLossPercent !== undefined) cfg.autoSellStopLossPercent = runtimeConfig.autoSellStopLossPercent;
+  if (runtimeConfig.autoSellStopLossSellPercent !== undefined) cfg.autoSellStopLossSellPercent = runtimeConfig.autoSellStopLossSellPercent;
+  if (runtimeConfig.marketCategoryBlocklist !== undefined) cfg.marketCategoryBlocklist = runtimeConfig.marketCategoryBlocklist;
+  if (runtimeConfig.marketTagBlocklist !== undefined) cfg.marketTagBlocklist = runtimeConfig.marketTagBlocklist;
+  if (runtimeConfig.filterMode === "price_only_test") {
+    cfg.minEventDurationHours = runtimeConfig.minEventDurationHours ?? 0;
+    cfg.marketCategoryBlocklist = runtimeConfig.marketCategoryBlocklist ?? ["Price"];
+    cfg.marketTagBlocklist = runtimeConfig.marketTagBlocklist ?? [];
+  }
+}
+
+function integerInRange(min, max) {
+  return (value, key) => {
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < min || number > max) {
+      throw new Error(`${key} must be an integer between ${min} and ${max}`);
+    }
+    return number;
+  };
+}
+
+function numberInRange(min, max) {
+  return (value, key) => {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < min || number > max) {
+      throw new Error(`${key} must be a number between ${min} and ${max}`);
+    }
+    return number;
+  };
+}
+
+function decimalStringInRange(min, max) {
+  return (value, key) => String(numberInRange(min, max)(value, key));
+}
+
+function booleanValue(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  throw new Error("boolean value must be true or false");
+}
+
+function stringList(value, key) {
+  const list = Array.isArray(value)
+    ? value
+    : String(value ?? "").split(",");
+  const normalized = list.map((item) => String(item).trim()).filter(Boolean);
+  if (normalized.some((item) => item.length > 80)) throw new Error(`${key} contains an item that is too long`);
+  return normalized;
 }
 
 function loadProviderEnv() {

@@ -219,6 +219,78 @@
                     <strong id="autoSellText">--</strong>
                   </div>
                 </div>
+                <form id="runtimeConfigForm" class="configForm">
+                  <div class="configGrid">
+                    <label class="field">
+                      <span>过滤模式</span>
+                      <select id="configMode">
+                        <option value="price_only_test">只过滤 Price</option>
+                        <option value="production">生产过滤</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>买入选项</span>
+                      <input id="configOutcomeCount" type="number" min="1" max="12" step="1">
+                    </label>
+                    <label class="field">
+                      <span>每项金额</span>
+                      <input id="configStakePerOutcome" type="number" min="0.1" max="100" step="0.1">
+                    </label>
+                    <label class="field">
+                      <span>批次上限</span>
+                      <input id="configMaxBatchStake" type="number" min="0.1" max="5000" step="0.1">
+                    </label>
+                    <label class="field">
+                      <span>Gas gwei</span>
+                      <input id="configGasPriceGwei" type="number" min="0.01" max="50" step="0.01">
+                    </label>
+                    <label class="field">
+                      <span>自动卖出</span>
+                      <select id="configAutoSellEnabled">
+                        <option value="1">开启</option>
+                        <option value="0">关闭</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>卖出延迟秒</span>
+                      <input id="configAutoSellStartDelay" type="number" min="0" max="3600" step="1">
+                    </label>
+                    <label class="field">
+                      <span>卖出间隔秒</span>
+                      <input id="configAutoSellInterval" type="number" min="1" max="3600" step="1">
+                    </label>
+                    <label class="field">
+                      <span>每次卖出 %</span>
+                      <input id="configAutoSellChunk" type="number" min="0.1" max="100" step="0.1">
+                    </label>
+                    <label class="field">
+                      <span>止损</span>
+                      <select id="configAutoSellStopLossEnabled">
+                        <option value="1">开启</option>
+                        <option value="0">关闭</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>止损触发 %</span>
+                      <input id="configAutoSellStopLoss" type="number" min="0.1" max="100" step="0.1">
+                    </label>
+                    <label class="field">
+                      <span>止损卖出 %</span>
+                      <input id="configAutoSellStopLossSell" type="number" min="0.1" max="100" step="0.1">
+                    </label>
+                    <label class="field tokenField">
+                      <span>管理令牌</span>
+                      <input id="configAdminToken" type="password" autocomplete="off">
+                    </label>
+                    <div class="configActions">
+                      <button id="saveConfigBtn" class="iconButton primaryAction" type="submit">
+                        <span data-icon="send"></span>
+                        <span>应用配置</span>
+                      </button>
+                    </div>
+                  </div>
+                  <p id="configStatus" class="configStatus">--</p>
+                </form>
               </section>
               <section class="panel">
                 <div class="panelHead">

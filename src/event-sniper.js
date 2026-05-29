@@ -7,7 +7,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import readline from "node:readline/promises";
 import { promisify } from "node:util";
-import { formatUnits, parseUnits } from "viem";
+import { formatUnits, parseGwei, parseUnits } from "viem";
 import WebSocket from "ws";
 import { appendJsonl, loadSeen, parseArgs, readConfig, saveSeen } from "./config.js";
 import {
@@ -40,6 +40,7 @@ import {
   quoteSellOutcome,
   quoteBuyAllOutcomes,
   resolveWalletBudgetGasLimit,
+  roundDownSellAmount,
   sellOutcome,
   sellOutcomesBatch,
   warmBroadcastRpcClients,
@@ -63,6 +64,7 @@ const marketDecisionDedupe = new Set();
 const WILL_BUY_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SELL_BATCH_BASE_GAS = 1_500_000;
 const SELL_BATCH_PER_OUTCOME_GAS = 1_000_000;
+const OPERATOR_APPROVAL_GAS = 250_000;
 
 async function main() {
   const [command = "scan", ...rest] = process.argv.slice(2);
@@ -514,6 +516,7 @@ async function status(cfg, args) {
     wallet,
     funding,
     gasReserve,
+    autoSellCircuit: summarizeAutoSellCircuit(cfg),
     requiredBusdtUpperBound: funding.upperBoundRequiredBusdt,
     watchConfig: {
       eventDiscovery: cfg.eventDiscovery,
@@ -527,6 +530,7 @@ async function status(cfg, args) {
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+      filterMode: cfg.filterMode ?? "production",
       autoSellEnabled: cfg.autoSellEnabled,
       autoSellStrategy: cfg.autoSellStrategy,
       autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
@@ -547,6 +551,8 @@ async function status(cfg, args) {
       autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
+      maxMarketStakeUsdt: cfg.maxMarketStakeUsdt,
+      gasPriceGwei: cfg.gasPriceGwei || null,
       minEventDurationHours: cfg.minEventDurationHours,
       fastSkipPreflight: cfg.fastSkipPreflight,
       fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
@@ -762,6 +768,14 @@ async function bench(cfg, args) {
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
       autoSellPollMs: cfg.autoSellPollMs,
+      autoSellBuyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
+      autoSellBuyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
+      autoSellPreapproveOperator: cfg.autoSellPreapproveOperator,
+      autoSellRequirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator,
+      autoSellMaxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
+      autoSellMaxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
+      autoSellMaxGasPerTx: cfg.autoSellMaxGasPerTx,
+      autoSellMaxTxPerTick: cfg.autoSellMaxTxPerTick,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       fastGasLimit: cfg.fastGasLimit,
       bundleFastGasLimit: cfg.bundleFastGasLimit,
@@ -1141,7 +1155,26 @@ async function selfTest(cfg) {
     autoSellChunkPercent: 10,
     autoSellStopLossEnabled: true,
     autoSellStopLossPercent: 10,
-    autoSellStopLossSellPercent: 100
+    autoSellStopLossSellPercent: 100,
+    autoSellBuyGuardBeforeMs: 120000,
+    autoSellBuyGuardAfterMs: 10000,
+    autoSellPreapproveOperator: true,
+    autoSellApprovalsPerTick: 1,
+    autoSellRequirePreapprovedOperator: true,
+    autoSellMaxOutcomesPerTx: 8,
+    autoSellMaxMarketsPerTx: 4,
+    autoSellMaxGasPerTx: 12000000,
+    autoSellMaxTxPerTick: 1,
+    autoSellMinBnbReserve: 0.003,
+    autoSellFailureCooldownMs: 3600000,
+    autoSellMaxConsecutiveFailures: 2,
+    autoSellCircuitBreakerEnabled: true,
+    autoSellCircuitFailureLimit: 2,
+    autoSellCircuitWindowMs: 600000,
+    autoSellCircuitPauseMs: 3600000,
+    autoSellErrorMessageMaxChars: 500,
+    autoSellAlertCooldownMs: 3600000,
+    autoSellEligibleTailBytes: 4194304
   };
   const passed = [];
 
@@ -1268,14 +1301,106 @@ async function selfTest(cfg) {
         chunk.length <= testCfg.autoSellMaxOutcomesPerTx &&
         new Set(chunk.map((entry) => String(entry.item.plan.market).toLowerCase())).size <= testCfg.autoSellMaxMarketsPerTx &&
         estimateAutoSellBatchGas(chunk.length) <= testCfg.autoSellMaxGasPerTx
-      ),
+    ),
     `auto-sell should chunk 14 outcomes into capped batches, got ${sellChunks.map((chunk) => chunk.length).join(",")}`
   );
   assertSelfTest(
     isSuccessfulBuyFill({ result: { dryRun: false, status: "broadcast" }, plan: { market: { address: "0x0000000000000000000000000000000000000001" } } }),
     "broadcast buy fills should make positions eligible for auto-sell monitoring"
   );
-  passed.push("auto-sell buy guard, chunking, and broadcast eligibility are enforced");
+  const tailTestId = `${Date.now()}-${process.pid}`;
+  const tailFillsFile = path.join(os.tmpdir(), `42space-tail-fills-${tailTestId}.jsonl`);
+  const tailPositionStateFile = path.join(os.tmpdir(), `42space-tail-positions-${tailTestId}.json`);
+  try {
+    const tailRows = [
+      { id: "old", at: "2030-01-01T00:00:00.000Z", pad: "x".repeat(2048) },
+      {
+        id: "buy",
+        at: "2030-01-01T00:00:01.000Z",
+        result: { dryRun: false, status: "broadcast" },
+        plan: { market: { address: "0x0000000000000000000000000000000000000011" } }
+      },
+      {
+        id: "receipt",
+        at: "2030-01-01T00:00:02.000Z",
+        level: "event-receipt",
+        status: "success",
+        context: { market: "0x0000000000000000000000000000000000000012" }
+      }
+    ];
+    fs.writeFileSync(tailFillsFile, `${tailRows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+    saveAutoSellPositionState(tailPositionStateFile, {
+      positions: {
+        "wallet:market:token": {
+          marketAddress: "0x0000000000000000000000000000000000000013",
+          tokenId: "1",
+          buyAt: "2030-01-01T00:00:03.000Z"
+        }
+      }
+    });
+    const tailEligibleMarkets = loadAutoSellEligibleMarkets({
+      ...testCfg,
+      fillsFile: tailFillsFile,
+      autoSellPositionStateFile: tailPositionStateFile,
+      autoSellEligibleTailBytes: 700
+    });
+    assertSelfTest(!tailEligibleMarkets.has("0x0000000000000000000000000000000000000010"), "tail reader should not parse stale prefix rows");
+    assertSelfTest(tailEligibleMarkets.has("0x0000000000000000000000000000000000000011"), "tail reader should retain broadcast buy fills");
+    assertSelfTest(tailEligibleMarkets.has("0x0000000000000000000000000000000000000012"), "tail reader should retain receipt buy fills");
+    assertSelfTest(tailEligibleMarkets.has("0x0000000000000000000000000000000000000013"), "position state should keep auto-sell eligibility when fills are tailed");
+  } finally {
+    fs.rmSync(tailFillsFile, { force: true });
+    fs.rmSync(tailPositionStateFile, { force: true });
+    fs.rmSync(`${tailPositionStateFile}.bak`, { force: true });
+  }
+  passed.push("auto-sell buy guard, chunking, and tailed broadcast eligibility are enforced");
+
+  const noisyAutoSellError = autoSellErrorMessage(
+    { ...testCfg, autoSellErrorMessageMaxChars: 160 },
+    { message: `execution reverted data: 0x${"a".repeat(512)} Request Arguments: calldata=0x${"b".repeat(512)}` }
+  );
+  assertSelfTest(noisyAutoSellError.length < 220, `auto-sell error should be compact, got ${noisyAutoSellError.length} chars`);
+  assertSelfTest(!noisyAutoSellError.includes("a".repeat(96)), "auto-sell error should truncate long hex calldata");
+
+  const circuitState = defaultAutoSellCircuitState();
+  const circuitNow = Date.parse("2030-01-01T00:00:00.000Z");
+  const firstFailure = recordAutoSellFailure(testCfg, circuitState, {
+    keys: ["wallet:market:token"],
+    status: "receipt-reverted",
+    message: "receipt reverted",
+    now: circuitNow,
+    countGlobal: true
+  });
+  assertSelfTest(!firstFailure.opened, "first auto-sell failure should not open the circuit");
+  const secondFailure = recordAutoSellFailure(testCfg, circuitState, {
+    keys: ["wallet:market:token"],
+    status: "receipt-reverted",
+    message: "receipt reverted again",
+    now: circuitNow + 1000,
+    countGlobal: true
+  });
+  assertSelfTest(secondFailure.opened, "second auto-sell failure should open the circuit");
+  assertSelfTest(
+    autoSellCircuitPauseInfo(circuitState, circuitNow + 1000)?.reason === "consecutive-auto-sell-failures",
+    "auto-sell circuit pause reason should be recorded"
+  );
+  assertSelfTest(
+    autoSellFailureCooldownInfo(circuitState, "wallet:market:token", circuitNow + 1000)?.consecutiveFailures === 2,
+    "auto-sell position failure cooldown should be recorded"
+  );
+  recordAutoSellSuccess(circuitState, ["wallet:market:token"]);
+  assertSelfTest(!circuitState.failures["wallet:market:token"], "auto-sell success should clear per-position failure state");
+  passed.push("auto-sell circuit breaker, cooldown, and error compaction are enforced");
+
+  assertSelfTest(
+    formatUnits(roundDownSellAmount(parseUnits("108.884", 18)), 18) === "108.88",
+    "auto-sell amount should round down to the 0.01 outcome-token curve tick"
+  );
+  assertSelfTest(
+    roundDownSellAmount(parseUnits("0.009", 18)) === 0n,
+    "sub-tick auto-sell amount should not be sent"
+  );
+  passed.push("sell amounts are normalized to the market curve tick");
 
   assertSelfTest(
     effectivePrebroadcastMs({ ...testCfg, prebroadcastMs: 750, allowPreopenBroadcast: false }) === 0,
@@ -1790,7 +1915,7 @@ async function arm(cfg, args) {
   }
 
   notifyFeishu(cfg, {
-    title: "42space bot 已启动",
+    title: "bot 已启动",
     fields: {
       mode: "execute",
       discovery: cfg.eventDiscovery,
@@ -2205,6 +2330,10 @@ async function watch(cfg, options = {}) {
         eventOutcomeSelection: cfg.eventOutcomeSelection,
         eventOutcomeCount: cfg.eventOutcomeCount,
         eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+        filterMode: cfg.filterMode ?? "production",
+        minEventDurationHours: cfg.minEventDurationHours,
+        marketCategoryBlocklist: cfg.marketCategoryBlocklist,
+        marketTagBlocklist: cfg.marketTagBlocklist,
         restDiscoveryEnabled: cfg.restDiscoveryEnabled,
         restDiscoveryPollMs: cfg.restDiscoveryPollMs,
         fastSkipPreflight: cfg.fastSkipPreflight,
@@ -2312,38 +2441,47 @@ function startAutoSellMonitor(cfg, runtime = null) {
         runtime,
         source: "monitor"
       });
-      if (result.triggered > 0 || result.errors.length > 0) {
+      if (result.executed > 0 || result.errors.length > 0 || result.circuitBreaker?.opened) {
         console.log(JSON.stringify({
           level: "event-auto-sell-monitor",
           mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
           ...result
         }));
+        const circuitOpened = result.circuitBreaker?.opened;
         notifyFeishu(cfg, {
-          title: result.errors.length > 0 ? "自动卖出有错误" : "自动卖出已触发",
-          level: result.errors.length > 0 ? "warn" : "info",
+          title: circuitOpened ? "自动卖出已暂停" : (result.errors.length > 0 ? "自动卖出有错误" : "自动卖出已触发"),
+          level: result.errors.length > 0 || circuitOpened ? "warn" : "info",
           fields: {
             triggered: result.triggered,
             executed: result.executed,
             errors: result.errors.length,
+            circuit: result.circuitBreaker?.status ?? "",
+            reason: result.circuitBreaker?.reason ?? "",
+            pausedUntil: result.circuitBreaker?.pausedUntil ?? "",
             first: result.actions[0]?.question ?? result.errors[0]?.question ?? ""
           },
-          dedupeKey: result.errors.length > 0 ? "auto-sell-errors" : null,
-          cooldownMs: cfg.feishuAlertCooldownMs
+          dedupeKey: circuitOpened
+            ? `auto-sell-circuit-${result.circuitBreaker.reason ?? "open"}`
+            : (result.errors.length > 0 ? "auto-sell-errors" : null),
+          cooldownMs: result.errors.length > 0 || circuitOpened
+            ? cfg.autoSellAlertCooldownMs
+            : cfg.feishuAlertCooldownMs
         });
       }
     } catch (error) {
+      const message = autoSellErrorMessage(cfg, error);
       console.error(JSON.stringify({
         level: "event-auto-sell-error",
         source: "monitor",
-        message: errorMessage(error),
+        message,
         at: new Date().toISOString()
       }));
       notifyFeishu(cfg, {
         title: "自动卖出监控异常",
         level: "warn",
-        fields: { message: errorMessage(error) },
+        fields: { message },
         dedupeKey: "auto-sell-monitor-error",
-        cooldownMs: cfg.feishuAlertCooldownMs
+        cooldownMs: cfg.autoSellAlertCooldownMs
       });
     } finally {
       running = false;
@@ -2351,6 +2489,7 @@ function startAutoSellMonitor(cfg, runtime = null) {
   };
 
   const timer = setInterval(tick, cfg.autoSellPollMs);
+  void tick();
   return timer;
 }
 
@@ -2370,12 +2509,25 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     triggered: 0,
     executed: 0,
     skipped: 0,
+    cooldowns: 0,
     errors: [],
     actions: []
   };
+  const now = Date.now();
+  const circuitState = loadAutoSellCircuitState(cfg.autoSellCircuitStateFile);
   const startupBlock = runtimeAutoSellBlockInfo(cfg, runtime);
   if (startupBlock) {
     Object.assign(result, startupBlock);
+    return result;
+  }
+  const circuitPause = autoSellCircuitPauseInfo(circuitState, now);
+  if (circuitPause) {
+    result.skippedReason = "auto-sell-circuit-open";
+    result.circuitBreaker = {
+      status: "open",
+      reason: circuitPause.reason,
+      pausedUntil: circuitPause.until
+    };
     return result;
   }
 
@@ -2385,7 +2537,6 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
   });
   const eligibleMarkets = loadAutoSellEligibleMarkets(cfg);
   const ladderState = loadAutoSellPositionState(cfg.autoSellPositionStateFile);
-  const now = Date.now();
   const allItems = [];
 
   for (const position of openPositions) {
@@ -2402,8 +2553,15 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     }
 
     result.checked += 1;
+    const key = autoSellPositionKey(walletAddress, position);
+    const cooldown = autoSellFailureCooldownInfo(circuitState, key, now);
+    if (cooldown) {
+      result.skipped += 1;
+      result.cooldowns += 1;
+      continue;
+    }
+
     try {
-      const key = autoSellPositionKey(walletAddress, position);
       const entry = ensureAutoSellPositionState(ladderState, key, position, buyAt);
       if (entry.completed || entry.stopLossSold) {
         result.alreadyHandled += 1;
@@ -2416,12 +2574,23 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
       result.triggered += 1;
       allItems.push({ key, entry, position, ...action });
     } catch (error) {
+      const message = autoSellErrorMessage(cfg, error);
+      const failure = recordAutoSellFailure(cfg, circuitState, {
+        keys: [key],
+        status: isInsufficientFundsErrorMessage(message) ? "insufficient-bnb" : "position-error",
+        message,
+        now,
+        countGlobal: isInsufficientFundsErrorMessage(message)
+      });
+      saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
+      if (failure.opened) result.circuitBreaker = failure.circuitBreaker;
       const item = {
         marketAddress: position.marketAddress,
         tokenId: String(position.tokenId),
         question: position.question?.title ?? null,
         outcome: position.outcome?.name ?? null,
-        message: errorMessage(error)
+        message,
+        cooldownUntil: failure.cooldowns[0]?.until ?? null
       };
       result.errors.push(item);
       console.error(JSON.stringify({
@@ -2441,7 +2610,8 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
       runtime,
       result,
       source,
-      walletAddress
+      walletAddress,
+      circuitState
     });
   }
 
@@ -2481,9 +2651,35 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     });
   }
 
+  const postApprovalPause = autoSellCircuitPauseInfo(circuitState, Date.now());
+  if (postApprovalPause) {
+    const skippedActions = readyItems.map(({ action }) => ({
+      ...action,
+      status: "skipped-auto-sell-circuit-open",
+      pausedUntil: postApprovalPause.until,
+      pauseReason: postApprovalPause.reason
+    }));
+    result.skipped += skippedActions.length;
+    result.actions.push(...skippedActions);
+    result.circuitBreaker = {
+      status: "open",
+      reason: postApprovalPause.reason,
+      pausedUntil: postApprovalPause.until
+    };
+    if (skippedActions.length > 0) {
+      appendAutoSellBatchLog(cfg, {
+        source,
+        walletAddress,
+        markets: [...new Set(skippedActions.map((action) => action.marketAddress))],
+        actions: skippedActions,
+        execution: { status: "skipped-auto-sell-circuit-open", circuitBreaker: result.circuitBreaker }
+      });
+    }
+    return result;
+  }
+
   const chunks = chunkAutoSellItems(cfg, readyItems);
-  for (let index = 0; index < chunks.length; index += 1) {
-    const chunk = chunks[index];
+  for (const chunk of chunks) {
     const items = chunk.map((entry) => entry.item);
     const actions = chunk.map((entry) => entry.action);
     let execution = null;
@@ -2503,6 +2699,30 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         continue;
       }
 
+      const activeCircuitPause = autoSellCircuitPauseInfo(circuitState, Date.now());
+      if (activeCircuitPause) {
+        for (const action of actions) {
+          action.status = "skipped-auto-sell-circuit-open";
+          action.pausedUntil = activeCircuitPause.until;
+          action.pauseReason = activeCircuitPause.reason;
+        }
+        result.skipped += actions.length;
+        result.actions.push(...actions);
+        result.circuitBreaker = {
+          status: "open",
+          reason: activeCircuitPause.reason,
+          pausedUntil: activeCircuitPause.until
+        };
+        appendAutoSellBatchLog(cfg, {
+          source,
+          walletAddress,
+          markets: marketsFromItems(items),
+          actions,
+          execution: { status: "skipped-auto-sell-circuit-open", circuitBreaker: result.circuitBreaker }
+        });
+        continue;
+      }
+
       if (txsSent >= cfg.autoSellMaxTxPerTick) {
         for (const action of actions) action.status = "deferred-tx-limit";
         result.skipped += actions.length;
@@ -2513,6 +2733,46 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
           markets: marketsFromItems(items),
           actions,
           execution: { status: "deferred-tx-limit", maxTxPerTick: cfg.autoSellMaxTxPerTick }
+        });
+        continue;
+      }
+
+      try {
+        await ensureAutoSellGasBudget(cfg, publicClient, walletAddress, estimateAutoSellBatchGas(items.length));
+      } catch (error) {
+        const message = autoSellErrorMessage(cfg, error);
+        const failure = recordAutoSellFailure(cfg, circuitState, {
+          keys: items.map((item) => item.key),
+          status: isInsufficientFundsErrorMessage(message) ? "insufficient-bnb" : "gas-budget-error",
+          message,
+          now: Date.now(),
+          countGlobal: true
+        });
+        saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
+        for (const action of actions) {
+          action.status = "skipped-gas-budget";
+          action.message = message;
+          action.cooldownUntil = failure.cooldowns.find((entry) => entry.key === autoSellActionPositionKey(walletAddress, action))?.until ?? null;
+        }
+        result.skipped += actions.length;
+        result.errors.push({
+          markets: marketsFromItems(items),
+          count: items.length,
+          message,
+          circuitBreaker: failure.circuitBreaker ?? null
+        });
+        if (failure.opened) result.circuitBreaker = failure.circuitBreaker;
+        result.actions.push(...actions);
+        appendAutoSellBatchLog(cfg, {
+          source,
+          walletAddress,
+          markets: marketsFromItems(items),
+          actions,
+          execution: {
+            status: "skipped-gas-budget",
+            message,
+            circuitBreaker: failure.circuitBreaker ?? null
+          }
         });
         continue;
       }
@@ -2531,24 +2791,52 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         action.status = execution.status;
       }
       if (execution.status === "success") {
+        recordAutoSellSuccess(circuitState, items.map((item) => item.key));
+        saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
         for (const item of items) markAutoSellActionApplied(cfg, item.entry, item);
         saveAutoSellPositionState(cfg.autoSellPositionStateFile, ladderState);
         result.executed += actions.length;
       } else {
+        const message = `auto-sell receipt status ${execution.status}`;
+        const failure = recordAutoSellFailure(cfg, circuitState, {
+          keys: items.map((item) => item.key),
+          status: `receipt-${execution.status}`,
+          message,
+          txHash: execution.txHash ?? null,
+          now: Date.now(),
+          countGlobal: true
+        });
+        saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
+        if (failure.opened) result.circuitBreaker = failure.circuitBreaker;
+        for (const action of actions) {
+          action.cooldownUntil = failure.cooldowns.find((entry) => entry.key === autoSellActionPositionKey(walletAddress, action))?.until ?? null;
+        }
         result.errors.push({
           markets: marketsFromItems(items),
           count: items.length,
-          message: `auto-sell receipt status ${execution.status}`
+          message,
+          circuitBreaker: failure.circuitBreaker ?? null
         });
       }
 
       result.actions.push(...actions);
       appendAutoSellBatchLog(cfg, { source, walletAddress, markets: marketsFromItems(items), actions, execution });
     } catch (error) {
+      const message = autoSellErrorMessage(cfg, error);
+      const failure = recordAutoSellFailure(cfg, circuitState, {
+        keys: items.map((item) => item.key),
+        status: isInsufficientFundsErrorMessage(message) ? "insufficient-bnb" : "tx-error",
+        message,
+        now: Date.now(),
+        countGlobal: true
+      });
+      saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
+      if (failure.opened) result.circuitBreaker = failure.circuitBreaker;
       const item = {
         markets: marketsFromItems(items),
         count: items.length,
-        message: errorMessage(error)
+        message,
+        circuitBreaker: failure.circuitBreaker ?? null
       };
       result.errors.push(item);
       console.error(JSON.stringify({
@@ -2559,7 +2847,8 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
       }));
       for (const action of actions) {
         action.status = "error";
-        action.message = errorMessage(error);
+        action.message = message;
+        action.cooldownUntil = failure.cooldowns.find((entry) => entry.key === autoSellActionPositionKey(walletAddress, action))?.until ?? null;
       }
       result.actions.push(...actions);
       appendAutoSellBatchLog(cfg, { source, walletAddress, markets: marketsFromItems(items), actions, execution });
@@ -2569,8 +2858,9 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
   return result;
 }
 
-async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets, runtime, result, source, walletAddress }) {
+async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets, runtime, result, source, walletAddress, circuitState }) {
   if (cfg.autoSellApprovalsPerTick <= 0) return 0;
+  const { publicClient } = makeClients(cfg);
   const markets = [];
   const seenMarkets = new Set();
   for (const position of openPositions) {
@@ -2591,6 +2881,7 @@ async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets
       break;
     }
     try {
+      await ensureAutoSellGasBudget(cfg, publicClient, walletAddress, OPERATOR_APPROVAL_GAS);
       const execution = await withRuntimeTransactionLock(runtime, "operator-preapproval", () =>
         ensureMarketOperatorApproval(cfg, market)
       );
@@ -2624,9 +2915,20 @@ async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets
         });
       }
     } catch (error) {
+      const message = autoSellErrorMessage(cfg, error);
+      const failure = circuitState ? recordAutoSellFailure(cfg, circuitState, {
+        keys: [`operator:${String(market).toLowerCase()}`],
+        status: isInsufficientFundsErrorMessage(message) ? "insufficient-bnb" : "operator-preapproval-error",
+        message,
+        now: Date.now(),
+        countGlobal: true
+      }) : { opened: false, cooldowns: [] };
+      if (circuitState) saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
+      if (failure.opened) result.circuitBreaker = failure.circuitBreaker;
       const item = {
         marketAddress: market,
-        message: errorMessage(error)
+        message,
+        circuitBreaker: failure.circuitBreaker ?? null
       };
       result.errors.push(item);
       console.error(JSON.stringify({
@@ -2635,6 +2937,7 @@ async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets
         ...item,
         at: new Date().toISOString()
       }));
+      if (failure.opened) break;
     }
   }
   return sent;
@@ -2699,7 +3002,7 @@ async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, posit
       ? Math.max(0, (1 - fullExitValueUsdt / costBasisUsdt) * 100)
       : 0;
   } catch (error) {
-    quoteError = errorMessage(error);
+    quoteError = autoSellErrorMessage(cfg, error);
   }
 
   if (
@@ -2779,8 +3082,8 @@ function appendAutoSellBatchLog(cfg, { source, walletAddress, market = null, mar
     market,
     markets,
     strategy: cfg.autoSellStrategy,
-    actions,
-    execution,
+    actions: sanitizeAutoSellLogValue(cfg, actions),
+    execution: sanitizeAutoSellLogValue(cfg, execution),
     at: new Date().toISOString()
   });
 }
@@ -2858,15 +3161,7 @@ function loadAutoSellEligibleMarkets(cfg) {
     ? new Date(cfg.autoSellApplyAfterIso).getTime()
     : 0;
   const markets = new Map();
-  if (!fs.existsSync(cfg.fillsFile)) return markets;
-  const lines = fs.readFileSync(cfg.fillsFile, "utf8").split(/\r?\n/).filter(Boolean);
-  for (const line of lines) {
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  for (const row of readJsonlTailRows(cfg.fillsFile, cfg.autoSellEligibleTailBytes)) {
     const at = new Date(row.at ?? 0).getTime();
     if (!Number.isFinite(at) || at < applyAfterMs) continue;
     if (!isSuccessfulBuyFill(row)) continue;
@@ -2877,7 +3172,53 @@ function loadAutoSellEligibleMarkets(cfg) {
       }
     }
   }
+  addAutoSellPositionStateEligibleMarkets(cfg, markets, applyAfterMs);
   return markets;
+}
+
+function readJsonlTailRows(file, maxBytes) {
+  if (!fs.existsSync(file)) return [];
+  const stat = fs.statSync(file);
+  if (stat.size === 0) return [];
+  const bytes = Math.max(1024, Number(maxBytes) || 4194304);
+  const start = Math.max(0, stat.size - bytes);
+  const length = stat.size - start;
+  const buffer = Buffer.allocUnsafe(length);
+  const fd = fs.openSync(file, "r");
+  try {
+    fs.readSync(fd, buffer, 0, length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  let text = buffer.toString("utf8");
+  if (start > 0) {
+    const firstNewline = text.indexOf("\n");
+    text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+  }
+  return text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function addAutoSellPositionStateEligibleMarkets(cfg, markets, applyAfterMs) {
+  const state = loadAutoSellPositionState(cfg.autoSellPositionStateFile);
+  for (const entry of Object.values(state.positions ?? {})) {
+    const market = entry?.marketAddress;
+    const at = new Date(entry?.buyAt ?? 0).getTime();
+    if (!market || !Number.isFinite(at) || at < applyAfterMs) continue;
+    const key = String(market).toLowerCase();
+    if (!markets.has(key) || new Date(markets.get(key)).getTime() < at) {
+      markets.set(key, new Date(at).toISOString());
+    }
+  }
 }
 
 function isSuccessfulBuyFill(row) {
@@ -2933,6 +3274,306 @@ function saveAutoSellPositionState(file, state) {
   }
   fs.renameSync(tmp, file);
   fs.chmodSync(file, 0o600);
+}
+
+function loadAutoSellCircuitState(file) {
+  if (!fs.existsSync(file)) return defaultAutoSellCircuitState();
+  try {
+    return normalizeAutoSellCircuitState(JSON.parse(fs.readFileSync(file, "utf8")));
+  } catch (error) {
+    const backup = `${file}.bak`;
+    if (fs.existsSync(backup)) {
+      return normalizeAutoSellCircuitState(JSON.parse(fs.readFileSync(backup, "utf8")));
+    }
+    throw new Error(`Failed to load auto-sell circuit state ${file}: ${error.message}`);
+  }
+}
+
+function saveAutoSellCircuitState(file, state) {
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  const backup = `${file}.bak`;
+  fs.writeFileSync(tmp, `${JSON.stringify(normalizeAutoSellCircuitState(state), null, 2)}\n`, { mode: 0o600 });
+  if (fs.existsSync(file)) {
+    fs.copyFileSync(file, backup);
+    fs.chmodSync(backup, 0o600);
+  }
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
+}
+
+function defaultAutoSellCircuitState() {
+  return {
+    version: 1,
+    pausedUntil: null,
+    pauseReason: null,
+    pauseMessage: null,
+    pauseOpenedAt: null,
+    failures: {},
+    recentFailures: []
+  };
+}
+
+function normalizeAutoSellCircuitState(input) {
+  const raw = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  return {
+    version: 1,
+    pausedUntil: raw.pausedUntil ?? null,
+    pauseReason: raw.pauseReason ?? null,
+    pauseMessage: raw.pauseMessage ?? null,
+    pauseOpenedAt: raw.pauseOpenedAt ?? null,
+    failures: raw.failures && typeof raw.failures === "object" && !Array.isArray(raw.failures)
+      ? raw.failures
+      : {},
+    recentFailures: Array.isArray(raw.recentFailures) ? raw.recentFailures.slice(-100) : []
+  };
+}
+
+function autoSellCircuitPauseInfo(state, now = Date.now()) {
+  const untilMs = Date.parse(state?.pausedUntil ?? "");
+  if (!Number.isFinite(untilMs) || untilMs <= now) return null;
+  return {
+    reason: state.pauseReason ?? "circuit-breaker",
+    message: state.pauseMessage ?? null,
+    until: new Date(untilMs).toISOString()
+  };
+}
+
+function summarizeAutoSellCircuit(cfg) {
+  try {
+    const state = loadAutoSellCircuitState(cfg.autoSellCircuitStateFile);
+    const pause = autoSellCircuitPauseInfo(state);
+    return {
+      enabled: cfg.autoSellCircuitBreakerEnabled,
+      status: pause ? "open" : "closed",
+      reason: pause?.reason ?? null,
+      pausedUntil: pause?.until ?? null,
+      failureKeys: Object.keys(state.failures ?? {}).length,
+      recentFailures: Array.isArray(state.recentFailures) ? state.recentFailures.length : 0,
+      maxConsecutiveFailures: cfg.autoSellMaxConsecutiveFailures,
+      failureCooldownMs: cfg.autoSellFailureCooldownMs,
+      circuitFailureLimit: cfg.autoSellCircuitFailureLimit,
+      circuitWindowMs: cfg.autoSellCircuitWindowMs,
+      circuitPauseMs: cfg.autoSellCircuitPauseMs,
+      minBnbReserve: cfg.autoSellMinBnbReserve
+    };
+  } catch (error) {
+    return {
+      enabled: cfg.autoSellCircuitBreakerEnabled,
+      status: "error",
+      message: autoSellErrorMessage(cfg, error)
+    };
+  }
+}
+
+function autoSellFailureCooldownInfo(state, key, now = Date.now()) {
+  const entry = state?.failures?.[key];
+  if (!entry) return null;
+  const untilMs = Date.parse(entry.cooldownUntil ?? "");
+  if (!Number.isFinite(untilMs) || untilMs <= now) return null;
+  return {
+    reason: "failure-cooldown",
+    until: new Date(untilMs).toISOString(),
+    consecutiveFailures: Number(entry.consecutive ?? 0),
+    message: entry.lastMessage ?? null
+  };
+}
+
+function recordAutoSellSuccess(state, keys) {
+  if (!state?.failures) return;
+  for (const key of uniqueAutoSellKeys(keys)) {
+    delete state.failures[key];
+  }
+}
+
+function recordAutoSellFailure(cfg, state, {
+  keys,
+  status,
+  message,
+  txHash = null,
+  now = Date.now(),
+  countGlobal = false
+} = {}) {
+  const normalized = normalizeAutoSellCircuitState(state);
+  Object.assign(state, normalized);
+  const compactMessage = compactAutoSellMessage(message, cfg.autoSellErrorMessageMaxChars);
+  const cooldowns = [];
+  const uniqueKeys = uniqueAutoSellKeys(keys);
+
+  for (const key of uniqueKeys) {
+    const current = state.failures[key] ?? {};
+    const previousCooldownMs = Date.parse(current.cooldownUntil ?? "");
+    const previousConsecutive = Number(current.consecutive ?? 0);
+    const consecutive = Number.isFinite(previousCooldownMs) && previousCooldownMs <= now
+      ? 1
+      : previousConsecutive + 1;
+    const next = {
+      ...current,
+      consecutive,
+      lastStatus: status,
+      lastMessage: compactMessage,
+      lastTxHash: txHash,
+      lastFailedAt: new Date(now).toISOString()
+    };
+    if (consecutive >= cfg.autoSellMaxConsecutiveFailures && cfg.autoSellFailureCooldownMs > 0) {
+      next.cooldownUntil = new Date(now + cfg.autoSellFailureCooldownMs).toISOString();
+      cooldowns.push({ key, until: next.cooldownUntil, consecutive });
+    }
+    state.failures[key] = next;
+  }
+
+  let opened = false;
+  let circuitBreaker = null;
+  const insufficientBnb = status === "insufficient-bnb" || isInsufficientFundsErrorMessage(compactMessage);
+  if (insufficientBnb) {
+    opened = openAutoSellCircuit(cfg, state, {
+      reason: "insufficient-bnb",
+      message: compactMessage,
+      now
+    });
+  } else if (countGlobal && cfg.autoSellCircuitBreakerEnabled) {
+    state.recentFailures = (state.recentFailures ?? [])
+      .filter((entry) => {
+        const at = Date.parse(entry.at ?? "");
+        return Number.isFinite(at) && now - at <= cfg.autoSellCircuitWindowMs;
+      });
+    state.recentFailures.push({
+      at: new Date(now).toISOString(),
+      status,
+      message: compactMessage,
+      txHash
+    });
+    if (state.recentFailures.length >= cfg.autoSellCircuitFailureLimit) {
+      opened = openAutoSellCircuit(cfg, state, {
+        reason: "consecutive-auto-sell-failures",
+        message: compactMessage,
+        now
+      });
+    }
+  }
+
+  const pause = autoSellCircuitPauseInfo(state, now);
+  if (pause) {
+    circuitBreaker = {
+      status: "open",
+      reason: pause.reason,
+      pausedUntil: pause.until,
+      message: pause.message,
+      opened
+    };
+  }
+  pruneAutoSellCircuitState(state, now);
+  return { opened, cooldowns, circuitBreaker };
+}
+
+function openAutoSellCircuit(cfg, state, { reason, message, now }) {
+  const pausedUntilMs = now + cfg.autoSellCircuitPauseMs;
+  const previousPausedUntilMs = Date.parse(state.pausedUntil ?? "");
+  const opened = !Number.isFinite(previousPausedUntilMs) || pausedUntilMs > previousPausedUntilMs;
+  state.pausedUntil = new Date(pausedUntilMs).toISOString();
+  state.pauseReason = reason;
+  state.pauseMessage = compactAutoSellMessage(message, cfg.autoSellErrorMessageMaxChars);
+  state.pauseOpenedAt = new Date(now).toISOString();
+  return opened;
+}
+
+function pruneAutoSellCircuitState(state, now = Date.now()) {
+  const keepAfter = now - 24 * 60 * 60 * 1000;
+  state.recentFailures = (state.recentFailures ?? []).filter((entry) => {
+    const at = Date.parse(entry.at ?? "");
+    return Number.isFinite(at) && at >= keepAfter;
+  }).slice(-100);
+  for (const [key, entry] of Object.entries(state.failures ?? {})) {
+    const lastFailedAt = Date.parse(entry.lastFailedAt ?? "");
+    const cooldownUntil = Date.parse(entry.cooldownUntil ?? "");
+    const stillCooling = Number.isFinite(cooldownUntil) && cooldownUntil > now;
+    const recentlyFailed = Number.isFinite(lastFailedAt) && lastFailedAt >= keepAfter;
+    if (!stillCooling && !recentlyFailed) delete state.failures[key];
+  }
+}
+
+function uniqueAutoSellKeys(keys) {
+  const result = [];
+  const seen = new Set();
+  for (const key of Array.isArray(keys) ? keys : [keys]) {
+    const normalized = String(key ?? "").trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+async function ensureAutoSellGasBudget(cfg, publicClient, walletAddress, gasUnits) {
+  if (cfg.dryRun || !cfg.execute) return null;
+  const gasLimit = BigInt(Math.max(0, Number(gasUnits ?? 0)));
+  const gasPriceWei = cfg.gasPriceGwei
+    ? parseGwei(String(cfg.gasPriceGwei))
+    : await publicClient.getGasPrice();
+  const estimatedTxCostWei = gasLimit * gasPriceWei;
+  const minReserveWei = parseUnits(String(cfg.autoSellMinBnbReserve ?? 0), 18);
+  const requiredWei = estimatedTxCostWei + minReserveWei;
+  const balanceWei = await publicClient.getBalance({ address: walletAddress });
+  if (balanceWei < requiredWei) {
+    const error = new Error(
+      `AUTO_SELL gas guard: BNB balance ${formatUnits(balanceWei, 18)} below required ${formatUnits(requiredWei, 18)} ` +
+      `(estimatedGas=${gasLimit.toString()}, gasPriceGwei=${formatUnits(gasPriceWei, 9)}, minReserveBnb=${cfg.autoSellMinBnbReserve})`
+    );
+    error.code = "AUTO_SELL_INSUFFICIENT_BNB";
+    throw error;
+  }
+  return {
+    balanceBnb: formatUnits(balanceWei, 18),
+    requiredBnb: formatUnits(requiredWei, 18),
+    estimatedTxCostBnb: formatUnits(estimatedTxCostWei, 18),
+    gasLimit: gasLimit.toString(),
+    gasPriceGwei: formatUnits(gasPriceWei, 9)
+  };
+}
+
+function autoSellActionPositionKey(walletAddress, action) {
+  return [
+    String(walletAddress).toLowerCase(),
+    String(action.marketAddress).toLowerCase(),
+    String(action.tokenId)
+  ].join(":");
+}
+
+function autoSellErrorMessage(cfg, error) {
+  return compactAutoSellMessage(errorMessage(error), cfg.autoSellErrorMessageMaxChars);
+}
+
+function compactAutoSellMessage(message, maxChars = 500) {
+  const limit = Math.max(80, Number(maxChars) || 500);
+  let text = redactSecretUrls(String(message ?? ""));
+  text = text.replace(/0x[a-fA-F0-9]{96,}/g, (hex) =>
+    `${hex.slice(0, 18)}...${hex.slice(-12)}[hex:${hex.length}]`
+  );
+  text = text.replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}...[truncated ${text.length - limit} chars]`;
+}
+
+function sanitizeAutoSellLogValue(cfg, value, depth = 0) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return compactAutoSellMessage(value, cfg.autoSellErrorMessageMaxChars);
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value !== "object") return value;
+  if (depth >= 5) return "[truncated-depth]";
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeAutoSellLogValue(cfg, item, depth + 1));
+  }
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    result[key] = sanitizeAutoSellLogValue(cfg, item, depth + 1);
+  }
+  return result;
+}
+
+function isInsufficientFundsErrorMessage(message) {
+  return /insufficient funds|gas \* price|exceeds the balance|not enough (?:bnb|native)|AUTO_SELL_INSUFFICIENT_BNB|AUTO_SELL gas guard|BNB balance .*below required/i.test(String(message));
 }
 
 function isAutoSellablePosition(position) {
@@ -5732,7 +6373,7 @@ function notifyFeishu(cfg, { title, level = "info", fields = {}, dedupeKey = nul
     alertCooldowns.set(dedupeKey, now);
   }
 
-  const text = formatFeishuAlertText({ title, level, fields });
+  const text = formatFeishuAlertText({ title: alertTitle(cfg, title), level, fields });
   void sendFeishuMessage(cfg.feishuWebhook, text).catch((error) => {
     console.error(JSON.stringify({
       level: "warn",
@@ -5741,6 +6382,13 @@ function notifyFeishu(cfg, { title, level = "info", fields = {}, dedupeKey = nul
       at: new Date().toISOString()
     }));
   });
+}
+
+function alertTitle(cfg, title) {
+  const botName = cfg.botName ? String(cfg.botName).trim() : "";
+  if (!botName) return title;
+  if (String(title).startsWith(`[${botName}]`)) return title;
+  return `[${botName}] ${title}`;
 }
 
 async function sendFeishuMessage(webhook, text) {

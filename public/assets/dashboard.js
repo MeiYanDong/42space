@@ -35,6 +35,8 @@ const state = {
   sellPercent: 100,
   quoteRequest: 0,
   quoteTimer: null,
+  configDirty: false,
+  runtimeConfig: null,
   timer: null
 };
 
@@ -88,6 +90,22 @@ const els = {
   windowText: $("windowText"),
   autoSellText: $("autoSellText"),
   preflightList: $("preflightList"),
+  runtimeConfigForm: $("runtimeConfigForm"),
+  configMode: $("configMode"),
+  configOutcomeCount: $("configOutcomeCount"),
+  configStakePerOutcome: $("configStakePerOutcome"),
+  configMaxBatchStake: $("configMaxBatchStake"),
+  configGasPriceGwei: $("configGasPriceGwei"),
+  configAutoSellEnabled: $("configAutoSellEnabled"),
+  configAutoSellStartDelay: $("configAutoSellStartDelay"),
+  configAutoSellInterval: $("configAutoSellInterval"),
+  configAutoSellChunk: $("configAutoSellChunk"),
+  configAutoSellStopLossEnabled: $("configAutoSellStopLossEnabled"),
+  configAutoSellStopLoss: $("configAutoSellStopLoss"),
+  configAutoSellStopLossSell: $("configAutoSellStopLossSell"),
+  configAdminToken: $("configAdminToken"),
+  saveConfigBtn: $("saveConfigBtn"),
+  configStatus: $("configStatus"),
   sellDrawer: $("sellDrawer"),
   sellBackdrop: $("sellBackdrop"),
   closeDialog: $("closeDialog"),
@@ -106,12 +124,14 @@ const els = {
 renderStaticIcons();
 bindNavigation();
 bindSellControls();
+bindRuntimeConfigControls();
 setRoute(state.route, { replace: true });
 
 els.refreshBtn.addEventListener("click", () => loadOverview({ force: true }));
 window.addEventListener("hashchange", () => setRoute(routeFromHash(), { replace: true }));
 
 loadOverview();
+loadRuntimeConfig();
 state.timer = setInterval(() => {
   updateCountdowns();
   loadOverview();
@@ -128,6 +148,17 @@ async function loadOverview({ force = false } = {}) {
     showToast(error.message || "刷新失败");
   } finally {
     els.refreshBtn.disabled = false;
+  }
+}
+
+async function loadRuntimeConfig({ force = false } = {}) {
+  try {
+    const data = await api("/api/runtime-config");
+    state.runtimeConfig = data.config;
+    if (!state.configDirty || force) setRuntimeConfigForm(data.config);
+    els.configStatus.textContent = runtimeStatusText(data.config);
+  } catch (error) {
+    els.configStatus.textContent = error.message || "配置读取失败";
   }
 }
 
@@ -443,6 +474,7 @@ function renderStrategy(data) {
   els.stakeText.textContent = data.settings?.stakeText ?? "--";
   els.windowText.textContent = data.settings?.windowText ?? "--";
   els.autoSellText.textContent = data.settings?.autoSellText ?? "--";
+  if (!state.configDirty && data.settings?.runtimeConfig) setRuntimeConfigForm(data.settings.runtimeConfig);
   const checks = [
     { label: "运行状态", value: data.bot.label, tone: data.bot.tone },
     { label: "资金状态", value: data.wallet ? `${data.wallet.label} · ${data.wallet.busdt} U / ${data.wallet.bnb} BNB` : "--", tone: data.wallet?.tone ?? "warn" },
@@ -456,6 +488,31 @@ function renderStrategy(data) {
       <strong class="${check.tone}">${escapeHtml(check.value)}</strong>
     </div>
   `).join("");
+}
+
+function setRuntimeConfigForm(config) {
+  if (!config) return;
+  els.configMode.value = config.filterMode ?? "price_only_test";
+  els.configOutcomeCount.value = config.eventOutcomeCount ?? 2;
+  els.configStakePerOutcome.value = config.stakePerOutcomeUsdt ?? 1;
+  els.configMaxBatchStake.value = config.maxBatchStakeUsdt ?? 20;
+  els.configGasPriceGwei.value = config.gasPriceGwei ?? 2;
+  els.configAutoSellEnabled.value = config.autoSellEnabled ? "1" : "0";
+  els.configAutoSellStartDelay.value = config.autoSellStartDelaySeconds ?? 10;
+  els.configAutoSellInterval.value = config.autoSellIntervalSeconds ?? 10;
+  els.configAutoSellChunk.value = config.autoSellChunkPercent ?? 10;
+  els.configAutoSellStopLossEnabled.value = config.autoSellStopLossEnabled ? "1" : "0";
+  els.configAutoSellStopLoss.value = config.autoSellStopLossPercent ?? 10;
+  els.configAutoSellStopLossSell.value = config.autoSellStopLossSellPercent ?? 100;
+}
+
+function runtimeStatusText(config) {
+  if (!config) return "--";
+  const mode = config.filterMode === "price_only_test" ? "只过滤 Price" : "生产过滤";
+  const sell = config.autoSellEnabled
+    ? `${config.autoSellStartDelaySeconds}s/${config.autoSellIntervalSeconds}s/${config.autoSellChunkPercent}%`
+    : "卖出关";
+  return `${mode} · ${config.eventOutcomeCount} 档 · ${config.stakePerOutcomeUsdt}U/档 · gas ${config.gasPriceGwei} · ${sell}`;
 }
 
 function openSell(item) {
@@ -619,6 +676,77 @@ function bindSellControls() {
   }
 }
 
+function bindRuntimeConfigControls() {
+  if (!els.runtimeConfigForm) return;
+  const token = localStorage.getItem("42spaceAdminToken") ?? "";
+  els.configAdminToken.value = token;
+  for (const input of [
+    els.configMode,
+    els.configOutcomeCount,
+    els.configStakePerOutcome,
+    els.configMaxBatchStake,
+    els.configGasPriceGwei,
+    els.configAutoSellEnabled,
+    els.configAutoSellStartDelay,
+    els.configAutoSellInterval,
+    els.configAutoSellChunk,
+    els.configAutoSellStopLossEnabled,
+    els.configAutoSellStopLoss,
+    els.configAutoSellStopLossSell
+  ]) {
+    input.addEventListener("input", () => {
+      state.configDirty = true;
+      els.configStatus.textContent = "未应用";
+    });
+  }
+  els.configAdminToken.addEventListener("input", () => {
+    localStorage.setItem("42spaceAdminToken", els.configAdminToken.value);
+  });
+  els.runtimeConfigForm.addEventListener("submit", saveRuntimeConfig);
+}
+
+async function saveRuntimeConfig(event) {
+  event.preventDefault();
+  const token = els.configAdminToken.value.trim();
+  if (!token) {
+    showToast("需要管理令牌");
+    return;
+  }
+  const payload = {
+    filterMode: els.configMode.value,
+    eventOutcomeCount: Number(els.configOutcomeCount.value),
+    stakePerOutcomeUsdt: Number(els.configStakePerOutcome.value),
+    maxBatchStakeUsdt: Number(els.configMaxBatchStake.value),
+    gasPriceGwei: String(els.configGasPriceGwei.value),
+    autoSellEnabled: els.configAutoSellEnabled.value === "1",
+    autoSellStartDelaySeconds: Number(els.configAutoSellStartDelay.value),
+    autoSellIntervalSeconds: Number(els.configAutoSellInterval.value),
+    autoSellChunkPercent: Number(els.configAutoSellChunk.value),
+    autoSellStopLossEnabled: els.configAutoSellStopLossEnabled.value === "1",
+    autoSellStopLossPercent: Number(els.configAutoSellStopLoss.value),
+    autoSellStopLossSellPercent: Number(els.configAutoSellStopLossSell.value)
+  };
+  els.saveConfigBtn.disabled = true;
+  try {
+    const data = await api("/api/runtime-config", {
+      method: "PUT",
+      headers: { "x-admin-token": token },
+      body: JSON.stringify(payload)
+    });
+    state.configDirty = false;
+    state.runtimeConfig = data.config;
+    localStorage.setItem("42spaceAdminToken", token);
+    setRuntimeConfigForm(data.config);
+    els.configStatus.textContent = runtimeStatusText(data.config);
+    showToast(data.message || "配置已应用");
+    await loadOverview({ force: true });
+  } catch (error) {
+    showToast(error.message || "配置保存失败");
+  } finally {
+    els.saveConfigBtn.disabled = false;
+  }
+}
+
 function setRoute(route, { replace = false } = {}) {
   const nextRoute = ROUTES[route] ? route : "overview";
   state.route = nextRoute;
@@ -704,9 +832,10 @@ function updateCountdowns() {
 }
 
 async function api(url, options = {}) {
+  const { headers = {}, ...rest } = options;
   const response = await fetch(url, {
-    headers: { "content-type": "application/json" },
-    ...options
+    ...rest,
+    headers: { "content-type": "application/json", ...headers }
   });
   const data = await response.json();
   if (!response.ok || data.ok === false) throw new Error(data.message || "请求失败");
