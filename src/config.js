@@ -463,7 +463,7 @@ export function normalizeRuntimeConfig(input = {}, { partial = false } = {}) {
   const mode = result.filterMode ?? (partial ? raw.filterMode : "price_only_test");
   if (!partial || mode === "price_only_test") {
     if (!has("marketCategoryBlocklist") && !partial) result.marketCategoryBlocklist = ["Price"];
-    if (!has("marketTagBlocklist") && !partial) result.marketTagBlocklist = [];
+    if (!has("marketTagBlocklist") && !partial) result.marketTagBlocklist = ["Price"];
   }
   if (has("marketCategoryBlocklist")) result.marketCategoryBlocklist = stringList(raw.marketCategoryBlocklist, "marketCategoryBlocklist");
   if (has("marketTagBlocklist")) result.marketTagBlocklist = stringList(raw.marketTagBlocklist, "marketTagBlocklist");
@@ -507,8 +507,8 @@ function applyRuntimeConfig(cfg, runtimeConfig = {}) {
   if (runtimeConfig.marketTagBlocklist !== undefined) cfg.marketTagBlocklist = runtimeConfig.marketTagBlocklist;
   if (runtimeConfig.filterMode === "price_only_test") {
     cfg.minEventDurationHours = runtimeConfig.minEventDurationHours ?? 0;
-    cfg.marketCategoryBlocklist = runtimeConfig.marketCategoryBlocklist ?? ["Price"];
-    cfg.marketTagBlocklist = runtimeConfig.marketTagBlocklist ?? [];
+    cfg.marketCategoryBlocklist = ensureListIncludes(runtimeConfig.marketCategoryBlocklist ?? ["Price"], "Price");
+    cfg.marketTagBlocklist = ensureListIncludes(runtimeConfig.marketTagBlocklist ?? ["Price"], "Price");
   }
 }
 
@@ -552,6 +552,12 @@ function stringList(value, key) {
   const normalized = list.map((item) => String(item).trim()).filter(Boolean);
   if (normalized.some((item) => item.length > 80)) throw new Error(`${key} contains an item that is too long`);
   return normalized;
+}
+
+function ensureListIncludes(value, required) {
+  const list = stringList(value, "list");
+  if (list.some((item) => item.toLowerCase() === String(required).toLowerCase())) return list;
+  return [...list, required];
 }
 
 function loadProviderEnv() {

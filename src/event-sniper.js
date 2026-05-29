@@ -9,7 +9,7 @@ import readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { formatUnits, parseGwei, parseUnits } from "viem";
 import WebSocket from "ws";
-import { appendJsonl, loadSeen, parseArgs, readConfig, saveSeen } from "./config.js";
+import { appendJsonl, loadSeen, normalizeRuntimeConfig, parseArgs, readConfig, saveSeen } from "./config.js";
 import {
   approveRouterMax,
   buildDirectSellPlan,
@@ -1516,24 +1516,44 @@ async function selfTest(cfg) {
     tags: ["8 hour"]
   })], testCfg);
   assertSelfTest(priceMarkets.length === 0, "Price market filter should exclude BTC price range markets");
-  const textualPriceDecision = getEventMarketDecision(mockEventMarket({
+  const priceTagDecision = getEventMarketDecision(mockEventMarket({
     address: "0x0000000000000000000000000000000000000244",
-    question: "What is the price of BTC at 10:00 UTC on 29 May 2026?",
+    question: "Tagged price market",
     categories: ["Crypto"],
-    tags: ["Normal"],
+    tags: ["Price"],
     startDate: new Date(Date.now() + 60000).toISOString(),
     endDate: new Date(Date.now() + 72 * 3600000).toISOString()
   }), {
     ...testCfg,
     minEventDurationHours: 0,
     marketCategoryBlocklist: ["Price"],
-    marketTagBlocklist: []
+    marketTagBlocklist: ["Price"]
   });
   assertSelfTest(
-    !textualPriceDecision.eligible && textualPriceDecision.reason === "price-market",
-    `textual price question should be excluded as Price, got ${JSON.stringify(textualPriceDecision)}`
+    !priceTagDecision.eligible && priceTagDecision.reason === "price-market",
+    `Price-tagged market should be excluded as Price, got ${JSON.stringify(priceTagDecision)}`
   );
-  passed.push("Price markets and textual price questions are excluded from Event Market bot");
+  const priceOnlyRuntimeConfig = normalizeRuntimeConfig({
+    filterMode: "price_only_test",
+    eventOutcomeCount: 2,
+    stakePerOutcomeUsdt: 1,
+    maxMarketStakeUsdt: 2,
+    maxBatchStakeUsdt: 20,
+    minEventDurationHours: 0,
+    gasPriceGwei: "0.15",
+    autoSellEnabled: true,
+    autoSellStartDelaySeconds: 10,
+    autoSellIntervalSeconds: 10,
+    autoSellChunkPercent: 10,
+    autoSellStopLossEnabled: true,
+    autoSellStopLossPercent: 10,
+    autoSellStopLossSellPercent: 100
+  });
+  assertSelfTest(
+    priceOnlyRuntimeConfig.marketTagBlocklist?.includes("Price"),
+    `price_only_test runtime config should block Price tags, got ${JSON.stringify(priceOnlyRuntimeConfig.marketTagBlocklist)}`
+  );
+  passed.push("Price category/tag markets are excluded from Event Market bot");
 
   const longEventMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000045",

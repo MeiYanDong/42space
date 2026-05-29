@@ -242,7 +242,7 @@ async function updateRuntimeConfig(req) {
     autoSellStopLossSellPercent: body.autoSellStopLossSellPercent,
     minEventDurationHours: isProduction ? (body.minEventDurationHours ?? 48) : 0,
     marketCategoryBlocklist: ["Price"],
-    marketTagBlocklist: isProduction ? ["8 hour", "automated"] : []
+    marketTagBlocklist: isProduction ? ["8 hour", "automated"] : ["Price"]
   };
   input.maxMarketStakeUsdt = roundMoney(Number(input.eventOutcomeCount) * Number(input.stakePerOutcomeUsdt));
   const config = normalizeRuntimeConfig(input, { partial: false });
