@@ -1755,6 +1755,48 @@ async function selfTest(cfg) {
   );
   passed.push("Feishu alerts render as operator cards with clean text fallback");
 
+  const fundingFeishuAlert = buildFeishuAlertView({
+    title: "[42space-2] 资金不足，等待补款",
+    level: "warn",
+    fields: {
+      shortfall: "BUSDT 差 1U / BNB 差 0.001",
+      nextStart: "2030-01-01T00:30:00.000Z",
+      msUntilNextStart: 1800000,
+      retryMs: 1000,
+      requiredBusdt: 2,
+      wallet: "0x0000000000000000000000000000000000000055",
+      action: "补资金后自动恢复"
+    }
+  });
+  const fundingFeishuText = formatFeishuAlertText(fundingFeishuAlert);
+  assertSelfTest(fundingFeishuText.includes("状态：暂不会买入"), "funding alert should show operator state");
+  assertSelfTest(fundingFeishuText.includes("缺口：BUSDT 差 1U"), "funding alert should show funding gap");
+  assertSelfTest(fundingFeishuText.includes("处理：补资金后自动恢复"), "funding alert should show next action");
+  assertSelfTest(!fundingFeishuText.includes("retryMs"), "funding alert should not expose retryMs");
+  assertSelfTest(!fundingFeishuText.includes("requiredBusdt"), "funding alert should not expose requiredBusdt");
+  assertSelfTest(!fundingFeishuText.includes("wallet"), "funding alert should not expose wallet as a raw field");
+
+  const alertStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-alert-state-test-"));
+  try {
+    const alertCfg = { ...testCfg, alertStateFile: path.join(alertStateDir, "alert-state.json") };
+    const alertKey = `self-test-alert-${Date.now()}`;
+    assertSelfTest(
+      shouldSendFeishuAlert(alertCfg, { dedupeKey: alertKey, fingerprint: "same", title: "测试告警" }),
+      "first fingerprint alert should send"
+    );
+    assertSelfTest(
+      !shouldSendFeishuAlert(alertCfg, { dedupeKey: alertKey, fingerprint: "same", title: "测试告警" }),
+      "same fingerprint alert should be suppressed"
+    );
+    assertSelfTest(
+      shouldSendFeishuAlert(alertCfg, { dedupeKey: alertKey, fingerprint: "changed", title: "测试告警" }),
+      "changed fingerprint alert should send"
+    );
+  } finally {
+    fs.rmSync(alertStateDir, { recursive: true, force: true });
+  }
+  passed.push("Feishu funding cards are concise and state-change dedupe is persistent");
+
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-self-test-"));
   try {
     const stateFile = path.join(stateDir, "seen.json");
@@ -2570,31 +2612,32 @@ function startAutoSellMonitor(cfg, runtime = null) {
         source: "monitor"
       });
       if (result.executed > 0 || result.errors.length > 0 || result.circuitBreaker?.opened) {
+        const circuitOpened = result.circuitBreaker?.opened;
         console.log(JSON.stringify({
           level: "event-auto-sell-monitor",
           mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
           ...result
         }));
-        const circuitOpened = result.circuitBreaker?.opened;
-        notifyFeishu(cfg, {
-          title: circuitOpened ? "自动卖出已暂停" : (result.errors.length > 0 ? "自动卖出有错误" : "自动卖出已触发"),
-          level: result.errors.length > 0 || circuitOpened ? "warn" : "info",
-          fields: {
-            triggered: result.triggered,
-            executed: result.executed,
-            errors: result.errors.length,
-            circuit: result.circuitBreaker?.status ?? "",
-            reason: result.circuitBreaker?.reason ?? "",
-            pausedUntil: result.circuitBreaker?.pausedUntil ?? "",
-            first: result.actions[0]?.question ?? result.errors[0]?.question ?? ""
-          },
-          dedupeKey: circuitOpened
-            ? `auto-sell-circuit-${result.circuitBreaker.reason ?? "open"}`
-            : (result.errors.length > 0 ? "auto-sell-errors" : null),
-          cooldownMs: result.errors.length > 0 || circuitOpened
-            ? cfg.autoSellAlertCooldownMs
-            : cfg.feishuAlertCooldownMs
-        });
+        if (result.errors.length > 0 || circuitOpened) {
+          notifyFeishu(cfg, {
+            title: circuitOpened ? "自动卖出已暂停" : "自动卖出有错误",
+            level: "warn",
+            fields: {
+              errors: result.errors.length,
+              circuit: result.circuitBreaker?.status ?? "",
+              reason: result.circuitBreaker?.reason ?? result.errors[0]?.message ?? "",
+              pausedUntil: result.circuitBreaker?.pausedUntil ?? "",
+              first: result.errors[0]?.question ?? result.actions[0]?.question ?? "",
+              action: circuitOpened ? "等待冷却后自动恢复" : "已进入失败冷却，查看控制台"
+            },
+            dedupeKey: circuitOpened
+              ? `auto-sell-circuit-${result.circuitBreaker.reason ?? "open"}`
+              : "auto-sell-errors",
+            cooldownMs: cfg.autoSellAlertCooldownMs,
+            fingerprint: autoSellAlertFingerprint(result),
+            repeatMs: 0
+          });
+        }
       }
     } catch (error) {
       const message = autoSellErrorMessage(cfg, error);
@@ -2609,7 +2652,9 @@ function startAutoSellMonitor(cfg, runtime = null) {
         level: "warn",
         fields: { message },
         dedupeKey: "auto-sell-monitor-error",
-        cooldownMs: cfg.autoSellAlertCooldownMs
+        cooldownMs: cfg.autoSellAlertCooldownMs,
+        fingerprint: `monitor-error:${message}`,
+        repeatMs: 0
       });
     } finally {
       running = false;
@@ -3673,6 +3718,18 @@ function autoSellErrorMessage(cfg, error) {
   return compactAutoSellMessage(errorMessage(error), cfg.autoSellErrorMessageMaxChars);
 }
 
+function autoSellAlertFingerprint(result = {}) {
+  const firstError = result.errors?.[0] ?? {};
+  return [
+    result.circuitBreaker?.opened ? "circuit" : "error",
+    result.circuitBreaker?.reason ?? "",
+    result.circuitBreaker?.pausedUntil ?? "",
+    firstError.marketAddress ?? firstError.market ?? "",
+    firstError.tokenId ?? "",
+    compactAutoSellMessage(firstError.message ?? result.circuitBreaker?.reason ?? "", 160)
+  ].join(":");
+}
+
 function compactAutoSellMessage(message, maxChars = 500) {
   const limit = Math.max(80, Number(maxChars) || 500);
   let text = redactSecretUrls(String(message ?? ""));
@@ -3801,20 +3858,16 @@ async function waitForWatchFunding(cfg) {
         }));
         notifyFeishu(cfg, {
           title: "资金检查通过",
-          fields: {
-            wallet: fundingStatus.address ?? "",
-            requiredBusdt: fundingStatus.funding?.requiredBusdt ?? "",
-            executableBusdt: fundingStatus.executablePlan?.totalStakeUsdt ?? "",
-            executableMarkets: fundingStatus.executablePlan?.selected?.length ?? "",
-            unfundedMarkets: fundingStatus.executablePlan?.skipped?.length ?? "",
-            requiredBnb: fundingStatus.gasReserve?.requiredBnb ?? ""
-          },
+          fields: buildFundingReadyAlertFields(fundingStatus),
           dedupeKey: "funding-ready",
-          cooldownMs: cfg.feishuAlertCooldownMs
+          cooldownMs: cfg.feishuAlertCooldownMs,
+          fingerprint: fundingReadyAlertFingerprint(fundingStatus),
+          repeatMs: 0
         });
         return fundingStatus;
       }
       retryMs = nextFundingRetryMs(cfg, fundingStatus);
+      const waitAlertFields = buildFundingWaitingAlertFields(fundingStatus, retryMs);
       console.error(JSON.stringify({
         level: "event-arm-waiting-for-funds",
         message: fundingStatus.message,
@@ -3828,26 +3881,28 @@ async function waitForWatchFunding(cfg) {
       notifyFeishu(cfg, {
         title: "资金不足，等待补款",
         level: "warn",
-        fields: {
-          message: fundingStatus.message,
-          retryMs
-        },
+        fields: waitAlertFields,
         dedupeKey: "waiting-for-funds",
-        cooldownMs: cfg.feishuAlertCooldownMs
+        cooldownMs: cfg.feishuAlertCooldownMs,
+        fingerprint: fundingWaitingAlertFingerprint(fundingStatus),
+        repeatMs: 0
       });
     } catch (error) {
+      const message = errorMessage(error);
       console.error(JSON.stringify({
         level: "event-arm-waiting-error",
-        message: errorMessage(error),
+        message,
         retryMs,
         at: new Date().toISOString()
       }));
       notifyFeishu(cfg, {
         title: "资金检查异常",
         level: "warn",
-        fields: { message: errorMessage(error), retryMs },
+        fields: { message, retryMs, action: "查看日志或 RPC 状态" },
         dedupeKey: "funding-check-error",
-        cooldownMs: cfg.feishuAlertCooldownMs
+        cooldownMs: cfg.feishuAlertCooldownMs,
+        fingerprint: `funding-error:${compactAutoSellMessage(message, 180)}`,
+        repeatMs: 0
       });
     }
     await sleep(retryMs);
@@ -3873,6 +3928,112 @@ function fundingMsUntilStart(fundingStatus) {
   const ts = Date.parse(startDate);
   if (!Number.isFinite(ts)) return null;
   return ts - Date.now();
+}
+
+function buildFundingReadyAlertFields(fundingStatus) {
+  return {
+    requiredBusdt: fundingStatus?.funding?.requiredBusdt ?? "",
+    executableBusdt: fundingStatus?.executablePlan?.totalStakeUsdt ?? "",
+    executableMarkets: fundingStatus?.executablePlan?.selected?.length ?? "",
+    totalMarkets: fundingStatus?.funding?.nextBatchMarketCount ?? "",
+    unfundedMarkets: fundingStatus?.executablePlan?.skipped?.length ?? "",
+    requiredBnb: fundingStatus?.gasReserve?.requiredBnb ?? "",
+    nextStart: fundingStatus?.funding?.nextBatchStartDate ?? "",
+    partialFunding: fundingStatus?.wallet?.partialFunding ? "yes" : "",
+    action: "无需操作"
+  };
+}
+
+function buildFundingWaitingAlertFields(fundingStatus, retryMs) {
+  return {
+    message: fundingStatus?.message ?? "",
+    shortfall: fundingShortfallText(fundingStatus),
+    nextStart: fundingStatus?.funding?.nextBatchStartDate ?? "",
+    msUntilNextStart: fundingMsUntilStart(fundingStatus),
+    executableMarkets: fundingStatus?.executablePlan?.selected?.length ?? "",
+    totalMarkets: fundingStatus?.funding?.nextBatchMarketCount ?? "",
+    retryMs,
+    action: fundingWaitActionText(fundingStatus)
+  };
+}
+
+function fundingReadyAlertFingerprint(fundingStatus) {
+  return [
+    "ready",
+    fundingStatus?.skipped ? "skipped" : "checked",
+    fundingStatus?.funding?.nextBatchStartDate ?? "no-start",
+    fundingStatus?.executablePlan?.selected?.length ?? 0,
+    fundingStatus?.funding?.nextBatchMarketCount ?? 0,
+    fundingStatus?.wallet?.partialFunding ? "partial" : "full"
+  ].join(":");
+}
+
+function fundingWaitingAlertFingerprint(fundingStatus) {
+  return [
+    "waiting",
+    fundingReminderStage(fundingStatus),
+    fundingShortfallFingerprint(fundingStatus),
+    fundingStatus?.funding?.nextBatchStartDate ?? "no-start",
+    fundingStatus?.executablePlan?.selected?.length ?? 0,
+    fundingStatus?.funding?.nextBatchMarketCount ?? 0
+  ].join(":");
+}
+
+function fundingReminderStage(fundingStatus) {
+  const ms = fundingMsUntilStart(fundingStatus);
+  if (ms === null || ms < 0) return "normal";
+  if (ms <= 5 * 60 * 1000) return "t-5m";
+  if (ms <= 30 * 60 * 1000) return "t-30m";
+  return "normal";
+}
+
+function fundingShortfallFingerprint(fundingStatus) {
+  const shortfall = fundingShortfallNumbers(fundingStatus);
+  return [
+    shortfall.busdt > 0 ? `busdt-${roundToken(shortfall.busdt, 2)}` : "busdt-ok",
+    shortfall.allowance > 0 ? `allow-${roundToken(shortfall.allowance, 2)}` : "allow-ok",
+    shortfall.bnb > 0 ? `bnb-${roundToken(shortfall.bnb, 5)}` : "bnb-ok"
+  ].join(":");
+}
+
+function fundingShortfallText(fundingStatus) {
+  const shortfall = fundingShortfallNumbers(fundingStatus);
+  const parts = [];
+  if (shortfall.busdt > 0) parts.push(`BUSDT 差 ${roundToken(shortfall.busdt, 4)}U`);
+  if (shortfall.allowance > 0) parts.push(`授权差 ${roundToken(shortfall.allowance, 4)}U`);
+  if (shortfall.bnb > 0) parts.push(`BNB 差 ${roundToken(shortfall.bnb, 8)}`);
+  return parts.join(" / ") || compactAutoSellMessage(fundingStatus?.message ?? "资金未满足", 180);
+}
+
+function fundingShortfallNumbers(fundingStatus) {
+  const wallet = fundingStatus?.wallet ?? {};
+  const requiredBusdt = fundingRequiredBusdt(fundingStatus);
+  const requiredBnb = Number(fundingStatus?.gasReserve?.requiredBnb ?? 0);
+  const busdtBalance = Number(wallet.busdtBalance ?? 0);
+  const busdtAllowance = Number(wallet.busdtAllowanceToRouter ?? 0);
+  const bnbBalance = Number(wallet.bnbBalance ?? 0);
+  return {
+    busdt: Math.max(0, requiredBusdt - busdtBalance),
+    allowance: Math.max(0, requiredBusdt - busdtAllowance),
+    bnb: Math.max(0, requiredBnb - bnbBalance)
+  };
+}
+
+function fundingRequiredBusdt(fundingStatus) {
+  const hasKnownBatch = Number(fundingStatus?.funding?.nextBatchMarketCount ?? 0) > 0;
+  if (hasKnownBatch) return Number(fundingStatus?.funding?.minimumExecutableBusdt ?? 0);
+  return Number(
+    fundingStatus?.funding?.upperBoundRequiredBusdt ??
+    fundingStatus?.funding?.requiredBusdt ??
+    0
+  );
+}
+
+function fundingWaitActionText(fundingStatus) {
+  if (!fundingStatus?.balanceReady) return "补 BUSDT 后自动恢复";
+  if (!fundingStatus?.allowanceReady) return "补授权后自动恢复";
+  if (!fundingStatus?.bnbReady) return "补 BNB 后自动恢复";
+  return "等待下一次检查";
 }
 
 function describeFundingRecovery(fundingRecovery) {
@@ -6550,16 +6711,9 @@ async function trackReceipt(cfg, txHash, context) {
         tx: txHash,
         status: receipt.status,
         context: context.type ?? ""
-      }
-    });
-  } else {
-    notifyFeishu(cfg, {
-      title: "买入确认成功",
-      fields: {
-        tx: txHash,
-        block: receipt.blockNumber?.toString() ?? "",
-        context: context.type ?? ""
-      }
+      },
+      dedupeKey: `receipt-failed:${txHash}`,
+      cooldownMs: cfg.feishuAlertCooldownMs
     });
   }
 }
@@ -6582,14 +6736,12 @@ function recordReceiptMarketDecisions(cfg, context = {}, receipt, txHash) {
   }
 }
 
-function notifyFeishu(cfg, { title, level = "info", fields = {}, dedupeKey = null, cooldownMs = 0 } = {}) {
+function notifyFeishu(
+  cfg,
+  { title, level = "info", fields = {}, dedupeKey = null, cooldownMs = 0, fingerprint = null, repeatMs = 0 } = {}
+) {
   if (!cfg.feishuAlertsEnabled || !cfg.feishuWebhook || !title) return;
-  const now = Date.now();
-  if (dedupeKey && cooldownMs > 0) {
-    const last = alertCooldowns.get(dedupeKey) ?? 0;
-    if (now - last < cooldownMs) return;
-    alertCooldowns.set(dedupeKey, now);
-  }
+  if (!shouldSendFeishuAlert(cfg, { dedupeKey, cooldownMs, fingerprint, repeatMs, title })) return;
 
   const alert = buildFeishuAlertView({ title: alertTitle(cfg, title), level, fields });
   void sendFeishuAlert(cfg.feishuWebhook, alert).catch((error) => {
@@ -6600,6 +6752,108 @@ function notifyFeishu(cfg, { title, level = "info", fields = {}, dedupeKey = nul
       at: new Date().toISOString()
     }));
   });
+}
+
+function shouldSendFeishuAlert(cfg, { dedupeKey, cooldownMs = 0, fingerprint = null, repeatMs = 0, title = "" } = {}) {
+  if (!dedupeKey && !fingerprint) return true;
+  const key = String(dedupeKey ?? title);
+  const now = Date.now();
+  const memoryEntry = readMemoryAlertState(key);
+
+  try {
+    const state = loadAlertState(cfg.alertStateFile);
+    const entry = state.alerts[key] ?? {};
+    if (isAlertSuppressed(entry, { now, cooldownMs, fingerprint, repeatMs })) return false;
+    state.alerts[key] = {
+      fingerprint: fingerprint ?? entry.fingerprint ?? "",
+      lastSentAt: new Date(now).toISOString(),
+      title: String(title ?? "").slice(0, 120)
+    };
+    saveAlertState(cfg.alertStateFile, state);
+    writeMemoryAlertState(key, state.alerts[key]);
+    return true;
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "feishu-alert-state-error",
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    }));
+    if (isAlertSuppressed(memoryEntry, { now, cooldownMs, fingerprint, repeatMs })) return false;
+    writeMemoryAlertState(key, {
+      fingerprint: fingerprint ?? memoryEntry.fingerprint ?? "",
+      lastSentAt: new Date(now).toISOString(),
+      title: String(title ?? "").slice(0, 120)
+    });
+    return true;
+  }
+}
+
+function isAlertSuppressed(entry = {}, { now, cooldownMs = 0, fingerprint = null, repeatMs = 0 } = {}) {
+  const lastSentMs = alertEntryTimeMs(entry);
+  if (fingerprint) {
+    if (entry.fingerprint === fingerprint) {
+      if (!Number.isFinite(lastSentMs)) return false;
+      const repeatWindow = Number(repeatMs ?? 0);
+      return repeatWindow <= 0 || now - lastSentMs < repeatWindow;
+    }
+    return false;
+  }
+  const cooldown = Number(cooldownMs ?? 0);
+  return cooldown > 0 && Number.isFinite(lastSentMs) && now - lastSentMs < cooldown;
+}
+
+function readMemoryAlertState(key) {
+  const entry = alertCooldowns.get(key);
+  if (!entry) return {};
+  if (typeof entry === "number") return { lastSentAt: new Date(entry).toISOString() };
+  return entry;
+}
+
+function writeMemoryAlertState(key, entry) {
+  alertCooldowns.set(key, entry);
+}
+
+function loadAlertState(file) {
+  if (!file || !fs.existsSync(file)) return defaultAlertState();
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return defaultAlertState();
+  }
+  if (!parsed || typeof parsed !== "object" || !parsed.alerts || typeof parsed.alerts !== "object") {
+    return defaultAlertState();
+  }
+  return {
+    version: 1,
+    alerts: parsed.alerts,
+    updatedAt: parsed.updatedAt ?? null
+  };
+}
+
+function saveAlertState(file, state) {
+  if (!file) return;
+  const dir = path.dirname(file);
+  if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
+  const next = {
+    version: 1,
+    alerts: state.alerts ?? {},
+    updatedAt: new Date().toISOString()
+  };
+  const tmp = path.join(dir && dir !== "." ? dir : ".", `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
+}
+
+function defaultAlertState() {
+  return { version: 1, alerts: {}, updatedAt: null };
+}
+
+function alertEntryTimeMs(entry = {}) {
+  const time = Date.parse(entry.lastSentAt ?? "");
+  return Number.isFinite(time) ? time : NaN;
 }
 
 function alertTitle(cfg, title) {
@@ -6781,18 +7035,19 @@ function buildFeishuFundingView(title, fields) {
     return {
       facts: [
         alertFact("状态", "资金可执行"),
-        alertFact("钱包", formatAddressLabel(fieldValue(fields, ["wallet"]))),
         alertFact("可买", formatExecutableFunding(fields)),
-        alertFact("所需", formatAmountWithUnit(fieldValue(fields, ["requiredBusdt"]), "BUSDT")),
-        alertFact("BNB 预留", formatAmountWithUnit(fieldValue(fields, ["requiredBnb"]), "BNB"))
+        alertFact("下一场", formatFundingNextStart(fields)),
+        alertFact("BNB 预留", formatAmountWithUnit(fieldValue(fields, ["requiredBnb"]), "BNB")),
+        alertFact("处理", fieldValue(fields, ["action"]))
       ]
     };
   }
   return {
     facts: [
-      alertFact("状态", title.includes("异常") ? "检查异常" : "等待补款"),
-      alertFact("原因", fieldValue(fields, ["message", "reason"])),
-      alertFact("重试", formatDurationMs(fieldValue(fields, ["retryMs"])))
+      alertFact("状态", title.includes("异常") ? "检查异常" : "暂不会买入"),
+      alertFact(title.includes("异常") ? "原因" : "缺口", title.includes("异常") ? fieldValue(fields, ["message", "reason"]) : fieldValue(fields, ["shortfall"])),
+      alertFact("下一场", formatFundingNextStart(fields)),
+      alertFact("处理", fieldValue(fields, ["action"]) || (title.includes("异常") ? "查看日志" : "补资金后自动恢复"))
     ]
   };
 }
@@ -6811,14 +7066,14 @@ function buildFeishuRouterApprovalView(title, fields) {
 
 function buildFeishuAutoSellView(title, fields) {
   if (!title.includes("自动卖出")) return null;
+  const paused = title.includes("暂停");
   return {
     facts: [
       alertFact("状态", formatAutoSellAlertState(title)),
-      alertFact("执行", formatAutoSellExecution(fields)),
-      alertFact("错误", formatNonZeroCount(fieldValue(fields, ["errors"]))),
-      alertFact("市场", fieldValue(fields, ["first"])),
+      alertFact("影响", paused ? "暂停自动卖出" : "部分卖出失败"),
+      alertFact("事件", fieldValue(fields, ["first"])),
       alertFact("原因", fieldValue(fields, ["reason", "message"])),
-      alertFact("暂停至", formatAlertDateTime(fieldValue(fields, ["pausedUntil"])))
+      alertFact(paused ? "恢复" : "处理", paused ? formatAlertDateTime(fieldValue(fields, ["pausedUntil"])) : fieldValue(fields, ["action"]))
     ]
   };
 }
@@ -6887,15 +7142,18 @@ function compactAlertFacts(facts = []) {
 
 function formatFeishuAlertText(alert) {
   const prefix = alert.level === "info" ? "" : `${alertLevelLabel(alert.level)} · `;
-  const lines = [`${prefix}${alert.title}`, ...formatFeishuAlertFacts(alert).split("\n")];
+  const lines = [`${prefix}${alert.title}`, ...formatFeishuAlertFacts(alert, { markdown: false }).split("\n")];
   if (alert.note) lines.push(`说明：${alert.note}`);
   lines.push(`时间：${alert.time}`);
   return lines.join("\n").slice(0, 3000);
 }
 
-function formatFeishuAlertFacts(alert) {
+function formatFeishuAlertFacts(alert, { markdown = true } = {}) {
   return alert.facts
-    .map((fact) => `${fact.label}：${fact.value}`)
+    .map((fact, index) => {
+      const line = `${fact.label}：${fact.value}`;
+      return markdown && index === 0 ? `**${line}**` : line;
+    })
     .join("\n")
     .slice(0, 2600);
 }
@@ -7026,10 +7284,24 @@ function formatContextLabel(value) {
 
 function formatExecutableFunding(fields) {
   const markets = fieldValue(fields, ["executableMarkets"]);
+  const total = fieldValue(fields, ["totalMarkets"]);
+  const unfunded = fieldValue(fields, ["unfundedMarkets"]);
   const busdt = formatAmountWithUnit(fieldValue(fields, ["executableBusdt"]), "BUSDT");
-  if (markets && busdt) return `${markets} 场 / ${busdt}`;
-  if (markets) return `${markets} 场`;
-  return busdt;
+  const marketText = markets && total ? `${markets}/${total} 场` : (markets ? `${markets} 场` : "");
+  const suffix = unfunded && Number(unfunded) > 0 ? " · 部分可买" : "";
+  if (marketText && busdt) return `${marketText} / ${busdt}${suffix}`;
+  if (marketText) return `${marketText}${suffix}`;
+  if (busdt) return busdt;
+  if (fieldValue(fields, ["partialFunding"])) return "部分可买";
+  return "";
+}
+
+function formatFundingNextStart(fields) {
+  const start = formatAlertDateTime(fieldValue(fields, ["nextStart", "startDate"]));
+  const wait = formatDurationMs(fieldValue(fields, ["msUntilNextStart"]));
+  if (start && wait) return `${start} · ${wait}`;
+  if (start) return start;
+  return "";
 }
 
 function formatAmountWithUnit(value, unit) {

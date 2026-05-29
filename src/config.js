@@ -130,6 +130,7 @@ export function readConfig() {
     feishuAlertsEnabled: envBool("FEISHU_ALERTS_ENABLED", true),
     feishuWebhook: envString("FEISHU_WEBHOOK", ""),
     feishuAlertCooldownMs: envInteger("FEISHU_ALERT_COOLDOWN_MS", 60000),
+    alertStateFile: envString("ALERT_STATE_FILE", path.join(path.dirname(runtimeConfigFile), "alert-state.json")),
     autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
     autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 5000),
     autoSellStrategy: envString("AUTO_SELL_STRATEGY", "ladder"),
@@ -402,6 +403,7 @@ export function readConfig() {
   ensureParentDir(cfg.fillsFile);
   ensureParentDir(cfg.decisionFile);
   ensureParentDir(cfg.marketFollowFile);
+  ensureParentDir(cfg.alertStateFile);
   ensureParentDir(cfg.autoSellStateFile);
   ensureParentDir(cfg.autoSellPositionStateFile);
   ensureParentDir(cfg.autoSellCircuitStateFile);

@@ -16,6 +16,7 @@
 - [x] Create `/etc/42space/profiles/42space-2.env` from the current A/B env.
 - [x] Convert profile data paths to absolute profile-local paths.
 - [x] Document `MARKET_FOLLOW_FILE` as profile-local state for follow-controlled buy gating.
+- [x] Document `ALERT_STATE_FILE` as profile-local state for Feishu alert dedupe.
 - [x] Preserve production data under `/opt/42space/data/42space`.
 - [x] Preserve A/B data under `/opt/42space/data/42space-2`.
 
