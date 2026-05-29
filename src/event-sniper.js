@@ -67,8 +67,8 @@ const SELL_BATCH_PER_OUTCOME_GAS = 1_000_000;
 const OPERATOR_APPROVAL_GAS = 250_000;
 
 async function main() {
-  applyDashboardChildPriority();
   const [command = "scan", ...rest] = process.argv.slice(2);
+  applyDashboardChildPriority(command);
   const args = parseArgs(rest);
   const cfg = readConfig();
 
@@ -172,8 +172,9 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-function applyDashboardChildPriority() {
+function applyDashboardChildPriority(command) {
   if (process.env.DASHBOARD_CHILD_LOW_PRIORITY !== "1") return;
+  if (!["status", "positions"].includes(command)) return;
   const nice = Number(process.env.DASHBOARD_CHILD_NICE ?? 10);
   if (!Number.isFinite(nice) || nice === 0) return;
   try {
