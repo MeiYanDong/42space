@@ -71,6 +71,7 @@ Each profile env must set:
 - `BOT_SYSTEMD_SERVICE`;
 - `DASHBOARD_PORT`;
 - `RUNTIME_CONFIG_FILE`;
+- `MARKET_FOLLOW_FILE`;
 - `STATE_FILE`;
 - `FILLS_FILE`;
 - `MARKET_DECISIONS_FILE`;
@@ -83,6 +84,7 @@ All data file values should be absolute paths under the profile data directory, 
 
 ```text
 RUNTIME_CONFIG_FILE=/opt/42space/data/42space-2/runtime-config.json
+MARKET_FOLLOW_FILE=/opt/42space/data/42space-2/market-follow.json
 FILLS_FILE=/opt/42space/data/42space-2/fills.jsonl
 DASHBOARD_ACTIONS_FILE=/opt/42space/data/42space-2/dashboard-actions.jsonl
 ```

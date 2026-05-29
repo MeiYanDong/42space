@@ -15,6 +15,12 @@ Give a non-technical operator a clear view of what the bot is doing and what pos
 
 ## Required Views
 
+### Upcoming Page
+
+`即将开盘` is an independent page. It shows future markets as an expandable list with filters for event duration, market category, and open-time horizon. Expanding a market shows its outcomes, prices, and odds when available.
+
+Follow state is operational, not cosmetic: following a market allows the bot to buy it, and cancelling follow forbids the bot from buying it. Each profile stores its own follow state under its profile data directory.
+
 ### Upcoming
 
 Show markets that may be bought:
@@ -28,6 +34,8 @@ Show markets that may be bought:
 - reason
 
 ### Holdings
+
+`项目持仓` is an independent page. It combines default-followed strategy matches, manually followed markets, current holdings, and a hidden-by-default history section for projects that have been fully sold.
 
 Show current bot positions:
 
@@ -86,6 +94,8 @@ Market source labels are still not simplified for operators. The next dashboard 
 Daily volume markets need a reusable hourly heatmap before making a trading decision. The `volume:heatmap` command keeps a local Binance Futures 1h kline cache, prints dates horizontally and UTC hours vertically, compares today's completed or live hours against the prior 7 complete UTC days, and projects conservative, median, and hot final ranges.
 
 ## Alerting
+
+Feishu alerts should render as operator-facing cards first, with a clean text fallback if the webhook rejects interactive cards. The card body should use Chinese labels, show only 3 to 5 useful facts, and keep raw technical fields in JSONL logs instead of sending them to operators.
 
 Feishu alerts should fire for:
 

@@ -1,9 +1,14 @@
 import { ADDRESSES } from "./fortytwo.js";
+import { applyMarketFollowDecision, isManualFollowDecision } from "./market-follow.js";
 
 export function filterEventMarkets(markets, cfg) {
   return markets
-    .filter((market) => isEventMarket(market, cfg))
-    .filter((market) => passesCreatedAtFloor(market, cfg))
+    .filter((market) => {
+      const decision = getEventMarketDecision(market, cfg);
+      if (!decision.eligible) return false;
+      if (isManualFollowDecision(decision)) return true;
+      return passesCreatedAtFloor(market, cfg);
+    })
     .sort(compareCreatedAtDesc);
 }
 
@@ -12,6 +17,10 @@ export function isEventMarket(market, cfg) {
 }
 
 export function getEventMarketDecision(market, cfg) {
+  return applyMarketFollowDecision(market, cfg, getBaseEventMarketDecision(market, cfg));
+}
+
+export function getBaseEventMarketDecision(market, cfg) {
   const durationMs = eventDurationMs(market);
   const durationHours = Number.isFinite(durationMs) ? durationMs / 3600000 : null;
   const minHours = Number(cfg.minEventDurationHours ?? 0);

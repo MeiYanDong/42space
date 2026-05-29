@@ -171,7 +171,8 @@ export function readConfig() {
     allowLateBuy: envBool("ALLOW_LATE_BUY", false),
     stateFile: envString("STATE_FILE", "data/seen-markets.json"),
     fillsFile: envString("FILLS_FILE", "data/fills.jsonl"),
-    decisionFile: envString("MARKET_DECISIONS_FILE", "data/market-decisions.jsonl")
+    decisionFile: envString("MARKET_DECISIONS_FILE", "data/market-decisions.jsonl"),
+    marketFollowFile: envString("MARKET_FOLLOW_FILE", path.join(path.dirname(runtimeConfigFile), "market-follow.json"))
   };
   applyRuntimeConfig(cfg, runtimeConfig);
   cfg.broadcastRpcUrls = resolveBroadcastRpcUrls(cfg.rpcUrl);
@@ -400,6 +401,7 @@ export function readConfig() {
   ensureParentDir(cfg.stateFile);
   ensureParentDir(cfg.fillsFile);
   ensureParentDir(cfg.decisionFile);
+  ensureParentDir(cfg.marketFollowFile);
   ensureParentDir(cfg.autoSellStateFile);
   ensureParentDir(cfg.autoSellPositionStateFile);
   ensureParentDir(cfg.autoSellCircuitStateFile);

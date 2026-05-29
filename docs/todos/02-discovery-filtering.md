@@ -25,6 +25,7 @@
   - [x] BTC price range should skip
   - [x] missing end time should skip
 - [x] Add regression coverage that REST raw discovery still notices newly filtered markets after the initial seed.
+- [x] Add profile-local follow state so default strategy matches are allowed, manual follow can allow buy, and cancel follow blocks buy.
 
 ## Update Rule
 

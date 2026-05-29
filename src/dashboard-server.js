@@ -7,8 +7,9 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { loadDotEnv, normalizeRuntimeConfig, readConfig, writeRuntimeConfig } from "./config.js";
-import { fetchActivity, fetchMarkets } from "./fortytwo.js";
-import { eventDurationMs, getEventMarketDecision, isEventMarket, isPriceMarket } from "./event-strategy.js";
+import { fetchActivity, fetchMarket, fetchMarkets } from "./fortytwo.js";
+import { eventDurationMs, getBaseEventMarketDecision, getEventMarketDecision, isEventMarket, isPriceMarket } from "./event-strategy.js";
+import { blockMarket, followMarket, marketFollowStatus, readMarketFollowState } from "./market-follow.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -54,6 +55,21 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/runtime-config" && req.method === "PUT") {
       return sendJson(res, await updateRuntimeConfig(req));
+    }
+    if (url.pathname === "/api/upcoming-markets" && req.method === "GET") {
+      return sendJson(res, (await getOverview()).newMarkets);
+    }
+    if (url.pathname === "/api/project-holdings" && req.method === "GET") {
+      return sendJson(res, (await getOverview()).projectBoard);
+    }
+    if (url.pathname === "/api/market-detail" && req.method === "GET") {
+      return sendJson(res, await marketDetail(url));
+    }
+    if (url.pathname === "/api/market-follow" && req.method === "POST") {
+      return sendJson(res, await updateMarketFollow(req, "follow"));
+    }
+    if (url.pathname === "/api/market-follow" && req.method === "DELETE") {
+      return sendJson(res, await updateMarketFollow(req, "block"));
     }
     if (url.pathname === "/api/sell/quote" && req.method === "POST") {
       return sendJson(res, await sellQuote(await readJsonBody(req)));
@@ -143,6 +159,8 @@ function logOverviewRefreshError(error) {
 
 async function buildOverview() {
   const cfg = readConfig();
+  const followState = readMarketFollowState(cfg.marketFollowFile);
+  const strategyCfg = { ...cfg, marketFollowState: followState };
   const [status, bot] = await Promise.all([
     runEvent(["status", ...walletArgs()], { timeoutMs: dashboardEventTimeoutMs }),
     getBotState()
@@ -154,6 +172,8 @@ async function buildOverview() {
   ]);
   const holdings = normalizeHoldings(positions, walletActivity);
   const recentRows = readRecentActivity();
+  const newMarketFeed = normalizeNewMarkets(newMarkets, status, walletActivity, recentRows, strategyCfg, followState);
+  const analytics = buildAnalytics(positions, walletActivity);
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
@@ -161,9 +181,10 @@ async function buildOverview() {
     wallet: normalizeWallet(status.wallet),
     next: normalizeNext(status),
     manualSell: manualSellState(status, cfg),
-    newMarkets: normalizeNewMarkets(newMarkets, status, walletActivity, recentRows),
+    newMarkets: newMarketFeed,
     holdings,
-    analytics: buildAnalytics(positions, walletActivity),
+    projectBoard: buildProjectBoard(newMarketFeed, holdings, walletActivity, followState),
+    analytics,
     activity: normalizeActivity(recentRows, walletActivity),
     settings: {
       appName,
@@ -219,7 +240,8 @@ function runtimeConfigSummary(cfg, watchConfig) {
     autoSellStopLossSellPercent: Number(watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent),
     marketCategoryBlocklist: cfg.marketCategoryBlocklist ?? [],
     marketTagBlocklist: cfg.marketTagBlocklist ?? [],
-    runtimeConfigFile: cfg.runtimeConfigFile
+    runtimeConfigFile: cfg.runtimeConfigFile,
+    marketFollowFile: cfg.marketFollowFile
   };
 }
 
@@ -258,11 +280,82 @@ async function updateRuntimeConfig(req) {
   };
 }
 
+async function marketDetail(url) {
+  const address = url.searchParams.get("market");
+  if (!address) throw new Error("Missing market");
+  const cfg = readConfig();
+  const followState = readMarketFollowState(cfg.marketFollowFile);
+  const market = await fetchMarket(cfg, address);
+  const baseDecision = getBaseEventMarketDecision(market, cfg);
+  const decision = getEventMarketDecision(market, { ...cfg, marketFollowState: followState });
+  return {
+    ok: true,
+    market: {
+      title: market.question,
+      address: market.address,
+      status: market.status,
+      category: firstCategory(market),
+      categories: market.categories ?? [],
+      tags: market.tags ?? [],
+      startsAt: market.startDate,
+      endsAt: market.endDate,
+      duration: durationText(market),
+      durationHours: durationHoursValue(market),
+      decision: {
+        eligible: decision.eligible,
+        reason: decision.reason,
+        reasonText: decision.reasonText
+      },
+      follow: marketFollowStatus(followState, market, baseDecision, decision),
+      outcomes: sortOutcomesForDashboard(market.outcomes ?? []).map((outcome) => ({
+        tokenId: String(outcome.tokenId ?? ""),
+        name: outcome.name ?? outcome.title ?? "Outcome",
+        price: price(outcome.price),
+        priceValue: num(outcome.price),
+        odds: oddsText(outcome),
+        payout: payoutText(outcome.payout),
+        volume: money(outcome.volume),
+        minted: chips(outcome.mintedQuantity)
+      }))
+    }
+  };
+}
+
+async function updateMarketFollow(req, mode) {
+  const body = await readJsonBody(req);
+  requireAdminToken(req, body);
+  const cfg = readConfig();
+  const action = body.action === "block" || body.action === "unfollow" ? "block" : mode;
+  const marketInput = {
+    market: body.market,
+    title: body.title,
+    category: body.category,
+    startsAt: body.startsAt,
+    endsAt: body.endsAt,
+    snapshot: body.snapshot
+  };
+  const state = action === "block"
+    ? blockMarket(cfg.marketFollowFile, marketInput)
+    : followMarket(cfg.marketFollowFile, marketInput);
+  const restarted = await restartWorker();
+  overviewCache = null;
+  return {
+    ok: true,
+    action,
+    state,
+    restarted,
+    message: action === "block"
+      ? (restarted ? "已取消关注，worker 已重启" : "已取消关注")
+      : (restarted ? "已关注，worker 已重启" : "已关注")
+  };
+}
+
 function requireAdminToken(req, body = {}) {
   const expected = process.env.DASHBOARD_ADMIN_TOKEN ?? "";
-  if (!expected) throw new Error("DASHBOARD_ADMIN_TOKEN is required before runtime config can be changed");
+  if (!expected) return false;
   const provided = req.headers["x-admin-token"] ?? body.adminToken ?? "";
   if (!safeEqual(String(provided), expected)) throw new Error("Invalid admin token");
+  return true;
 }
 
 function safeEqual(a, b) {
@@ -519,8 +612,7 @@ function queueMarketState(market) {
   return market.prepared ? "已准备" : "待准备";
 }
 
-function normalizeNewMarkets(markets, status, walletRows, localRows) {
-  const cfg = readConfig();
+function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readConfig(), followState = readMarketFollowState(cfg.marketFollowFile)) {
   const openWindowSeconds = Number(status.watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 60);
   const bought = boughtMarketSummary(walletRows, localRows);
   const skipped = skippedMarketSet(localRows);
@@ -531,10 +623,12 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
   const plannedStakePerOutcome = Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5);
 
   for (const market of markets) {
+    const baseDecision = getBaseEventMarketDecision(market, cfg);
     const decision = getEventMarketDecision(market, cfg);
-    if (!decision.eligible && !["short-duration", "missing-time", "price-market"].includes(decision.reason)) continue;
+    if (!decision.eligible && !["short-duration", "missing-time", "price-market", "follow-blocked"].includes(decision.reason)) continue;
     const key = normAddress(market.address);
     const pending = future.get(key);
+    const follow = marketFollowStatus(followState, market, baseDecision, decision);
     if (!decision.eligible) excluded += 1;
     const state = marketState(market, { bought, skipped, pending, openWindowSeconds, decision });
     const boughtInfo = bought.get(key);
@@ -552,6 +646,9 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
       endsAt: market.endDate,
       timeGroup: marketTimeGroup(market),
       duration: durationText(market),
+      durationHours: durationHoursValue(market),
+      categories: market.categories ?? [],
+      rawTags: market.tags ?? [],
       tags: marketTags(market, decision, pending, cfg),
       filterReason: decision.eligible ? "" : decision.reasonText,
       choices,
@@ -559,7 +656,8 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
       stakeValue: stake,
       state,
       tone: marketTone(state),
-      eligible: decision.eligible
+      eligible: decision.eligible,
+      follow
     });
   }
 
@@ -570,6 +668,158 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
       .sort(compareDashboardMarketRows)
       .slice(0, Number(process.env.DASHBOARD_MARKET_ROWS ?? 80))
   };
+}
+
+function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
+  const openGroups = new Map((holdings.groups ?? []).map((group) => [normAddress(group.market), group]));
+  const ledger = buildTradeLedger(walletActivity);
+  const active = new Map();
+
+  for (const item of marketFeed.items ?? []) {
+    if (item.timeGroup !== "future") continue;
+    if (!item.follow?.allowed && !item.follow?.manuallyFollowed) continue;
+    upsertProjectBoardItem(active, item.address, {
+      market: item.address,
+      title: item.title,
+      category: item.category,
+      startsAt: item.startsAt,
+      endsAt: item.endsAt,
+      duration: item.duration,
+      state: item.state,
+      source: item.follow?.source ?? "default",
+      follow: item.follow,
+      stake: item.stake,
+      choices: item.choices,
+      holding: openGroups.get(normAddress(item.address)) ?? null
+    });
+  }
+
+  for (const record of Object.values(followState.followed ?? {})) {
+    const key = normAddress(record.market);
+    if (active.has(key)) continue;
+    upsertProjectBoardItem(active, record.market, {
+      market: record.market,
+      title: record.title,
+      category: record.category,
+      startsAt: record.startsAt,
+      endsAt: record.endsAt,
+      duration: "",
+      state: "等待发现",
+      source: "manual",
+      follow: {
+        allowed: true,
+        defaultFollowed: false,
+        manuallyFollowed: true,
+        manuallyBlocked: false,
+        source: "manual",
+        label: "手动关注"
+      },
+      stake: "",
+      choices: "",
+      holding: openGroups.get(key) ?? null
+    });
+  }
+
+  for (const group of holdings.groups ?? []) {
+    upsertProjectBoardItem(active, group.market, {
+      market: group.market,
+      title: group.title,
+      category: "",
+      startsAt: "",
+      endsAt: "",
+      duration: "",
+      state: "持仓中",
+      source: "holding",
+      follow: {
+        allowed: true,
+        defaultFollowed: false,
+        manuallyFollowed: Boolean(followState.followed?.[normAddress(group.market)]),
+        manuallyBlocked: Boolean(followState.blocked?.[normAddress(group.market)]),
+        source: "holding",
+        label: "有持仓"
+      },
+      stake: "",
+      choices: group.items.length,
+      holding: group
+    });
+  }
+
+  const openKeys = new Set((holdings.groups ?? []).map((group) => normAddress(group.market)));
+  const activeKeys = new Set(active.keys());
+  const history = [];
+  for (const trade of ledger.markets.values()) {
+    const key = normAddress(trade.marketAddress);
+    if (!key || openKeys.has(key)) continue;
+    const bought = Number(trade.bought ?? 0);
+    if (bought <= 0) continue;
+    if (activeKeys.has(key)) active.delete(key);
+    const sold = Number(trade.sold ?? 0);
+    const realized = Number(trade.realized ?? 0);
+    history.push({
+      market: trade.marketAddress,
+      title: trade.title || trade.marketAddress,
+      bought: money(bought),
+      sold: money(sold),
+      realized: money(realized, { sign: true }),
+      pnl: money(realized, { sign: true }),
+      roi: pct(bought > 0 ? (realized / bought) * 100 : 0),
+      positive: realized >= 0,
+      lastAt: trade.lastAt ?? null
+    });
+  }
+
+  return {
+    count: active.size,
+    active: [...active.values()].map(formatProjectBoardItem).sort(compareProjectBoardItems),
+    history: history.sort((a, b) => safeTime(b.lastAt) - safeTime(a.lastAt)).slice(0, 80)
+  };
+}
+
+function upsertProjectBoardItem(map, market, input) {
+  const key = normAddress(market);
+  if (!key) return;
+  const existing = map.get(key);
+  map.set(key, {
+    ...(existing ?? {}),
+    ...input,
+    holding: input.holding ?? existing?.holding ?? null,
+    follow: input.follow ?? existing?.follow ?? null
+  });
+}
+
+function formatProjectBoardItem(item) {
+  const holding = item.holding;
+  return {
+    market: item.market,
+    title: item.title || holding?.title || "未命名项目",
+    category: item.category || "",
+    startsAt: item.startsAt || "",
+    endsAt: item.endsAt || "",
+    duration: item.duration || "",
+    state: holding ? "持仓中" : item.state,
+    source: item.source,
+    follow: item.follow,
+    stake: item.stake,
+    choices: item.choices,
+    holding: holding ? {
+      cost: holding.cost,
+      sold: holding.sold,
+      value: holding.value,
+      realized: holding.realized,
+      unrealized: holding.unrealized,
+      pnl: holding.pnl,
+      positive: holding.positive,
+      sellable: holding.sellable,
+      sellableCount: holding.sellableCount,
+      items: holding.items
+    } : null
+  };
+}
+
+function compareProjectBoardItems(a, b) {
+  const holdingDelta = Number(Boolean(b.holding)) - Number(Boolean(a.holding));
+  if (holdingDelta !== 0) return holdingDelta;
+  return safeTime(a.startsAt) - safeTime(b.startsAt);
 }
 
 function boughtMarketSummary(walletRows, localRows) {
@@ -644,6 +894,7 @@ function marketState(market, { bought, skipped, pending, openWindowSeconds, deci
   const key = normAddress(market.address);
   if (bought.has(key)) return "已买";
   if (skipped.has(key)) return "已跳过";
+  if (decision?.reason === "follow-blocked") return "禁止买入";
   if (!decision?.eligible) return "已过滤";
   if (pending?.fundingState === "funded") return "待买";
   if (pending?.fundingState === "insufficient-funds") return "资金不足";
@@ -658,7 +909,7 @@ function marketState(market, { bought, skipped, pending, openWindowSeconds, deci
 function marketTone(state) {
   if (state === "已买" || state === "已准备" || state === "待买") return "good";
   if (state === "窗口内" || state === "待准备" || state === "资金不足") return "warn";
-  if (state === "已错过") return "bad";
+  if (state === "已错过" || state === "禁止买入") return "bad";
   return "neutral";
 }
 
@@ -667,6 +918,9 @@ function marketTags(market, decision, pending, cfg) {
   if (decision.reason === "short-duration") tags.push(`短于${minDurationLabel(cfg)}`);
   if (decision.reason === "missing-time") tags.push("缺少时间");
   if (decision.reason === "price-market" || isPriceMarket(market, cfg)) tags.push("Price");
+  if (decision.follow?.manuallyBlocked) tags.push("禁止买入");
+  if (decision.follow?.manuallyFollowed) tags.push("手动关注");
+  if (decision.follow?.defaultFollowed && !decision.follow?.manuallyFollowed) tags.push("默认关注");
   if (decision.eligible) tags.push("符合买入");
   if (pending?.fundingState === "funded") tags.push("当前可买");
   if (pending?.fundingState === "insufficient-funds") tags.push("资金不足");
@@ -714,8 +968,8 @@ function marketTimeGroup(market) {
 }
 
 function marketTimeGroupRank(group) {
-  if (group === "past") return 0;
-  if (group === "future") return 1;
+  if (group === "future") return 0;
+  if (group === "past") return 1;
   return 2;
 }
 
@@ -737,6 +991,12 @@ function durationText(market) {
     return `${roundDisplay(days, days >= 10 ? 0 : 1)} 天`;
   }
   return `${roundDisplay(hours, 1)} 小时`;
+}
+
+function durationHoursValue(market) {
+  const duration = eventDurationMs(market);
+  if (!Number.isFinite(duration) || duration <= 0) return null;
+  return Math.round((duration / 3600000) * 1000) / 1000;
 }
 
 function roundDisplay(value, decimals = 2) {
@@ -977,12 +1237,12 @@ function buildTradeLedger(activityRows = []) {
     const marketKey = normAddress(row.marketAddress ?? row.market);
     if (!marketKey) continue;
     const market = ensureTradeRecord(markets, marketKey, {
-      marketAddress: row.marketAddress,
+      marketAddress: row.marketAddress ?? row.market,
       title: row.title
     });
-    const outcomeKey = outcomeLedgerKey(row.marketAddress, row.tokenId);
+    const outcomeKey = outcomeLedgerKey(row.marketAddress ?? row.market, row.tokenId);
     const outcome = ensureTradeRecord(outcomes, outcomeKey, {
-      marketAddress: row.marketAddress,
+      marketAddress: row.marketAddress ?? row.market,
       title: row.title,
       tokenId: row.tokenId,
       outcome: row.outcome
@@ -998,6 +1258,9 @@ function buildTradeLedger(activityRows = []) {
       outcome.sold += collateral;
       outcome.realized += realized;
     }
+    const at = row.timestamp ? new Date(Number(row.timestamp) * 1000).toISOString() : row.at;
+    if (at && safeTime(at) > safeTime(market.lastAt)) market.lastAt = at;
+    if (at && safeTime(at) > safeTime(outcome.lastAt)) outcome.lastAt = at;
   }
   return { markets, outcomes };
 }
@@ -1146,6 +1409,10 @@ function readRecentActivity() {
   for (const row of readJsonl(fillsFile, Number(process.env.DASHBOARD_FILL_HISTORY_LIMIT ?? 2000))) {
     if (row.level === "event-skip-open-window") {
       rows.push({ at: row.at, label: "已跳过", title: row.question, market: row.market, amount: "" });
+      continue;
+    }
+    if (row.level === "event-skip-follow-blocked") {
+      rows.push({ at: row.at, label: "禁止买入", title: row.question, market: row.market, amount: "" });
       continue;
     }
     if (row.level === "event-execution-error") {
@@ -1447,6 +1714,32 @@ function price(value) {
   if (num < 0.01) return num.toFixed(4);
   if (num < 1) return num.toFixed(3).replace(/\.?0+$/, "");
   return num.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function payoutText(value) {
+  const num = Number(value ?? 0);
+  if (!Number.isFinite(num) || num <= 0) return "--";
+  return `${price(num)}x`;
+}
+
+function oddsText(outcome) {
+  if (outcome?.payout !== undefined && outcome?.payout !== null && outcome.payout !== "") {
+    return payoutText(outcome.payout);
+  }
+  const priceValue = Number(outcome?.price);
+  if (Number.isFinite(priceValue) && priceValue > 0) return `~${price(1 / priceValue)}x`;
+  return "--";
+}
+
+function sortOutcomesForDashboard(outcomes = []) {
+  return [...outcomes].sort((a, b) => {
+    try {
+      const delta = BigInt(a.tokenId ?? 0) - BigInt(b.tokenId ?? 0);
+      return delta < 0n ? -1 : (delta > 0n ? 1 : 0);
+    } catch {
+      return String(a.tokenId ?? "").localeCompare(String(b.tokenId ?? ""));
+    }
+  });
 }
 
 function chips(value) {

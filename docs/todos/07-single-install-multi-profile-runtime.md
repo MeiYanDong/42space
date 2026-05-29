@@ -15,6 +15,7 @@
 - [x] Create `/etc/42space/profiles/42space.env` from the current production env.
 - [x] Create `/etc/42space/profiles/42space-2.env` from the current A/B env.
 - [x] Convert profile data paths to absolute profile-local paths.
+- [x] Document `MARKET_FOLLOW_FILE` as profile-local state for follow-controlled buy gating.
 - [x] Preserve production data under `/opt/42space/data/42space`.
 - [x] Preserve A/B data under `/opt/42space/data/42space-2`.
 

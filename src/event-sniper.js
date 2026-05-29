@@ -55,6 +55,7 @@ import {
   selectEventMarket,
   summarizeEventMarket
 } from "./event-strategy.js";
+import { isMarketFollowBlocked } from "./market-follow.js";
 
 const execFileAsync = promisify(execFile);
 const PUBLIC_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -567,6 +568,7 @@ async function status(cfg, args) {
       maxMarketStakeUsdt: cfg.maxMarketStakeUsdt,
       gasPriceGwei: cfg.gasPriceGwei || null,
       minEventDurationHours: cfg.minEventDurationHours,
+      marketFollowFile: cfg.marketFollowFile,
       fastSkipPreflight: cfg.fastSkipPreflight,
       fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
       fanoutBroadcast: cfg.fanoutBroadcast,
@@ -1555,6 +1557,51 @@ async function selfTest(cfg) {
   );
   passed.push("Price category/tag markets are excluded from Event Market bot");
 
+  const defaultFollowMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000000344",
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 72 * 3600000).toISOString()
+  });
+  const blockedFollowDecision = getEventMarketDecision(defaultFollowMarket, {
+    ...testCfg,
+    marketFollowState: {
+      followed: {},
+      blocked: {
+        "0x0000000000000000000000000000000000000344": {
+          market: "0x0000000000000000000000000000000000000344",
+          title: "Blocked follow market"
+        }
+      }
+    }
+  });
+  assertSelfTest(
+    !blockedFollowDecision.eligible && blockedFollowDecision.reason === "follow-blocked",
+    `Cancelled follow should block default buy, got ${JSON.stringify(blockedFollowDecision)}`
+  );
+
+  const manualShortDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000345",
+    question: "Manual short event",
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), {
+    ...testCfg,
+    marketFollowState: {
+      followed: {
+        "0x0000000000000000000000000000000000000345": {
+          market: "0x0000000000000000000000000000000000000345",
+          title: "Manual short event"
+        }
+      },
+      blocked: {}
+    }
+  });
+  assertSelfTest(
+    manualShortDecision.eligible && manualShortDecision.reason === "manual-followed",
+    `Manual follow should allow an otherwise filtered strategy market, got ${JSON.stringify(manualShortDecision)}`
+  );
+  passed.push("Market follow state can allow or block auto-buy decisions");
+
   const longEventMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000045",
     startDate: new Date(Date.now() + 60000).toISOString(),
@@ -1677,6 +1724,36 @@ async function selfTest(cfg) {
     "due path should isolate reusable pre-signed bundle records"
   );
   passed.push("stale pre-signed bundles are not reused after market set changes");
+
+  const feishuAlert = buildFeishuAlertView({
+    title: "[42space-2] 买入已广播",
+    fields: {
+      type: "single",
+      market: "0x0000000000000000000000000000000000000054",
+      question: "Self test Event Market",
+      status: "broadcast",
+      stake: "25U",
+      rankSource: "token_order",
+      fallback: "missing_complete_odds_data",
+      tx: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    }
+  });
+  const feishuText = formatFeishuAlertText(feishuAlert);
+  assertSelfTest(feishuText.includes("状态：已发出"), "Feishu buy alert should show a readable status");
+  assertSelfTest(feishuText.includes("事件：Self test Event Market"), "Feishu buy alert should show the market title");
+  assertSelfTest(feishuText.includes("选择："), "Feishu buy alert should keep diagnostics as a Chinese note");
+  assertSelfTest(!feishuText.includes("rankSource"), "Feishu buy alert should not expose rankSource");
+  assertSelfTest(!feishuText.includes("fallback:"), "Feishu buy alert should not expose fallback as a raw field");
+  assertSelfTest(!feishuText.includes("type:"), "Feishu buy alert should not expose type as a raw field");
+  assertSelfTest(
+    buildFeishuCardPayload(feishuAlert).msg_type === "interactive",
+    "Feishu primary alert payload should be an interactive card"
+  );
+  assertSelfTest(
+    buildFeishuTextPayload(feishuAlert).content.text.includes("状态：已发出"),
+    "Feishu text fallback should stay readable"
+  );
+  passed.push("Feishu alerts render as operator cards with clean text fallback");
 
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-self-test-"));
   try {
@@ -2384,6 +2461,7 @@ async function watch(cfg, options = {}) {
         minEventDurationHours: cfg.minEventDurationHours,
         marketCategoryBlocklist: cfg.marketCategoryBlocklist,
         marketTagBlocklist: cfg.marketTagBlocklist,
+        marketFollowFile: cfg.marketFollowFile,
         restDiscoveryEnabled: cfg.restDiscoveryEnabled,
         restDiscoveryPollMs: cfg.restDiscoveryPollMs,
         fastSkipPreflight: cfg.fastSkipPreflight,
@@ -4603,6 +4681,7 @@ async function drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pen
 
 async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
   skipExpiredPendingMarkets(cfg, seen, pending, "pending-open-window");
+  await dropFollowBlockedPendingRecords(cfg, seen, pending, runtime, "pending-follow-blocked");
   const dueRecords = [...pending.values()].filter((record) => {
     return msUntilRecordAction(record, cfg) <= 0;
   });
@@ -4685,6 +4764,16 @@ function groupPreSignedBundleRecords(records) {
 
 async function executeDueBundle(cfg, seen, pending, runtime, records) {
   const markets = records.map((record) => pendingMarket(record));
+  const blockedRecords = records.filter((record) => isMarketFollowBlocked(pendingMarket(record), cfg));
+  if (blockedRecords.length > 0) {
+    clearPreSignedBundleRecords(records, "follow-blocked");
+    await resetRuntimeNonceToPending(cfg, runtime, "bundle_follow_blocked");
+    for (const record of blockedRecords) {
+      markFollowBlockedPendingRecord(cfg, seen, pending, record, "bundle-follow-blocked");
+    }
+    saveSeen(cfg.stateFile, seen);
+    return false;
+  }
   if (records.some((record) => markSkippedIfExpired(cfg, seen, pendingMarket(record), "bundle-open-window"))) {
     saveSeen(cfg.stateFile, seen);
     return false;
@@ -4796,6 +4885,7 @@ async function preSignHotPendingMarkets(cfg, pending, runtime) {
   const fundingBlockedKeys = new Set();
   if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
     const grouped = groupRecordsByStartDate([...pending.values()].filter((record) => {
+      if (isMarketFollowBlocked(pendingMarket(record), cfg)) return false;
       if (
         !record.preparedPlan ||
         record.preSignedFastBundleTransaction ||
@@ -4820,6 +4910,7 @@ async function preSignHotPendingMarkets(cfg, pending, runtime) {
   const records = [...pending.values()]
     .filter((record) => {
       if (fundingBlockedKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
+      if (isMarketFollowBlocked(pendingMarket(record), cfg)) return false;
       if (
         !record.preparedPlan ||
         record.preSignedFastTransaction ||
@@ -4958,13 +5049,16 @@ function hasPreSignedBundle(record) {
 }
 
 function clearPreSignedBundleRecords(records, reason) {
+  let cleared = false;
   for (const record of records) {
     if (!hasPreSignedBundle(record)) continue;
     record.preSignedFastBundleTransaction = null;
     record.preSignedFastBundle = null;
     record.bundlePreSignedAt = null;
     record.bundlePreSignDiscardReason = reason;
+    cleared = true;
   }
+  if (!cleared) return;
   console.error(JSON.stringify({
     level: "warn",
     source: "pre-sign-bundle-discarded",
@@ -5163,8 +5257,12 @@ function shouldNotifyWillBuySource(source) {
 
 function formatAlertSource(source) {
   const value = String(source ?? "");
-  if (value.includes("rest")) return "官网";
-  if (value.includes("ws") || value.includes("chain") || value.includes("controller")) return "链上";
+  const lower = value.toLowerCase();
+  const hasWebsite = lower.includes("rest") || value.includes("官网") || lower.includes("website");
+  const hasChain = lower.includes("ws") || lower.includes("chain") || lower.includes("controller") || value.includes("链上");
+  if (hasWebsite && hasChain) return "官网 + 链上";
+  if (hasWebsite) return "官网";
+  if (hasChain) return "链上";
   return value || "监控";
 }
 
@@ -5849,6 +5947,52 @@ function skipExpiredPendingMarkets(cfg, seen, pending, source) {
   if (skipped) saveSeen(cfg.stateFile, seen);
 }
 
+async function dropFollowBlockedPendingRecords(cfg, seen, pending, runtime, source) {
+  let resetNonce = false;
+  let dropped = false;
+  for (const record of [...pending.values()]) {
+    const market = pendingMarket(record);
+    if (!isMarketFollowBlocked(market, cfg)) continue;
+    if (hasPreSignedSingle(record) || hasPreSignedBundle(record)) resetNonce = true;
+    clearPreSignedSingleRecord(record, "follow-blocked");
+    clearPreSignedBundleRecords([record], "follow-blocked");
+    markFollowBlockedPendingRecord(cfg, seen, pending, record, source);
+    dropped = true;
+  }
+  if (resetNonce) await resetRuntimeNonceToPending(cfg, runtime, "follow_blocked_pending");
+  if (dropped) saveSeen(cfg.stateFile, seen);
+}
+
+function markFollowBlockedPendingRecord(cfg, seen, pending, record, source) {
+  const market = pendingMarket(record);
+  const key = eventSeenKey(market, cfg);
+  pending.delete(key);
+  seen.add(key);
+  const message = "已取消关注，禁止买入";
+  appendJsonl(cfg.fillsFile, {
+    level: "event-skip-follow-blocked",
+    source,
+    market: market.address,
+    question: market.question,
+    startDate: market.startDate,
+    reason: message,
+    at: new Date().toISOString()
+  });
+  recordMarketDecision(cfg, market, "skipped", {
+    source,
+    message,
+    dedupeKey: `${String(market.address).toLowerCase()}:skipped-follow-blocked`
+  });
+  console.error(JSON.stringify({
+    level: "warn",
+    source,
+    market: market.address,
+    question: market.question,
+    message,
+    at: new Date().toISOString()
+  }));
+}
+
 function markSkippedIfExpired(cfg, seen, market, source) {
   if (!isPastEventOpenWindow(cfg, market)) return false;
   const key = eventSeenKey(market, cfg);
@@ -6041,6 +6185,26 @@ async function maybeExecuteMarket(
 ) {
   const key = eventSeenKey(market, cfg);
   if (seen.has(key)) return false;
+  if (isMarketFollowBlocked(market, cfg)) {
+    seen.add(key);
+    saveSeen(cfg.stateFile, seen);
+    const message = "已取消关注，禁止买入";
+    appendJsonl(cfg.fillsFile, {
+      level: "event-skip-follow-blocked",
+      source: "single-follow-blocked",
+      market: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      reason: message,
+      at: new Date().toISOString()
+    });
+    recordMarketDecision(cfg, market, "skipped", {
+      source: "single-follow-blocked",
+      message,
+      dedupeKey: `${String(market.address).toLowerCase()}:skipped-follow-blocked`
+    });
+    return false;
+  }
   if (markSkippedIfExpired(cfg, seen, market, "single-open-window")) {
     saveSeen(cfg.stateFile, seen);
     return false;
@@ -6427,8 +6591,8 @@ function notifyFeishu(cfg, { title, level = "info", fields = {}, dedupeKey = nul
     alertCooldowns.set(dedupeKey, now);
   }
 
-  const text = formatFeishuAlertText({ title: alertTitle(cfg, title), level, fields });
-  void sendFeishuMessage(cfg.feishuWebhook, text).catch((error) => {
+  const alert = buildFeishuAlertView({ title: alertTitle(cfg, title), level, fields });
+  void sendFeishuAlert(cfg.feishuWebhook, alert).catch((error) => {
     console.error(JSON.stringify({
       level: "warn",
       source: "feishu-alert-error",
@@ -6445,50 +6609,537 @@ function alertTitle(cfg, title) {
   return `[${botName}] ${title}`;
 }
 
-async function sendFeishuMessage(webhook, text) {
+async function sendFeishuAlert(webhook, alert) {
+  try {
+    await postFeishuPayload(webhook, buildFeishuCardPayload(alert));
+    return;
+  } catch (cardError) {
+    await postFeishuPayload(webhook, buildFeishuTextPayload(alert)).catch((textError) => {
+      throw new Error(`card failed: ${errorMessage(cardError)}; text fallback failed: ${errorMessage(textError)}`);
+    });
+  }
+}
+
+async function postFeishuPayload(webhook, payload) {
   const response = await fetch(webhook, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      msg_type: "text",
-      content: { text }
-    })
+    body: JSON.stringify(payload)
   });
+  const body = await response.text();
   if (!response.ok) {
-    const body = await response.text();
     throw new Error(`Feishu webhook ${response.status}: ${body.slice(0, 200)}`);
+  }
+  const parsed = parseJsonOrNull(body);
+  const code = parsed?.code ?? parsed?.StatusCode;
+  if (code !== undefined && Number(code) !== 0) {
+    const message = parsed?.msg ?? parsed?.StatusMessage ?? body;
+    throw new Error(`Feishu webhook code ${code}: ${String(message).slice(0, 200)}`);
   }
 }
 
-function formatFeishuAlertText({ title, level, fields }) {
-  const lines = [
-    `${alertLevelLabel(level)} ${title}`,
-    `时间: ${new Date().toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}`
-  ];
-  for (const [key, value] of Object.entries(fields ?? {})) {
-    const formatted = formatAlertValue(value);
-    if (formatted === "") continue;
-    lines.push(`${key}: ${formatted}`);
+function parseJsonOrNull(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
+}
+
+function buildFeishuTextPayload(alert) {
+  return {
+    msg_type: "text",
+    content: { text: formatFeishuAlertText(alert) }
+  };
+}
+
+function buildFeishuCardPayload(alert) {
+  const content = formatFeishuAlertFacts(alert);
+  const note = [alert.note, `时间：${alert.time}`].filter(Boolean).join(" · ");
+  return {
+    msg_type: "interactive",
+    card: {
+      config: { wide_screen_mode: true },
+      header: {
+        template: alertCardTemplate(alert.level),
+        title: {
+          tag: "plain_text",
+          content: truncateAlertText(alert.title, 80)
+        }
+      },
+      elements: [
+        {
+          tag: "div",
+          text: {
+            tag: "lark_md",
+            content
+          }
+        },
+        {
+          tag: "note",
+          elements: [
+            {
+              tag: "plain_text",
+              content: truncateAlertText(note, 220)
+            }
+          ]
+        }
+      ]
+    }
+  };
+}
+
+function buildFeishuAlertView({ title, level = "info", fields = {} }) {
+  const baseTitle = stripAlertBotPrefix(title);
+  const view =
+    buildFeishuBotStartView(baseTitle, fields) ??
+    buildFeishuWillBuyView(baseTitle, fields) ??
+    buildFeishuBuyResultView(baseTitle, fields) ??
+    buildFeishuReceiptView(baseTitle, fields) ??
+    buildFeishuFundingView(baseTitle, fields) ??
+    buildFeishuRouterApprovalView(baseTitle, fields) ??
+    buildFeishuAutoSellView(baseTitle, fields) ??
+    buildFeishuOpsView(baseTitle, fields) ??
+    { facts: buildGenericAlertFacts(fields), note: "" };
+
+  const facts = compactAlertFacts(view.facts).slice(0, 5);
+  return {
+    title: truncateAlertText(title, 96),
+    level,
+    facts: facts.length > 0 ? facts : [{ label: "状态", value: "已记录" }],
+    note: formatReadableAlertValue(view.note),
+    time: formatAlertTime(new Date())
+  };
+}
+
+function buildFeishuBotStartView(title, fields) {
+  if (!title.includes("bot 已启动")) return null;
+  return {
+    facts: [
+      alertFact("状态", "运行中"),
+      alertFact("模式", formatModeLabel(fieldValue(fields, ["mode"]))),
+      alertFact("监听", formatDiscoveryLabel(fieldValue(fields, ["discovery"]))),
+      alertFact("买入", fieldValue(fields, ["stake"])),
+      alertFact("自动卖出", formatAutoSellStatus(fieldValue(fields, ["autoSell"])))
+    ]
+  };
+}
+
+function buildFeishuWillBuyView(title, fields) {
+  if (!title.includes("新盘准备买入")) return null;
+  const start = fieldValue(fields, ["开盘", "startDate"]);
+  const duration = fieldValue(fields, ["时长", "duration"]);
+  return {
+    facts: [
+      alertFact("状态", formatWillBuyState(fieldValue(fields, ["状态", "state"]))),
+      alertFact("事件", fieldValue(fields, ["事件", "question"])),
+      alertFact("买入", fieldValue(fields, ["买入", "stake"])),
+      alertFact("时间", [formatAlertDateTime(start), duration].filter(Boolean).join(" · ")),
+      alertFact("来源", formatAlertSource(fieldValue(fields, ["来源", "source"])))
+    ],
+    note: formatSelectionNote(fields)
+  };
+}
+
+function buildFeishuBuyResultView(title, fields) {
+  if (!title.includes("买入已广播") && !title.includes("买入成功") && !title.includes("买入失败") && !title.includes("买入未确认成功")) {
+    return null;
+  }
+  const problem = title.includes("失败") || title.includes("未确认");
+  const status = problem
+    ? formatBuyProblemStatus(title, fields)
+    : formatExecutionStatus(fieldValue(fields, ["status"]) || (title.includes("已广播") ? "broadcast" : "success"));
+  return {
+    facts: [
+      alertFact("状态", status),
+      alertFact(formatMarketFactLabel(fields), formatMarketFactValue(fields)),
+      alertFact("投入", fieldValue(fields, ["stake"])),
+      alertFact(problem ? "原因" : "交易", problem ? formatBuyProblemReason(fields) : formatTxLabel(fieldValue(fields, ["tx"]))),
+      alertFact(problem ? "交易" : "", problem ? formatTxLabel(fieldValue(fields, ["tx"])) : "")
+    ],
+    note: problem ? "" : formatSelectionNote(fields)
+  };
+}
+
+function buildFeishuReceiptView(title, fields) {
+  if (!title.includes("买入确认成功") && !title.includes("交易 receipt 非成功")) return null;
+  const failed = title.includes("非成功");
+  return {
+    facts: [
+      alertFact("状态", failed ? "链上回执非成功" : "链上已确认"),
+      alertFact("交易", formatTxLabel(fieldValue(fields, ["tx"]))),
+      alertFact(failed ? "回执" : "区块", failed ? formatExecutionStatus(fieldValue(fields, ["status"])) : fieldValue(fields, ["block"])),
+      alertFact("类型", formatContextLabel(fieldValue(fields, ["context"])))
+    ]
+  };
+}
+
+function buildFeishuFundingView(title, fields) {
+  if (!title.includes("资金检查通过") && !title.includes("资金不足") && !title.includes("资金检查异常")) return null;
+  if (title.includes("资金检查通过")) {
+    return {
+      facts: [
+        alertFact("状态", "资金可执行"),
+        alertFact("钱包", formatAddressLabel(fieldValue(fields, ["wallet"]))),
+        alertFact("可买", formatExecutableFunding(fields)),
+        alertFact("所需", formatAmountWithUnit(fieldValue(fields, ["requiredBusdt"]), "BUSDT")),
+        alertFact("BNB 预留", formatAmountWithUnit(fieldValue(fields, ["requiredBnb"]), "BNB"))
+      ]
+    };
+  }
+  return {
+    facts: [
+      alertFact("状态", title.includes("异常") ? "检查异常" : "等待补款"),
+      alertFact("原因", fieldValue(fields, ["message", "reason"])),
+      alertFact("重试", formatDurationMs(fieldValue(fields, ["retryMs"])))
+    ]
+  };
+}
+
+function buildFeishuRouterApprovalView(title, fields) {
+  if (!title.includes("Router 授权")) return null;
+  return {
+    facts: [
+      alertFact("状态", title.includes("补齐") ? "已补齐" : "已就绪"),
+      alertFact("额度", fieldValue(fields, ["required"])),
+      alertFact("授权", formatApprovalLabel(fieldValue(fields, ["approved"]))),
+      alertFact("交易", formatTxLabel(fieldValue(fields, ["tx"])))
+    ]
+  };
+}
+
+function buildFeishuAutoSellView(title, fields) {
+  if (!title.includes("自动卖出")) return null;
+  return {
+    facts: [
+      alertFact("状态", formatAutoSellAlertState(title)),
+      alertFact("执行", formatAutoSellExecution(fields)),
+      alertFact("错误", formatNonZeroCount(fieldValue(fields, ["errors"]))),
+      alertFact("市场", fieldValue(fields, ["first"])),
+      alertFact("原因", fieldValue(fields, ["reason", "message"])),
+      alertFact("暂停至", formatAlertDateTime(fieldValue(fields, ["pausedUntil"])))
+    ]
+  };
+}
+
+function buildFeishuOpsView(title, fields) {
+  if (
+    !title.includes("WS") &&
+    !title.includes("链上轮询") &&
+    !title.includes("REST 补漏")
+  ) {
+    return null;
+  }
+  return {
+    facts: [
+      alertFact("状态", formatOpsState(title)),
+      alertFact("当前", formatFallbackTarget(fieldValue(fields, ["fallback"]))),
+      alertFact("原因", fieldValue(fields, ["message", "reason"])),
+      alertFact("重试", formatDurationMs(fieldValue(fields, ["retryMs"])))
+    ]
+  };
+}
+
+function buildGenericAlertFacts(fields) {
+  const facts = [];
+  appendAlertFact(facts, "状态", fieldValue(fields, ["状态", "status"]));
+  appendAlertFact(facts, "事件", fieldValue(fields, ["事件", "question"]));
+  appendAlertFact(facts, "原因", fieldValue(fields, ["message", "reason"]));
+  appendAlertFact(facts, "交易", formatTxLabel(fieldValue(fields, ["tx", "txHash"])));
+  appendAlertFact(facts, "重试", formatDurationMs(fieldValue(fields, ["retryMs"])));
+  appendAlertFact(facts, "来源", formatAlertSource(fieldValue(fields, ["来源", "source"])));
+
+  for (const [key, value] of Object.entries(fields ?? {})) {
+    if (facts.length >= 5) break;
+    if (!isChineseAlertField(key) || isInternalAlertField(key)) continue;
+    appendAlertFact(facts, key, value);
+  }
+  return facts;
+}
+
+function appendAlertFact(facts, label, value) {
+  const fact = alertFact(label, value);
+  if (fact) facts.push(fact);
+}
+
+function alertFact(label, value) {
+  return { label, value };
+}
+
+function compactAlertFacts(facts = []) {
+  const compacted = [];
+  const seen = new Set();
+  for (const fact of facts) {
+    if (!fact?.label) continue;
+    const value = formatReadableAlertValue(fact.value);
+    if (!value) continue;
+    const key = `${fact.label}:${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    compacted.push({
+      label: String(fact.label),
+      value
+    });
+  }
+  return compacted;
+}
+
+function formatFeishuAlertText(alert) {
+  const prefix = alert.level === "info" ? "" : `${alertLevelLabel(alert.level)} · `;
+  const lines = [`${prefix}${alert.title}`, ...formatFeishuAlertFacts(alert).split("\n")];
+  if (alert.note) lines.push(`说明：${alert.note}`);
+  lines.push(`时间：${alert.time}`);
   return lines.join("\n").slice(0, 3000);
 }
 
-function alertLevelLabel(level) {
-  if (level === "warn") return "[WARN]";
-  if (level === "error") return "[ERROR]";
-  return "[INFO]";
+function formatFeishuAlertFacts(alert) {
+  return alert.facts
+    .map((fact) => `${fact.label}：${fact.value}`)
+    .join("\n")
+    .slice(0, 2600);
 }
 
-function formatAlertValue(value) {
+function alertLevelLabel(level) {
+  if (level === "warn") return "警告";
+  if (level === "error") return "错误";
+  return "提醒";
+}
+
+function alertCardTemplate(level) {
+  if (level === "warn") return "orange";
+  if (level === "error") return "red";
+  return "blue";
+}
+
+function formatReadableAlertValue(value) {
   if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "number" && !Number.isFinite(value)) return "";
   if (typeof value === "object") {
-    try {
-      return redactSecretUrls(JSON.stringify(value)).slice(0, 500);
-    } catch {
-      return "[object]";
-    }
+    return "详情见日志";
   }
-  return redactSecretUrls(String(value)).slice(0, 500);
+  return truncateAlertText(redactSecretUrls(String(value)), 500);
+}
+
+function stripAlertBotPrefix(title) {
+  return String(title ?? "").replace(/^\[[^\]]+\]\s*/, "");
+}
+
+function fieldValue(fields, keys) {
+  for (const key of keys) {
+    const value = fields?.[key];
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return "";
+}
+
+function isChineseAlertField(key) {
+  return /[\u4e00-\u9fff]/.test(String(key));
+}
+
+function isInternalAlertField(key) {
+  return ["排序", "兜底"].includes(String(key));
+}
+
+function formatModeLabel(value) {
+  if (value === "execute") return "实盘";
+  if (value === "dry-run") return "演练";
+  return value;
+}
+
+function formatDiscoveryLabel(value) {
+  if (value === "ws") return "WS 监听";
+  if (value === "chain") return "链上轮询";
+  if (value === "rest") return "官网轮询";
+  return value;
+}
+
+function formatAutoSellStatus(value) {
+  if (value === "off") return "关闭";
+  return value;
+}
+
+function formatWillBuyState(value) {
+  if (value === "pending") return "待开盘";
+  if (value === "immediate") return "立即买入";
+  return value;
+}
+
+function formatExecutionStatus(value) {
+  if (value === "broadcast") return "已发出 · 等待确认";
+  if (value === "success") return "已确认";
+  if (value === "reverted") return "链上回滚";
+  if (value === "failed") return "失败";
+  if (value === "unknown") return "未知";
+  return value;
+}
+
+function formatBuyProblemStatus(title, fields) {
+  if (title.includes("未确认")) return "未确认成功";
+  return formatExecutionStatus(fieldValue(fields, ["status"])) || "失败";
+}
+
+function formatBuyProblemReason(fields) {
+  return fieldValue(fields, ["message"]) ||
+    formatExecutionStatus(fieldValue(fields, ["status"])) ||
+    "详情见日志";
+}
+
+function formatMarketFactLabel(fields) {
+  if (fieldValue(fields, ["question"])) return "事件";
+  return "市场";
+}
+
+function formatMarketFactValue(fields) {
+  const question = fieldValue(fields, ["question"]);
+  if (question) return question;
+  const marketCount = fieldValue(fields, ["markets"]);
+  if (marketCount) return `${marketCount} 个同期开盘市场`;
+  return formatAddressLabel(fieldValue(fields, ["market"]));
+}
+
+function formatSelectionNote(fields) {
+  const fallback = fieldValue(fields, ["fallback", "fallbackReason", "兜底"]);
+  const rankSource = fieldValue(fields, ["rankSource", "排序"]);
+  if (fallback) return `选择：${formatFallbackReason(fallback, rankSource)}`;
+  if (rankSource && rankSource !== "payout") return `选择：${formatRankSource(rankSource)}`;
+  return "";
+}
+
+function formatRankSource(value) {
+  if (value === "payout") return "按实时赔率";
+  if (value === "token_order") return "按链上顺序";
+  return formatInternalLabel(value);
+}
+
+function formatFallbackReason(value, rankSource = "") {
+  if (value === "missing_complete_odds_data") return `赔率不完整，已${formatRankSource(rankSource || "token_order")}`;
+  if (value === "missing_odds_data") return `缺少赔率，已${formatRankSource(rankSource || "token_order")}`;
+  return formatInternalLabel(value);
+}
+
+function formatContextLabel(value) {
+  if (value === "single") return "单市场";
+  if (value === "bundle") return "批量";
+  return "";
+}
+
+function formatExecutableFunding(fields) {
+  const markets = fieldValue(fields, ["executableMarkets"]);
+  const busdt = formatAmountWithUnit(fieldValue(fields, ["executableBusdt"]), "BUSDT");
+  if (markets && busdt) return `${markets} 场 / ${busdt}`;
+  if (markets) return `${markets} 场`;
+  return busdt;
+}
+
+function formatAmountWithUnit(value, unit) {
+  const formatted = formatReadableAlertValue(value);
+  if (!formatted) return "";
+  if (/[A-Za-z\u4e00-\u9fff%]/.test(formatted)) return formatted;
+  return `${formatted} ${unit}`;
+}
+
+function formatApprovalLabel(value) {
+  if (value === "yes") return "已发送授权";
+  if (value === "ready") return "已就绪";
+  return value;
+}
+
+function formatAutoSellAlertState(title) {
+  if (title.includes("暂停")) return "已暂停";
+  if (title.includes("错误") || title.includes("异常")) return "需要检查";
+  if (title.includes("触发")) return "已触发";
+  return "已记录";
+}
+
+function formatAutoSellExecution(fields) {
+  const triggered = fieldValue(fields, ["triggered"]);
+  const executed = fieldValue(fields, ["executed"]);
+  const parts = [];
+  if (triggered !== "") parts.push(`触发 ${triggered}`);
+  if (executed !== "") parts.push(`成交 ${executed}`);
+  return parts.join(" / ");
+}
+
+function formatNonZeroCount(value) {
+  if (value === "" || Number(value) === 0) return "";
+  return value;
+}
+
+function formatOpsState(title) {
+  if (title.includes("已降级")) return "已自动降级";
+  if (title.includes("异常")) return "监听异常";
+  return "需要检查";
+}
+
+function formatFallbackTarget(value) {
+  if (value === "chain polling") return "链上轮询";
+  if (value === "REST polling") return "官网轮询";
+  return value;
+}
+
+function formatTxLabel(value) {
+  const tx = formatReadableAlertValue(value);
+  if (!tx) return "";
+  return shortHex(tx);
+}
+
+function formatAddressLabel(value) {
+  const text = formatReadableAlertValue(value);
+  if (!text) return "";
+  return shortHex(text);
+}
+
+function shortHex(value) {
+  const text = String(value);
+  if (!/^0x[0-9a-fA-F]{16,}$/.test(text)) return text;
+  return `${text.slice(0, 8)}...${text.slice(-6)}`;
+}
+
+function formatAlertDateTime(value) {
+  const text = formatReadableAlertValue(value);
+  if (!text) return "";
+  const time = Date.parse(text);
+  if (!Number.isFinite(time)) return text;
+  return new Date(time).toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  });
+}
+
+function formatAlertTime(date) {
+  return date.toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+}
+
+function formatDurationMs(value) {
+  if (value === undefined || value === null || value === "") return "";
+  const ms = Number(value);
+  if (!Number.isFinite(ms)) return value;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60000) return `${roundToken(ms / 1000, 1)}秒`;
+  return `${roundToken(ms / 60000, 1)}分钟`;
+}
+
+function formatInternalLabel(value) {
+  return formatReadableAlertValue(value).replace(/_/g, " ");
+}
+
+function truncateAlertText(value, maxChars) {
+  const text = String(value ?? "");
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
 function sleep(ms) {

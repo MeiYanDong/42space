@@ -50,6 +50,7 @@
 - [x] 2026-05-28 fix `presign-test` and `due-test` to use a budget-capped same-start batch and fail hard if no reusable pre-signed transaction exists; tests now cover both single and bundled pre-sign shapes.
 - [x] 2026-05-29 harden auto-sell around buys: known pending openings pause operator approvals and sells, operator approval is prewarmed separately, due sells are cross-market chunked, and sell state updates only on successful receipt.
 - [x] 2026-05-29 include broadcast-accepted buys in auto-sell eligibility; the actual open-position pull still gates real sell actions, so failed broadcasts do not create sellable positions.
+- [x] 2026-05-29 make cancelled follow state a live buy blocker; pending records are dropped and pre-signed raw buys are discarded before due execution.
 
 ## Next
 

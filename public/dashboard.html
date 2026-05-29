@@ -48,13 +48,13 @@
           </button>
           <button class="navItem" type="button" data-route="markets">
             <span data-icon="sparkles"></span>
-            <span>Markets</span>
-            <small>买入队列</small>
+            <span>即将开盘</span>
+            <small>筛选关注</small>
           </button>
           <button class="navItem" type="button" data-route="positions">
             <span data-icon="layers-3"></span>
-            <span>Positions</span>
-            <small>持仓卖出</small>
+            <span>项目持仓</span>
+            <small>关注持仓</small>
           </button>
           <button class="navItem" type="button" data-route="execution">
             <span data-icon="activity"></span>
@@ -122,41 +122,32 @@
 
           <section id="marketsView" class="view" data-view="markets">
             <div class="viewToolbar">
-              <div class="segmented" aria-label="开盘时间">
-                <button type="button" class="isActive" data-market-time="all">全部时间</button>
-                <button type="button" data-market-time="past">过去</button>
-                <button type="button" data-market-time="future">未来</button>
+              <div class="segmented" aria-label="看盘时间">
+                <button type="button" data-upcoming-horizon="1">1 天内</button>
+                <button type="button" data-upcoming-horizon="3">3 天内</button>
+                <button type="button" class="isActive" data-upcoming-horizon="7">7 天内</button>
               </div>
-              <div class="segmented" aria-label="市场筛选">
-                <button type="button" class="isActive" data-market-filter="all">全部</button>
-                <button type="button" data-market-filter="pending">待处理</button>
-                <button type="button" data-market-filter="funding">资金不足</button>
-                <button type="button" data-market-filter="filtered">已过滤</button>
-                <button type="button" data-market-filter="bought">已买</button>
-                <button type="button" data-market-filter="skipped">已跳过</button>
+              <div class="segmented" aria-label="持续时间">
+                <button type="button" class="isActive" data-duration-filter="all">全部时长</button>
+                <button type="button" data-duration-filter="ge48">≥48H</button>
+                <button type="button" data-duration-filter="lt48">&lt;48H</button>
               </div>
+              <label class="toolbarSelect">
+                <span>类别</span>
+                <select id="upcomingCategoryFilter" aria-label="市场类别"></select>
+              </label>
             </div>
-            <div class="marketsLayout">
+            <div class="marketsLayout singleColumn">
               <section class="panel">
                 <div class="panelHead">
                   <div>
-                    <h3><i data-icon="sparkles"></i>市场队列</h3>
-                    <p>按 bot 的买入决策状态查看</p>
+                    <h3><i data-icon="sparkles"></i>即将开盘</h3>
+                    <p>关注即允许买入，取消关注即禁止买入</p>
                   </div>
                   <span id="newMarketCount">--</span>
                 </div>
                 <div id="newMarketList" class="marketTable"></div>
               </section>
-              <aside class="panel">
-                <div class="panelHead">
-                  <div>
-                    <h3><i data-icon="calendar-clock"></i>即将开盘</h3>
-                    <p>已知 future markets</p>
-                  </div>
-                  <span id="nextCount">--</span>
-                </div>
-                <div id="upcomingList" class="compactList"></div>
-              </aside>
             </div>
           </section>
 
@@ -165,7 +156,30 @@
             <section class="panel positionsPanel">
               <div class="panelHead">
                 <div>
-                  <h3><i data-icon="layers-3"></i>持仓与退出</h3>
+                  <h3><i data-icon="layers-3"></i>项目持仓</h3>
+                  <p>默认符合策略的项目会进入这里，手动关注也会进入</p>
+                </div>
+                <span id="projectBoardCount">--</span>
+              </div>
+              <div id="projectBoardList" class="projectBoard"></div>
+            </section>
+            <section class="panel positionsPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="receipt"></i>历史项目</h3>
+                  <p>全部卖出后的项目保留在这里复盘</p>
+                </div>
+                <button id="toggleHistoryProjects" class="ghost iconButton" type="button">
+                  <span data-icon="chevron-down"></span>
+                  <span>展示历史项目</span>
+                </button>
+              </div>
+              <div id="historyProjectList" class="projectBoard isHidden"></div>
+            </section>
+            <section class="panel positionsPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="badge-dollar-sign"></i>当前持仓明细</h3>
                   <p>选择仓位后在右侧面板报价和卖出</p>
                 </div>
                 <span id="holdingCount">--</span>

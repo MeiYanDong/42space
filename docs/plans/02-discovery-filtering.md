@@ -38,6 +38,7 @@ Then apply one strategy gate.
 Auto-buy only:
 
 - Event Market
+- not cancelled in the profile-local follow state
 - Not Price
 - `duration >= 48h`
 - Opened less than `EVENT_OPEN_WINDOW_SECONDS`
@@ -45,11 +46,14 @@ Auto-buy only:
 
 Skip:
 
+- markets explicitly cancelled from follow
 - Price markets
 - Short fixed-cycle templates, for example daily volume, daily token usage, model usage, price range
 - Anything older than the open window
 - Anything that cannot be normalized safely
 - Missing odds only if `EVENT_OUTCOME_SELECTION_FALLBACK=error` is explicitly enabled
+
+Manual follow can intentionally allow an otherwise filtered strategy market, but status, start time, and outcome availability still have to be usable.
 
 ## Timing Model
 

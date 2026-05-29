@@ -27,6 +27,9 @@
 - [x] Show and enforce Dashboard manual-sell protection during the buy hot window.
 - [x] Add reusable Binance Futures hourly volume heatmap analysis with local kline cache.
 - [x] Stop Feishu notifications for skipped markets; notify only eligible new markets that enter pending or immediate buy flow.
+- [x] Render Feishu notifications as concise operator cards with Chinese labels and clean text fallback.
+- [x] Add independent `即将开盘` and `项目持仓` pages with profile-local follow state.
+- [x] Make follow state operational: follow allows buy, cancel follow forbids buy, and fully sold projects remain visible under history.
 
 ## Next
 

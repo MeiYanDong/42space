@@ -6,13 +6,13 @@ const ROUTES = {
   },
   markets: {
     kicker: "Discovery",
-    title: "Markets",
-    lead: "查看新盘、待开盘队列和 bot 的买入决策。"
+    title: "即将开盘",
+    lead: "按时长、类别和开盘时间筛选；关注即允许买入，取消关注即禁止买入。"
   },
   positions: {
     kicker: "Portfolio",
-    title: "Positions",
-    lead: "管理 bot wallet 当前持仓，并按比例报价卖出。"
+    title: "项目持仓",
+    lead: "查看默认关注、手动关注、当前持仓和全部卖出后的历史项目。"
   },
   execution: {
     kicker: "Audit",
@@ -29,14 +29,20 @@ const ROUTES = {
 const state = {
   data: null,
   route: routeFromHash(),
-  marketFilter: "all",
-  marketTimeFilter: "all",
+  upcomingHorizonDays: 7,
+  durationFilter: "all",
+  categoryFilter: "all",
+  expandedMarkets: new Set(),
+  marketDetails: new Map(),
+  projectExpanded: new Set(),
+  showHistoryProjects: false,
   selected: null,
   sellPercent: 100,
   quoteRequest: 0,
   quoteTimer: null,
   configDirty: false,
   runtimeConfig: null,
+  runtimeWriteProtected: false,
   timer: null
 };
 
@@ -45,7 +51,11 @@ const ICONS = {
   "badge-dollar-sign": `<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"></path><path d="M12 7v10"></path><path d="M15 9.5A3.5 3.5 0 0 0 12 8a2.5 2.5 0 0 0 0 5 2.5 2.5 0 0 1 0 5 3.5 3.5 0 0 1-3-1.5"></path>`,
   "bar-chart-3": `<path d="M3 3v18h18"></path><path d="M18 17V9"></path><path d="M13 17V5"></path><path d="M8 17v-3"></path>`,
   "calendar-clock": `<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"></path><path d="M16 2v4"></path><path d="M8 2v4"></path><path d="M3 10h5"></path><circle cx="16" cy="16" r="6"></circle><path d="M16 14v2l1.5 1.5"></path>`,
+  "chevron-down": `<path d="m6 9 6 6 6-6"></path>`,
+  "chevron-right": `<path d="m9 18 6-6-6-6"></path>`,
   "circle-dollar-sign": `<circle cx="12" cy="12" r="10"></circle><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"></path><path d="M12 18V6"></path>`,
+  bookmark: `<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16Z"></path>`,
+  "bookmark-x": `<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16Z"></path><path d="m14.5 7.5-5 5"></path><path d="m9.5 7.5 5 5"></path>`,
   clock: `<circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path>`,
   "loader-circle": `<path d="M21 12a9 9 0 1 1-6.219-8.56"></path>`,
   "layers-3": `<path d="m12 2 9 5-9 5-9-5 9-5Z"></path><path d="m3 12 9 5 9-5"></path><path d="m3 17 9 5 9-5"></path>`,
@@ -77,9 +87,14 @@ const els = {
   newMarketList: $("newMarketList"),
   nextCount: $("nextCount"),
   upcomingList: $("upcomingList"),
+  upcomingCategoryFilter: $("upcomingCategoryFilter"),
   holdingCount: $("holdingCount"),
   holdingsList: $("holdingsList"),
   positionSummary: $("positionSummary"),
+  projectBoardCount: $("projectBoardCount"),
+  projectBoardList: $("projectBoardList"),
+  toggleHistoryProjects: $("toggleHistoryProjects"),
+  historyProjectList: $("historyProjectList"),
   projectCount: $("projectCount"),
   projectStats: $("projectStats"),
   activityList: $("activityList"),
@@ -156,8 +171,10 @@ async function loadRuntimeConfig({ force = false } = {}) {
   try {
     const data = await api("/api/runtime-config");
     state.runtimeConfig = data.config;
+    state.runtimeWriteProtected = Boolean(data.writeProtected);
     if (!state.configDirty || force) setRuntimeConfigForm(data.config);
     els.configStatus.textContent = runtimeStatusText(data.config);
+    syncAdminTokenField();
   } catch (error) {
     els.configStatus.textContent = error.message || "配置读取失败";
   }
@@ -241,31 +258,21 @@ function renderOverview(data) {
 }
 
 function renderMarkets(data) {
+  renderUpcomingCategoryOptions(data.newMarkets);
   renderNext(data.next);
   renderNewMarkets(data.newMarkets);
 }
 
 function renderNewMarkets(feed) {
   const items = feed.items
-    .filter((item) => marketMatchesFilter(item, state.marketFilter))
-    .filter((item) => marketMatchesTimeFilter(item, state.marketTimeFilter));
+    .filter(upcomingMatchesFilters);
   const baseCount = feed.excluded ? `${feed.count} 个 · 排除 ${feed.excluded}` : `${feed.count} 个`;
-  els.newMarketCount.textContent = state.marketFilter === "all" && state.marketTimeFilter === "all"
-    ? baseCount
-    : `${items.length} / ${feed.count}`;
+  els.newMarketCount.textContent = items.length === feed.count ? baseCount : `${items.length} / ${feed.count}`;
   if (!items.length) {
     els.newMarketList.innerHTML = `<div class="empty">暂无匹配市场</div>`;
     return;
   }
-  els.newMarketList.innerHTML = marketSections(items).map((section) => `
-    <section class="marketSection">
-      <div class="marketSectionHead">
-        <strong>${escapeHtml(section.label)}</strong>
-        <span>${section.items.length} 场</span>
-      </div>
-      ${marketTable(section.items)}
-    </section>
-  `).join("");
+  els.newMarketList.innerHTML = marketTable(items);
 }
 
 function marketTable(items) {
@@ -273,11 +280,11 @@ function marketTable(items) {
     <div class="tableHeader marketRow">
       <span>Market</span>
       <span>Time</span>
-      <span>State</span>
-      <span>Stake</span>
+      <span>Decision</span>
+      <span></span>
     </div>
     ${items.map((item) => `
-      <div class="marketRow">
+      <div class="marketRow ${state.expandedMarkets.has(item.address) ? "isExpanded" : ""}">
         <div class="marketQuestion">
           <strong>${escapeHtml(item.title)}</strong>
           <small>${item.category ? escapeHtml(item.category) : "Event Market"} · 买 ${item.choices} 档</small>
@@ -291,30 +298,23 @@ function marketTable(items) {
           <small>${escapeHtml(item.duration || "")}</small>
         </div>
         <div><span class="marketState ${marketStateTone(item.tone)}">${escapeHtml(item.state)}</span></div>
-        <div>${item.stake} U</div>
+        <div class="rowActions">
+          <button class="ghost iconButton compactIconButton" type="button" data-follow-action="${item.follow?.allowed ? "block" : "follow"}" data-market='${escapeAttr(JSON.stringify(followPayload(item)))}'>
+            ${icon(item.follow?.allowed ? "bookmark-x" : "bookmark")}
+            <span>${item.follow?.allowed ? "取消关注" : "关注"}</span>
+          </button>
+          <button class="ghost iconButton iconOnly" type="button" data-expand-market="${escapeAttr(item.address)}" aria-label="展开选项">
+            ${icon(state.expandedMarkets.has(item.address) ? "chevron-down" : "chevron-right")}
+          </button>
+        </div>
+        ${state.expandedMarkets.has(item.address) ? renderMarketDetail(item.address) : ""}
       </div>
     `).join("")}
   `;
 }
 
-function marketSections(items) {
-  if (state.marketTimeFilter !== "all") {
-    return [{
-      label: state.marketTimeFilter === "future" ? "未来开盘" : "已经开盘",
-      items
-    }];
-  }
-  const past = items.filter((item) => item.timeGroup === "past");
-  const future = items.filter((item) => item.timeGroup === "future");
-  const unknown = items.filter((item) => item.timeGroup !== "past" && item.timeGroup !== "future");
-  return [
-    { label: "已经开盘", items: past },
-    { label: "未来开盘", items: future },
-    { label: "时间未知", items: unknown }
-  ].filter((section) => section.items.length);
-}
-
 function renderNext(next) {
+  if (!els.nextCount || !els.upcomingList) return;
   els.nextCount.textContent = `${next.count} 场`;
   if (!next.items.length) {
     els.upcomingList.innerHTML = `<div class="empty">暂无</div>`;
@@ -330,6 +330,83 @@ function renderNext(next) {
   `).join("");
 }
 
+function renderUpcomingCategoryOptions(feed) {
+  if (!els.upcomingCategoryFilter) return;
+  const categories = [...new Set((feed.items ?? [])
+    .filter((item) => item.timeGroup === "future")
+    .flatMap((item) => [item.category, ...(item.categories ?? [])])
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+  const current = state.categoryFilter;
+  els.upcomingCategoryFilter.innerHTML = [
+    `<option value="all">全部类别</option>`,
+    ...categories.map((category) => `<option value="${escapeAttr(category)}">${escapeHtml(category)}</option>`)
+  ].join("");
+  els.upcomingCategoryFilter.value = categories.includes(current) ? current : "all";
+  state.categoryFilter = els.upcomingCategoryFilter.value;
+}
+
+function upcomingMatchesFilters(item) {
+  if (item.timeGroup !== "future") return false;
+  const startsAt = new Date(item.startsAt).getTime();
+  const horizonMs = Number(state.upcomingHorizonDays) * 86400000;
+  if (Number.isFinite(startsAt) && startsAt - Date.now() > horizonMs) return false;
+
+  const hours = Number(item.durationHours);
+  if (state.durationFilter === "ge48" && (!Number.isFinite(hours) || hours < 48)) return false;
+  if (state.durationFilter === "lt48" && Number.isFinite(hours) && hours >= 48) return false;
+
+  if (state.categoryFilter !== "all") {
+    const categories = [item.category, ...(item.categories ?? [])].map((value) => String(value ?? "").toLowerCase());
+    if (!categories.includes(state.categoryFilter.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function followPayload(item) {
+  return {
+    market: item.address,
+    title: item.title,
+    category: item.category,
+    startsAt: item.startsAt,
+    endsAt: item.endsAt,
+    snapshot: {
+      address: item.address,
+      title: item.title,
+      category: item.category,
+      startsAt: item.startsAt,
+      endsAt: item.endsAt
+    }
+  };
+}
+
+function renderMarketDetail(address) {
+  const detail = state.marketDetails.get(address);
+  if (!detail) return `<div class="marketDetail"><div class="empty">读取选项中</div></div>`;
+  if (detail.error) return `<div class="marketDetail"><div class="empty">${escapeHtml(detail.error)}</div></div>`;
+  const outcomes = detail.market?.outcomes ?? [];
+  if (!outcomes.length) return `<div class="marketDetail"><div class="empty">暂无选项数据</div></div>`;
+  return `
+    <div class="marketDetail">
+      <div class="outcomeHeader">
+        <span>选项</span>
+        <span>价格</span>
+        <span>赔率</span>
+        <span>成交</span>
+      </div>
+      ${outcomes.map((outcome) => `
+        <div class="outcomeRow">
+          <strong>${escapeHtml(outcome.name)}</strong>
+          <span>${escapeHtml(outcome.price)}</span>
+          <span>${escapeHtml(outcome.odds)}</span>
+          <span>${escapeHtml(outcome.volume)} U</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderPositions(data) {
   const cards = data.analytics.cards;
   els.positionSummary.innerHTML = `
@@ -340,8 +417,90 @@ function renderPositions(data) {
     ${summaryCard("未实现", `${cards.unrealizedPnl} U`, "当前浮盈亏", cards.unrealizedPositive)}
     ${summaryCard("总盈亏", `${cards.totalPnl} U`, cards.totalRoi, cards.totalPositive)}
   `;
+  renderProjectBoard(data.projectBoard);
   renderHoldings(data.holdings);
   renderProjectStats(data.analytics.projects);
+}
+
+function renderProjectBoard(board) {
+  if (!els.projectBoardList) return;
+  els.projectBoardCount.textContent = `${board?.count ?? 0} 个`;
+  const active = board?.active ?? [];
+  if (!active.length) {
+    els.projectBoardList.innerHTML = `<div class="empty">暂无关注项目</div>`;
+  } else {
+    els.projectBoardList.innerHTML = active.map(renderProjectBoardRow).join("");
+  }
+  bindSellButtons(els.projectBoardList);
+
+  const history = board?.history ?? [];
+  const label = state.showHistoryProjects ? "隐藏历史项目" : "展示历史项目";
+  if (els.toggleHistoryProjects) {
+    setButtonLabel(els.toggleHistoryProjects, state.showHistoryProjects ? "chevron-down" : "chevron-right", `${label}${history.length ? ` · ${history.length}` : ""}`);
+  }
+  if (els.historyProjectList) {
+    els.historyProjectList.classList.toggle("isHidden", !state.showHistoryProjects);
+    els.historyProjectList.innerHTML = history.length
+      ? history.map(renderHistoryProjectRow).join("")
+      : `<div class="empty">暂无历史项目</div>`;
+  }
+}
+
+function renderProjectBoardRow(project) {
+  const expanded = state.projectExpanded.has(project.market);
+  const holding = project.holding;
+  return `
+    <section class="projectBoardRow ${expanded ? "isExpanded" : ""}">
+      <div class="projectBoardTop">
+        <div class="projectBoardTitle">
+          <strong title="${escapeAttr(project.title)}">${escapeHtml(project.title)}</strong>
+          <span>${project.category ? `${escapeHtml(project.category)} · ` : ""}${escapeHtml(project.follow?.label ?? project.state)} · ${project.startsAt ? `${formatDate(project.startsAt)} 开` : "等待自动更新"}</span>
+        </div>
+        <div class="projectBoardStats">
+          ${holding ? `<span>投入 ${holding.cost} U</span><span>当前 ${holding.value} U</span><strong class="${holding.positive ? "good" : "bad"}">${holding.pnl} U</strong>` : `<span>${escapeHtml(project.state || "")}</span><span>${project.stake ? `${escapeHtml(project.stake)} U` : ""}</span>`}
+        </div>
+        <button class="ghost iconButton iconOnly" type="button" data-expand-project="${escapeAttr(project.market)}" aria-label="展开项目">
+          ${icon(expanded ? "chevron-down" : "chevron-right")}
+        </button>
+      </div>
+      ${expanded ? renderProjectBoardDetail(project) : ""}
+    </section>
+  `;
+}
+
+function renderProjectBoardDetail(project) {
+  const holding = project.holding;
+  if (!holding) {
+    return `
+      <div class="projectBoardDetail">
+        <div class="empty">还没有持仓，自动买入后这里会更新。</div>
+      </div>
+    `;
+  }
+  const sellBlocked = Boolean(state.data?.manualSell?.blocked);
+  const sellBlockMessage = state.data?.manualSell?.message ?? "";
+  return `
+    <div class="projectBoardDetail">
+      ${holding.items.map((item) => renderPosition(item, { sellBlocked, sellBlockMessage })).join("")}
+    </div>
+  `;
+}
+
+function renderHistoryProjectRow(project) {
+  return `
+    <div class="historyProjectRow">
+      <div>
+        <strong title="${escapeAttr(project.title)}">${escapeHtml(project.title)}</strong>
+        <span>${project.lastAt ? formatTime(project.lastAt) : "--"}</span>
+      </div>
+      <div class="projectBoardStats">
+        <span>买入 ${project.bought} U</span>
+        <span>卖出 ${project.sold} U</span>
+        <strong class="${project.positive ? "good" : "bad"}">${project.pnl} U</strong>
+        <span>${project.roi}</span>
+      </div>
+    </div>
+  `;
 }
 
 function renderHoldings(holdings) {
@@ -375,7 +534,13 @@ function renderHoldings(holdings) {
     </section>
   `).join("");
 
-  for (const button of document.querySelectorAll("[data-sell]")) {
+  bindSellButtons(els.holdingsList);
+}
+
+function bindSellButtons(root = document) {
+  for (const button of root.querySelectorAll("[data-sell]")) {
+    if (button.dataset.sellBound === "1") continue;
+    button.dataset.sellBound = "1";
     button.addEventListener("click", () => openSell(JSON.parse(button.dataset.sell)));
   }
 }
@@ -655,23 +820,101 @@ function bindNavigation() {
       window.location.hash = `#/${button.dataset.route}`;
     });
   }
-  for (const button of document.querySelectorAll("[data-market-filter]")) {
+  for (const button of document.querySelectorAll("[data-upcoming-horizon]")) {
     button.addEventListener("click", () => {
-      state.marketFilter = button.dataset.marketFilter;
-      for (const item of document.querySelectorAll("[data-market-filter]")) {
+      state.upcomingHorizonDays = Number(button.dataset.upcomingHorizon);
+      for (const item of document.querySelectorAll("[data-upcoming-horizon]")) {
         item.classList.toggle("isActive", item === button);
       }
       if (state.data) renderNewMarkets(state.data.newMarkets);
     });
   }
-  for (const button of document.querySelectorAll("[data-market-time]")) {
+  for (const button of document.querySelectorAll("[data-duration-filter]")) {
     button.addEventListener("click", () => {
-      state.marketTimeFilter = button.dataset.marketTime;
-      for (const item of document.querySelectorAll("[data-market-time]")) {
+      state.durationFilter = button.dataset.durationFilter;
+      for (const item of document.querySelectorAll("[data-duration-filter]")) {
         item.classList.toggle("isActive", item === button);
       }
       if (state.data) renderNewMarkets(state.data.newMarkets);
     });
+  }
+  els.upcomingCategoryFilter?.addEventListener("change", () => {
+    state.categoryFilter = els.upcomingCategoryFilter.value;
+    if (state.data) renderNewMarkets(state.data.newMarkets);
+  });
+  els.toggleHistoryProjects?.addEventListener("click", () => {
+    state.showHistoryProjects = !state.showHistoryProjects;
+    if (state.data) renderProjectBoard(state.data.projectBoard);
+  });
+  document.addEventListener("click", (event) => {
+    const marketButton = event.target.closest("[data-expand-market]");
+    if (marketButton) {
+      void toggleMarketExpansion(marketButton.dataset.expandMarket);
+      return;
+    }
+    const projectButton = event.target.closest("[data-expand-project]");
+    if (projectButton) {
+      toggleProjectExpansion(projectButton.dataset.expandProject);
+      return;
+    }
+    const followButton = event.target.closest("[data-follow-action]");
+    if (followButton) {
+      void saveMarketFollow(followButton);
+    }
+  });
+}
+
+async function toggleMarketExpansion(address) {
+  if (!address) return;
+  if (state.expandedMarkets.has(address)) {
+    state.expandedMarkets.delete(address);
+    if (state.data) renderNewMarkets(state.data.newMarkets);
+    return;
+  }
+  state.expandedMarkets.add(address);
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+  if (!state.marketDetails.has(address)) {
+    try {
+      const detail = await api(`/api/market-detail?market=${encodeURIComponent(address)}`);
+      state.marketDetails.set(address, detail);
+    } catch (error) {
+      state.marketDetails.set(address, { error: error.message || "读取失败" });
+    }
+  }
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+}
+
+function toggleProjectExpansion(address) {
+  if (!address) return;
+  if (state.projectExpanded.has(address)) {
+    state.projectExpanded.delete(address);
+  } else {
+    state.projectExpanded.add(address);
+  }
+  if (state.data) renderProjectBoard(state.data.projectBoard);
+}
+
+async function saveMarketFollow(button) {
+  let payload = {};
+  try {
+    payload = JSON.parse(button.dataset.market || "{}");
+  } catch {
+    showToast("市场数据无效");
+    return;
+  }
+  const action = button.dataset.followAction === "block" ? "block" : "follow";
+  button.disabled = true;
+  try {
+    const data = await api("/api/market-follow", {
+      method: action === "block" ? "DELETE" : "POST",
+      body: JSON.stringify({ ...payload, action })
+    });
+    showToast(data.message || (action === "block" ? "已取消关注" : "已关注"));
+    await loadOverview({ force: true });
+  } catch (error) {
+    showToast(error.message || "关注状态保存失败");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -690,7 +933,7 @@ function bindSellControls() {
 function bindRuntimeConfigControls() {
   if (!els.runtimeConfigForm) return;
   const token = localStorage.getItem("42spaceAdminToken") ?? "";
-  els.configAdminToken.value = token;
+  if (els.configAdminToken) els.configAdminToken.value = token;
   for (const input of [
     els.configMode,
     els.configOutcomeCount,
@@ -710,16 +953,22 @@ function bindRuntimeConfigControls() {
       els.configStatus.textContent = "未应用";
     });
   }
-  els.configAdminToken.addEventListener("input", () => {
+  els.configAdminToken?.addEventListener("input", () => {
     localStorage.setItem("42spaceAdminToken", els.configAdminToken.value);
   });
   els.runtimeConfigForm.addEventListener("submit", saveRuntimeConfig);
 }
 
+function syncAdminTokenField() {
+  const field = els.configAdminToken?.closest(".field");
+  if (!field) return;
+  field.hidden = !state.runtimeWriteProtected;
+}
+
 async function saveRuntimeConfig(event) {
   event.preventDefault();
-  const token = els.configAdminToken.value.trim();
-  if (!token) {
+  const token = els.configAdminToken?.value.trim() ?? "";
+  if (state.runtimeWriteProtected && !token) {
     showToast("需要管理令牌");
     return;
   }
@@ -741,12 +990,12 @@ async function saveRuntimeConfig(event) {
   try {
     const data = await api("/api/runtime-config", {
       method: "PUT",
-      headers: { "x-admin-token": token },
+      headers: token ? { "x-admin-token": token } : {},
       body: JSON.stringify(payload)
     });
     state.configDirty = false;
     state.runtimeConfig = data.config;
-    localStorage.setItem("42spaceAdminToken", token);
+    if (token) localStorage.setItem("42spaceAdminToken", token);
     setRuntimeConfigForm(data.config);
     els.configStatus.textContent = runtimeStatusText(data.config);
     showToast(data.message || "配置已应用");
@@ -777,21 +1026,6 @@ function setRoute(route, { replace = false } = {}) {
 
 function routeFromHash() {
   return window.location.hash.replace(/^#\/?/, "") || "overview";
-}
-
-function marketMatchesFilter(item, filter) {
-  if (filter === "all") return true;
-  if (filter === "bought") return item.state === "已买";
-  if (filter === "skipped") return item.state === "已跳过" || item.state === "已错过";
-  if (filter === "filtered") return item.state === "已过滤";
-  if (filter === "funding") return item.state === "资金不足";
-  if (filter === "pending") return !["已买", "已跳过", "已错过", "已过滤", "资金不足"].includes(item.state);
-  return true;
-}
-
-function marketMatchesTimeFilter(item, filter) {
-  if (filter === "all") return true;
-  return item.timeGroup === filter;
 }
 
 function marketStateTone(tone) {
@@ -826,7 +1060,7 @@ function splitActivityTitle(value) {
 function activityTone(label) {
   if (label === "卖出" || label === "手动卖出" || label === "自动卖出") return "sell";
   if (label === "买入" || label === "买入成功") return "buy";
-  if (label === "买入失败") return "badTone";
+  if (label === "买入失败" || label === "禁止买入") return "badTone";
   if (label === "等待确认") return "wait";
   return "neutral";
 }
