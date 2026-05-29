@@ -46,12 +46,7 @@ export function followMarket(file, marketInput) {
   return updateMarketFollowState(file, (state) => {
     const record = normalizeMarketRecord(marketInput, "manual");
     if (!record) throw new Error("Missing market");
-    delete state.blocked[record.market];
-    state.followed[record.market] = {
-      ...(state.followed[record.market] ?? {}),
-      ...record,
-      updatedAt: new Date().toISOString()
-    };
+    applyFollowRecord(state, record);
     return state;
   });
 }
@@ -60,14 +55,17 @@ export function blockMarket(file, marketInput) {
   return updateMarketFollowState(file, (state) => {
     const record = normalizeMarketRecord(marketInput, "manual");
     if (!record) throw new Error("Missing market");
-    delete state.followed[record.market];
-    state.blocked[record.market] = {
-      ...(state.blocked[record.market] ?? {}),
-      ...record,
-      updatedAt: new Date().toISOString()
-    };
+    applyBlockRecord(state, record);
     return state;
   });
+}
+
+export function followMarkets(file, marketInputs = []) {
+  return updateManyMarkets(file, marketInputs, "follow");
+}
+
+export function blockMarkets(file, marketInputs = []) {
+  return updateManyMarkets(file, marketInputs, "block");
 }
 
 export function marketFollowStatus(state, market, baseDecision = null, decision = null) {
@@ -168,6 +166,44 @@ function updateMarketFollowState(file, updater) {
     updatedAt: new Date().toISOString()
   }));
   return writeMarketFollowState(file, next);
+}
+
+function updateManyMarkets(file, marketInputs, action) {
+  if (!Array.isArray(marketInputs) || marketInputs.length === 0) throw new Error("Missing markets");
+  let changed = 0;
+  const state = updateMarketFollowState(file, (current) => {
+    for (const input of marketInputs) {
+      const record = normalizeMarketRecord(input, "manual");
+      if (!record) continue;
+      if (action === "block") {
+        applyBlockRecord(current, record);
+      } else {
+        applyFollowRecord(current, record);
+      }
+      changed += 1;
+    }
+    if (changed === 0) throw new Error("Missing markets");
+    return current;
+  });
+  return state;
+}
+
+function applyFollowRecord(state, record) {
+  delete state.blocked[record.market];
+  state.followed[record.market] = {
+    ...(state.followed[record.market] ?? {}),
+    ...record,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function applyBlockRecord(state, record) {
+  delete state.followed[record.market];
+  state.blocked[record.market] = {
+    ...(state.blocked[record.market] ?? {}),
+    ...record,
+    updatedAt: new Date().toISOString()
+  };
 }
 
 function normalizeRecordMap(value) {

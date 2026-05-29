@@ -385,6 +385,34 @@ span[data-icon] {
   white-space: nowrap;
 }
 
+.panelActions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.panelActions > span {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 10px;
+  background: var(--surface-chip);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.panelActions .bulkCount {
+  min-width: 68px;
+  color: var(--foreground);
+}
+
 .overviewGrid,
 .marketsLayout,
 .strategyGrid {
@@ -619,6 +647,34 @@ span[data-icon] {
 .marketQuestion,
 .activityBody {
   min-width: 0;
+}
+
+.marketQuestionHeader {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.marketQuestionText {
+  min-width: 0;
+}
+
+.marketSelect {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.marketSelect input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
 }
 
 .activityTitle,

@@ -32,6 +32,7 @@
 - [x] Keep normal low-funds status out of Feishu; only send low-funds alerts in the T-30m/T-5m opening window.
 - [x] Add independent `即将开盘` and `项目持仓` pages with profile-local follow state.
 - [x] Make follow state operational: follow allows buy, cancel follow forbids buy, and fully sold projects remain visible under history.
+- [x] Add bulk selection on `即将开盘` so filtered markets can be followed or cancelled in one action.
 
 ## Next
 

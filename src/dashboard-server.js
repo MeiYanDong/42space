@@ -9,7 +9,14 @@ import { fileURLToPath } from "node:url";
 import { loadDotEnv, normalizeRuntimeConfig, readConfig, writeRuntimeConfig } from "./config.js";
 import { fetchActivity, fetchMarket, fetchMarkets } from "./fortytwo.js";
 import { eventDurationMs, getBaseEventMarketDecision, getEventMarketDecision, isEventMarket, isPriceMarket } from "./event-strategy.js";
-import { blockMarket, followMarket, marketFollowStatus, readMarketFollowState } from "./market-follow.js";
+import {
+  blockMarket,
+  blockMarkets,
+  followMarket,
+  followMarkets,
+  marketFollowStatus,
+  readMarketFollowState
+} from "./market-follow.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -70,6 +77,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/market-follow" && req.method === "DELETE") {
       return sendJson(res, await updateMarketFollow(req, "block"));
+    }
+    if (url.pathname === "/api/market-follow-batch" && req.method === "POST") {
+      return sendJson(res, await updateMarketFollowBatch(req));
     }
     if (url.pathname === "/api/sell/quote" && req.method === "POST") {
       return sendJson(res, await sellQuote(await readJsonBody(req)));
@@ -347,6 +357,32 @@ async function updateMarketFollow(req, mode) {
     message: action === "block"
       ? (restarted ? "已取消关注，worker 已重启" : "已取消关注")
       : (restarted ? "已关注，worker 已重启" : "已关注")
+  };
+}
+
+async function updateMarketFollowBatch(req) {
+  const body = await readJsonBody(req);
+  requireAdminToken(req, body);
+  const markets = Array.isArray(body.markets) ? body.markets.filter(Boolean) : [];
+  if (markets.length === 0) throw new Error("Missing markets");
+  if (markets.length > 500) throw new Error("Too many markets");
+
+  const cfg = readConfig();
+  const action = body.action === "block" || body.action === "unfollow" ? "block" : "follow";
+  const state = action === "block"
+    ? blockMarkets(cfg.marketFollowFile, markets)
+    : followMarkets(cfg.marketFollowFile, markets);
+  const restarted = await restartWorker();
+  overviewCache = null;
+  return {
+    ok: true,
+    action,
+    count: markets.length,
+    state,
+    restarted,
+    message: action === "block"
+      ? `已取消关注 ${markets.length} 个${restarted ? "，worker 已重启" : ""}`
+      : `已关注 ${markets.length} 个${restarted ? "，worker 已重启" : ""}`
   };
 }
 

@@ -32,6 +32,9 @@ const state = {
   upcomingHorizonDays: 7,
   durationFilter: "all",
   categoryFilter: "all",
+  selectedUpcomingMarkets: new Set(),
+  visibleUpcomingMarkets: [],
+  upcomingBulkBusy: false,
   expandedMarkets: new Set(),
   marketDetails: new Map(),
   projectExpanded: new Set(),
@@ -51,6 +54,7 @@ const ICONS = {
   "badge-dollar-sign": `<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"></path><path d="M12 7v10"></path><path d="M15 9.5A3.5 3.5 0 0 0 12 8a2.5 2.5 0 0 0 0 5 2.5 2.5 0 0 1 0 5 3.5 3.5 0 0 1-3-1.5"></path>`,
   "bar-chart-3": `<path d="M3 3v18h18"></path><path d="M18 17V9"></path><path d="M13 17V5"></path><path d="M8 17v-3"></path>`,
   "calendar-clock": `<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"></path><path d="M16 2v4"></path><path d="M8 2v4"></path><path d="M3 10h5"></path><circle cx="16" cy="16" r="6"></circle><path d="M16 14v2l1.5 1.5"></path>`,
+  "check-square": `<path d="m9 11 3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>`,
   "chevron-down": `<path d="m6 9 6 6 6-6"></path>`,
   "chevron-right": `<path d="m9 18 6-6-6-6"></path>`,
   "circle-dollar-sign": `<circle cx="12" cy="12" r="10"></circle><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"></path><path d="M12 18V6"></path>`,
@@ -85,6 +89,10 @@ const els = {
   nextClock: $("nextClock"),
   newMarketCount: $("newMarketCount"),
   newMarketList: $("newMarketList"),
+  selectAllUpcoming: $("selectAllUpcoming"),
+  bulkFollowUpcoming: $("bulkFollowUpcoming"),
+  bulkBlockUpcoming: $("bulkBlockUpcoming"),
+  upcomingSelectedCount: $("upcomingSelectedCount"),
   nextCount: $("nextCount"),
   upcomingList: $("upcomingList"),
   upcomingCategoryFilter: $("upcomingCategoryFilter"),
@@ -264,10 +272,12 @@ function renderMarkets(data) {
 }
 
 function renderNewMarkets(feed) {
-  const items = feed.items
-    .filter(upcomingMatchesFilters);
+  const items = upcomingVisibleItems(feed);
+  state.visibleUpcomingMarkets = items;
+  pruneUpcomingSelection(items);
   const baseCount = feed.excluded ? `${feed.count} 个 · 排除 ${feed.excluded}` : `${feed.count} 个`;
   els.newMarketCount.textContent = items.length === feed.count ? baseCount : `${items.length} / ${feed.count}`;
+  renderUpcomingBulkControls(items);
   if (!items.length) {
     els.newMarketList.innerHTML = `<div class="empty">暂无匹配市场</div>`;
     return;
@@ -286,10 +296,17 @@ function marketTable(items) {
     ${items.map((item) => `
       <div class="marketRow ${state.expandedMarkets.has(item.address) ? "isExpanded" : ""}">
         <div class="marketQuestion">
-          <strong>${escapeHtml(item.title)}</strong>
-          <small>${item.category ? escapeHtml(item.category) : "Event Market"} · 买 ${item.choices} 档</small>
-          <div class="tagLine">${(item.tags || []).map((tag) => `<span class="miniTag">${escapeHtml(tag)}</span>`).join("")}</div>
-          ${item.filterReason ? `<small class="filterReason">${escapeHtml(item.filterReason)}</small>` : ""}
+          <div class="marketQuestionHeader">
+            <label class="marketSelect" title="选择该市场">
+              <input type="checkbox" data-select-upcoming="${escapeAttr(item.address)}" ${state.selectedUpcomingMarkets.has(marketSelectionKey(item)) ? "checked" : ""} aria-label="选择 ${escapeAttr(item.title)}">
+            </label>
+            <div class="marketQuestionText">
+              <strong>${escapeHtml(item.title)}</strong>
+              <small>${item.category ? escapeHtml(item.category) : "Event Market"} · 买 ${item.choices} 档</small>
+              <div class="tagLine">${(item.tags || []).map((tag) => `<span class="miniTag">${escapeHtml(tag)}</span>`).join("")}</div>
+              ${item.filterReason ? `<small class="filterReason">${escapeHtml(item.filterReason)}</small>` : ""}
+            </div>
+          </div>
         </div>
         <div class="timeCell">
           <small>新出 ${formatDate(item.createdAt)}</small>
@@ -311,6 +328,41 @@ function marketTable(items) {
       </div>
     `).join("")}
   `;
+}
+
+function upcomingVisibleItems(feed = state.data?.newMarkets) {
+  return (feed?.items ?? []).filter(upcomingMatchesFilters);
+}
+
+function renderUpcomingBulkControls(items = state.visibleUpcomingMarkets) {
+  const visibleKeys = visibleUpcomingKeys(items);
+  const selectedCount = [...state.selectedUpcomingMarkets].filter((key) => visibleKeys.has(key)).length;
+  const allSelected = items.length > 0 && selectedCount === items.length;
+  if (els.upcomingSelectedCount) {
+    els.upcomingSelectedCount.textContent = selectedCount ? `${selectedCount} 已选` : `${items.length} 可选`;
+  }
+  if (els.selectAllUpcoming) {
+    setButtonLabel(els.selectAllUpcoming, allSelected ? "x" : "check-square", allSelected ? "取消全选" : "全选");
+    els.selectAllUpcoming.disabled = state.upcomingBulkBusy || items.length === 0;
+  }
+  if (els.bulkFollowUpcoming) els.bulkFollowUpcoming.disabled = state.upcomingBulkBusy || selectedCount === 0;
+  if (els.bulkBlockUpcoming) els.bulkBlockUpcoming.disabled = state.upcomingBulkBusy || selectedCount === 0;
+}
+
+function pruneUpcomingSelection(items) {
+  const visibleKeys = visibleUpcomingKeys(items);
+  for (const key of [...state.selectedUpcomingMarkets]) {
+    if (!visibleKeys.has(key)) state.selectedUpcomingMarkets.delete(key);
+  }
+}
+
+function visibleUpcomingKeys(items) {
+  return new Set((items ?? []).map(marketSelectionKey).filter(Boolean));
+}
+
+function marketSelectionKey(itemOrAddress) {
+  const address = typeof itemOrAddress === "string" ? itemOrAddress : itemOrAddress?.address;
+  return String(address ?? "").trim().toLowerCase();
 }
 
 function renderNext(next) {
@@ -842,11 +894,19 @@ function bindNavigation() {
     state.categoryFilter = els.upcomingCategoryFilter.value;
     if (state.data) renderNewMarkets(state.data.newMarkets);
   });
+  els.selectAllUpcoming?.addEventListener("click", toggleAllUpcomingSelection);
+  els.bulkFollowUpcoming?.addEventListener("click", () => saveMarketFollowBatch("follow"));
+  els.bulkBlockUpcoming?.addEventListener("click", () => saveMarketFollowBatch("block"));
   els.toggleHistoryProjects?.addEventListener("click", () => {
     state.showHistoryProjects = !state.showHistoryProjects;
     if (state.data) renderProjectBoard(state.data.projectBoard);
   });
   document.addEventListener("click", (event) => {
+    const selectInput = event.target.closest("[data-select-upcoming]");
+    if (selectInput) {
+      toggleUpcomingSelection(selectInput.dataset.selectUpcoming, selectInput.checked);
+      return;
+    }
     const marketButton = event.target.closest("[data-expand-market]");
     if (marketButton) {
       void toggleMarketExpansion(marketButton.dataset.expandMarket);
@@ -862,6 +922,31 @@ function bindNavigation() {
       void saveMarketFollow(followButton);
     }
   });
+}
+
+function toggleUpcomingSelection(address, selected) {
+  const key = marketSelectionKey(address);
+  if (!key) return;
+  if (selected) {
+    state.selectedUpcomingMarkets.add(key);
+  } else {
+    state.selectedUpcomingMarkets.delete(key);
+  }
+  renderUpcomingBulkControls();
+}
+
+function toggleAllUpcomingSelection() {
+  const items = state.visibleUpcomingMarkets.length ? state.visibleUpcomingMarkets : upcomingVisibleItems();
+  const keys = [...visibleUpcomingKeys(items)];
+  const allSelected = keys.length > 0 && keys.every((key) => state.selectedUpcomingMarkets.has(key));
+  for (const key of keys) {
+    if (allSelected) {
+      state.selectedUpcomingMarkets.delete(key);
+    } else {
+      state.selectedUpcomingMarkets.add(key);
+    }
+  }
+  if (state.data) renderNewMarkets(state.data.newMarkets);
 }
 
 async function toggleMarketExpansion(address) {
@@ -915,6 +1000,33 @@ async function saveMarketFollow(button) {
     showToast(error.message || "关注状态保存失败");
   } finally {
     button.disabled = false;
+  }
+}
+
+async function saveMarketFollowBatch(action) {
+  const selectedItems = state.visibleUpcomingMarkets.filter((item) => state.selectedUpcomingMarkets.has(marketSelectionKey(item)));
+  if (!selectedItems.length) {
+    showToast("先选择市场");
+    return;
+  }
+  state.upcomingBulkBusy = true;
+  renderUpcomingBulkControls();
+  try {
+    const data = await api("/api/market-follow-batch", {
+      method: "POST",
+      body: JSON.stringify({
+        action,
+        markets: selectedItems.map(followPayload)
+      })
+    });
+    state.selectedUpcomingMarkets.clear();
+    showToast(data.message || (action === "block" ? `已取消关注 ${selectedItems.length} 个` : `已关注 ${selectedItems.length} 个`));
+    await loadOverview({ force: true });
+  } catch (error) {
+    showToast(error.message || "批量关注状态保存失败");
+  } finally {
+    state.upcomingBulkBusy = false;
+    renderUpcomingBulkControls();
   }
 }
 

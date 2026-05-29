@@ -144,7 +144,22 @@
                     <h3><i data-icon="sparkles"></i>即将开盘</h3>
                     <p>关注即允许买入，取消关注即禁止买入</p>
                   </div>
-                  <span id="newMarketCount">--</span>
+                  <div class="panelActions">
+                    <button id="selectAllUpcoming" class="ghost iconButton compactIconButton" type="button">
+                      <span data-icon="check-square"></span>
+                      <span>全选</span>
+                    </button>
+                    <button id="bulkFollowUpcoming" class="ghost iconButton compactIconButton" type="button">
+                      <span data-icon="bookmark"></span>
+                      <span>关注</span>
+                    </button>
+                    <button id="bulkBlockUpcoming" class="ghost iconButton compactIconButton" type="button">
+                      <span data-icon="bookmark-x"></span>
+                      <span>取消关注</span>
+                    </button>
+                    <span id="upcomingSelectedCount" class="bulkCount">0 已选</span>
+                    <span id="newMarketCount">--</span>
+                  </div>
                 </div>
                 <div id="newMarketList" class="marketTable"></div>
               </section>
