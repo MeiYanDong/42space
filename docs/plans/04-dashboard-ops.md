@@ -97,7 +97,7 @@ Daily volume markets need a reusable hourly heatmap before making a trading deci
 
 Feishu alerts should render as operator-facing cards first, with a clean text fallback if the webhook rejects interactive cards. The card body should use Chinese labels, show only 3 to 5 useful facts, and keep raw technical fields in JSONL logs instead of sending them to operators.
 
-Noisy operational alerts should be state-change based. Low-funds alerts are sent for a new funding state or the T-30m/T-5m reminder stage for the next opening, then stay silent until the gap, next opening, or readiness changes. Receipt success stays in fills/decision logs only; receipt failure sends Feishu. Automatic-sell success stays in logs only; automatic-sell failure or circuit pause sends one concise card and is deduped through the profile-local alert state file.
+Noisy operational alerts should be action-window based. Normal low-funds status belongs in the dashboard and JSONL logs only; Feishu low-funds alerts are reserved for the T-30m/T-5m reminder stage before the next opening, then stay silent until the gap, next opening, or readiness changes. Receipt success stays in fills/decision logs only; receipt failure sends Feishu. Automatic-sell success stays in logs only; automatic-sell failure or circuit pause sends one concise card and is deduped through the profile-local alert state file.
 
 Feishu alerts should fire for:
 

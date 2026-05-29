@@ -1775,6 +1775,13 @@ async function selfTest(cfg) {
   assertSelfTest(!fundingFeishuText.includes("retryMs"), "funding alert should not expose retryMs");
   assertSelfTest(!fundingFeishuText.includes("requiredBusdt"), "funding alert should not expose requiredBusdt");
   assertSelfTest(!fundingFeishuText.includes("wallet"), "funding alert should not expose wallet as a raw field");
+  assertSelfTest(!fundingFeishuText.includes("Watch preflight failed"), "funding alert should not expose raw preflight text");
+  assertSelfTest(!fundingFeishuText.includes("重试"), "funding alert should not expose retry timing");
+
+  const farFundingStatus = { funding: { nextBatchStartDate: new Date(Date.now() + 31 * 60 * 1000).toISOString() } };
+  const nearFundingStatus = { funding: { nextBatchStartDate: new Date(Date.now() + 29 * 60 * 1000).toISOString() } };
+  assertSelfTest(!shouldNotifyFundingWait(farFundingStatus), "far low-funds state should stay in logs/dashboard only");
+  assertSelfTest(shouldNotifyFundingWait(nearFundingStatus), "near-opening low-funds state should notify Feishu");
 
   const alertStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-alert-state-test-"));
   try {
@@ -3878,15 +3885,17 @@ async function waitForWatchFunding(cfg) {
         msUntilNextStart: fundingMsUntilStart(fundingStatus),
         at: new Date().toISOString()
       }));
-      notifyFeishu(cfg, {
-        title: "资金不足，等待补款",
-        level: "warn",
-        fields: waitAlertFields,
-        dedupeKey: "waiting-for-funds",
-        cooldownMs: cfg.feishuAlertCooldownMs,
-        fingerprint: fundingWaitingAlertFingerprint(fundingStatus),
-        repeatMs: 0
-      });
+      if (shouldNotifyFundingWait(fundingStatus)) {
+        notifyFeishu(cfg, {
+          title: "开盘前资金不足",
+          level: "warn",
+          fields: waitAlertFields,
+          dedupeKey: "waiting-for-funds",
+          cooldownMs: cfg.feishuAlertCooldownMs,
+          fingerprint: fundingWaitingAlertFingerprint(fundingStatus),
+          repeatMs: 0
+        });
+      }
     } catch (error) {
       const message = errorMessage(error);
       console.error(JSON.stringify({
@@ -3985,6 +3994,10 @@ function fundingReminderStage(fundingStatus) {
   if (ms <= 5 * 60 * 1000) return "t-5m";
   if (ms <= 30 * 60 * 1000) return "t-30m";
   return "normal";
+}
+
+function shouldNotifyFundingWait(fundingStatus) {
+  return fundingReminderStage(fundingStatus) !== "normal";
 }
 
 function fundingShortfallFingerprint(fundingStatus) {

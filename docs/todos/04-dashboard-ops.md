@@ -29,6 +29,7 @@
 - [x] Stop Feishu notifications for skipped markets; notify only eligible new markets that enter pending or immediate buy flow.
 - [x] Render Feishu notifications as concise operator cards with Chinese labels and clean text fallback.
 - [x] Deduplicate Feishu funding and auto-sell failure alerts by profile-local state; keep receipt success and auto-sell success in logs instead of operator chat.
+- [x] Keep normal low-funds status out of Feishu; only send low-funds alerts in the T-30m/T-5m opening window.
 - [x] Add independent `即将开盘` and `项目持仓` pages with profile-local follow state.
 - [x] Make follow state operational: follow allows buy, cancel follow forbids buy, and fully sold projects remain visible under history.
 

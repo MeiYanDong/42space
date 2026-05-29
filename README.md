@@ -130,7 +130,7 @@ STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=100 npm ru
 - `AUTO_SELL_BUY_GUARD_BEFORE_MS=120000`、`AUTO_SELL_BUY_GUARD_AFTER_MS=10000`：只要已知待买市场进入开盘前 120 秒到开盘窗口后 10 秒，自动卖出、operator 预授权都会暂停，买入热路径最高优先级。
 - `AUTO_SELL_PREAPPROVE_OPERATOR=1`、`AUTO_SELL_APPROVALS_PER_TICK=1`、`AUTO_SELL_REQUIRE_PREAPPROVED_OPERATOR=1`：自动卖出不再在真正卖出的同一笔流程里临时做 operator 授权；监控 tick 会低优先级提前补授权，未授权 market 的卖出延后到下一轮。
 - `AUTO_SELL_MAX_OUTCOMES_PER_TX=8`、`AUTO_SELL_MAX_MARKETS_PER_TX=4`、`AUTO_SELL_MAX_GAS_PER_TX=12000000`、`AUTO_SELL_MAX_TX_PER_TICK=1`：到期卖出先按 outcome 独立决策，再跨 market 合并成受限批次；单轮最多发 1 笔卖出交易，避免卖出队列占住 nonce。
-- `FEISHU_WEBHOOK=`：长期守护进程告警入口。生产环境放在服务器 env，不提交到 Git；会通知启动、资金状态变化、买入广播/失败、receipt 失败、WS/链上降级、自动卖出失败/暂停等关键事件。`ALERT_STATE_FILE` 保存 profile-local 告警状态，避免同一资金不足或同一卖出失败在重启后反复刷屏。
+- `FEISHU_WEBHOOK=`：长期守护进程告警入口。生产环境放在服务器 env，不提交到 Git；会通知启动、开盘前资金不足、买入广播/失败、receipt 失败、WS/链上降级、自动卖出失败/暂停等关键事件。常态资金不足只展示在 dashboard 和日志里；`ALERT_STATE_FILE` 保存 profile-local 告警状态，避免同一问题在重启后反复刷屏。
 - `MARKET_DECISIONS_FILE=data/market-decisions.jsonl`：记录每个市场的发现、过滤、待买、资金不足、买入成功/失败等决策流水，方便复盘“为什么买/没买”。
 - `EVENT_BUY_MODE=fast`：不逐个报价，直接 `minOut=1` 买入选中的 outcome。抢新场默认用这个。
 - `EVENT_BUY_MODE=quoted`：先模拟再买，慢但输出更完整。
