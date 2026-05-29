@@ -65,6 +65,7 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   updated: $("updated"),
+  appTitle: $("appTitle"),
   refreshBtn: $("refreshBtn"),
   viewKicker: $("viewKicker"),
   viewTitle: $("viewTitle"),
@@ -163,6 +164,9 @@ async function loadRuntimeConfig({ force = false } = {}) {
 }
 
 function render(data) {
+  const appName = data.settings?.appName || "42space";
+  if (els.appTitle) els.appTitle.textContent = `${appName} Bot Console`;
+  document.title = `${appName} Bot Console`;
   els.updated.textContent = `更新 ${formatTime(data.updatedAt)}`;
   els.botState.textContent = data.bot.label;
   els.botState.className = data.bot.tone;

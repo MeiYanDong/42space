@@ -45,13 +45,13 @@
 
 ## Phase 5: A/B Bot Rollout
 
-- [ ] Deploy canonical `42space` code to the `42space-2` runtime only.
-- [ ] Preserve `/etc/42space-2/42space.env`.
-- [ ] Preserve `/opt/42space-2/data`.
-- [ ] Preserve dashboard port `4243`.
-- [ ] Preserve `42space-2-event-arm.service` and `42space-2-dashboard.service`.
-- [ ] Verify `/api/overview` on port `4243` returns `ok: true`.
-- [ ] Verify production `42space` services remain active.
+- [x] Deploy canonical `42space` code to the `42space-2` runtime only.
+- [x] Preserve `/etc/42space-2/42space.env`.
+- [x] Preserve `/opt/42space-2/data`.
+- [x] Preserve dashboard port `4243`.
+- [x] Preserve `42space-2-event-arm.service` and `42space-2-dashboard.service`.
+- [x] Verify `/api/overview` on port `4243` returns `ok: true`.
+- [x] Verify production `42space` services remain active.
 
 ## Phase 6: Production Rollout Boundary
 
