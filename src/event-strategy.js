@@ -76,7 +76,17 @@ export function isPriceMarket(market, cfg) {
   if (containsAny(categoryText, cfg.marketCategoryBlocklist)) return true;
   if (containsAny(tagText, cfg.marketTagBlocklist)) return true;
   if (market.curve && String(market.curve).toLowerCase() === ADDRESSES.clockCurve.toLowerCase()) return true;
+  if (isTextualPriceMarket(haystack)) return true;
   return /price\s+range|8\s*hour|clock\s*curve/i.test(haystack);
+}
+
+function isTextualPriceMarket(text) {
+  const value = String(text ?? "");
+  return [
+    /\bwhat\s+(?:is|was|will\s+be)\s+the\s+price\s+of\b/i,
+    /\bprice\s+of\b.+\b(?:at|on|by|end\s+of)\b/i,
+    /\b[A-Z0-9$]{2,12}\/USDT\s+price\b/i
+  ].some((pattern) => pattern.test(value));
 }
 
 export function selectEventMarket(markets, args = {}) {

@@ -1516,7 +1516,24 @@ async function selfTest(cfg) {
     tags: ["8 hour"]
   })], testCfg);
   assertSelfTest(priceMarkets.length === 0, "Price market filter should exclude BTC price range markets");
-  passed.push("Price markets are excluded from Event Market bot");
+  const textualPriceDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000244",
+    question: "What is the price of BTC at 10:00 UTC on 29 May 2026?",
+    categories: ["Crypto"],
+    tags: ["Normal"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 72 * 3600000).toISOString()
+  }), {
+    ...testCfg,
+    minEventDurationHours: 0,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: []
+  });
+  assertSelfTest(
+    !textualPriceDecision.eligible && textualPriceDecision.reason === "price-market",
+    `textual price question should be excluded as Price, got ${JSON.stringify(textualPriceDecision)}`
+  );
+  passed.push("Price markets and textual price questions are excluded from Event Market bot");
 
   const longEventMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000045",
@@ -5292,6 +5309,10 @@ function recordMarketDecision(cfg, market, action, details = {}) {
     market: market.address,
     question: market.question,
     status: market.status,
+    categories: market.categories ?? [],
+    tags: market.tags ?? [],
+    curve: market.curve ?? null,
+    contractVersion: market.contractVersion ?? null,
     startDate: market.startDate,
     endDate: market.endDate,
     durationHours: marketDurationHours(market),
