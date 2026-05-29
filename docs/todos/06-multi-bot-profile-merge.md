@@ -55,12 +55,12 @@
 
 ## Phase 6: Production Rollout Boundary
 
-- [ ] Ask for explicit approval before deploying to production `42space`.
-- [ ] Preserve `/etc/42space/42space.env`.
-- [ ] Preserve `/opt/42space/data`.
-- [ ] Preserve dashboard port `4242`.
-- [ ] Preserve `42space-event-arm.service` and `42space-dashboard.service`.
-- [ ] Verify production health after deployment.
+- [x] Ask for explicit approval before deploying to production `42space`.
+- [x] Preserve `/etc/42space/42space.env`.
+- [x] Preserve `/opt/42space/data`.
+- [x] Preserve dashboard port `4242`.
+- [x] Preserve `42space-event-arm.service` and `42space-dashboard.service`.
+- [x] Verify production health after deployment.
 
 ## Update Rule
 
