@@ -67,6 +67,7 @@ const SELL_BATCH_PER_OUTCOME_GAS = 1_000_000;
 const OPERATOR_APPROVAL_GAS = 250_000;
 
 async function main() {
+  applyDashboardChildPriority();
   const [command = "scan", ...rest] = process.argv.slice(2);
   const args = parseArgs(rest);
   const cfg = readConfig();
@@ -169,6 +170,17 @@ async function main() {
   }
 
   throw new Error(`Unknown command: ${command}`);
+}
+
+function applyDashboardChildPriority() {
+  if (process.env.DASHBOARD_CHILD_LOW_PRIORITY !== "1") return;
+  const nice = Number(process.env.DASHBOARD_CHILD_NICE ?? 10);
+  if (!Number.isFinite(nice) || nice === 0) return;
+  try {
+    os.setPriority(0, nice);
+  } catch {
+    // Best effort only: dashboard probes must never fail because priority tuning is unavailable.
+  }
 }
 
 async function scan(cfg) {

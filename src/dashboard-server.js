@@ -24,12 +24,18 @@ const launchLabel = process.env.BOT_LAUNCH_LABEL ?? "com.myandong.42space-event-
 const systemdService = process.env.BOT_SYSTEMD_SERVICE ?? "42space-event-arm.service";
 const fillsFile = path.resolve(rootDir, process.env.FILLS_FILE ?? "data/fills.jsonl");
 const actionsFile = path.join(rootDir, "data/dashboard-actions.jsonl");
-const overviewCacheMs = Number(process.env.DASHBOARD_OVERVIEW_CACHE_MS ?? 15000);
-const overviewStaleMs = Number(process.env.DASHBOARD_OVERVIEW_STALE_MS ?? 120000);
-const overviewRefreshMs = Number(process.env.DASHBOARD_OVERVIEW_REFRESH_MS ?? 5000);
+const overviewCacheMs = Number(process.env.DASHBOARD_OVERVIEW_CACHE_MS ?? 30000);
+const overviewStaleMs = Number(process.env.DASHBOARD_OVERVIEW_STALE_MS ?? 300000);
+const overviewRefreshMs = Number(process.env.DASHBOARD_OVERVIEW_REFRESH_MS ?? 60000);
+const overviewHotPauseBeforeMs = Number(process.env.DASHBOARD_OVERVIEW_HOT_PAUSE_BEFORE_MS ?? 120000);
+const overviewHotPauseAfterMs = Number(process.env.DASHBOARD_OVERVIEW_HOT_PAUSE_AFTER_MS ?? 30000);
+const dashboardEventTimeoutMs = Number(process.env.DASHBOARD_EVENT_TIMEOUT_MS ?? 20000);
+const dashboardChildLowPriority = envBool("DASHBOARD_CHILD_LOW_PRIORITY", true);
+const dashboardChildNice = Number(process.env.DASHBOARD_CHILD_NICE ?? 10);
 
 let overviewCache = null;
 let overviewPromise = null;
+let lastOverviewHotSkipLogAt = 0;
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -66,7 +72,7 @@ server.listen(port, host, () => {
   void refreshOverviewCache().catch(logOverviewRefreshError);
   if (overviewRefreshMs > 0) {
     setInterval(() => {
-      void refreshOverviewCache().catch(logOverviewRefreshError);
+      void refreshOverviewCache({ background: true }).catch(logOverviewRefreshError);
     }, overviewRefreshMs).unref();
   }
 });
@@ -74,15 +80,21 @@ server.listen(port, host, () => {
 async function getOverview() {
   const now = Date.now();
   if (overviewCache && now - overviewCache.at < overviewCacheMs) return overviewCache.data;
+  if (overviewCache && overviewHotWindowInfo(overviewCache.data, now)) return overviewCache.data;
   if (overviewCache && now - overviewCache.at < overviewStaleMs) {
-    void refreshOverviewCache().catch(logOverviewRefreshError);
+    void refreshOverviewCache({ background: true }).catch(logOverviewRefreshError);
     return overviewCache.data;
   }
   return refreshOverviewCache();
 }
 
-function refreshOverviewCache() {
+function refreshOverviewCache({ background = false } = {}) {
   if (overviewPromise) return overviewPromise;
+  const hotWindow = overviewCache ? overviewHotWindowInfo(overviewCache.data) : null;
+  if (background && hotWindow) {
+    logOverviewHotSkip(hotWindow);
+    return Promise.resolve(overviewCache.data);
+  }
   overviewPromise = buildOverview()
     .then((data) => {
       overviewCache = { at: Date.now(), data };
@@ -92,6 +104,32 @@ function refreshOverviewCache() {
       overviewPromise = null;
     });
   return overviewPromise;
+}
+
+function overviewHotWindowInfo(data, now = Date.now()) {
+  const startsAt = Date.parse(data?.next?.first?.startsAt ?? "");
+  if (!Number.isFinite(startsAt)) return null;
+  const msUntilStart = startsAt - now;
+  if (msUntilStart > overviewHotPauseBeforeMs || msUntilStart < -overviewHotPauseAfterMs) return null;
+  return {
+    startsAt: new Date(startsAt).toISOString(),
+    msUntilStart,
+    beforeMs: overviewHotPauseBeforeMs,
+    afterMs: overviewHotPauseAfterMs
+  };
+}
+
+function logOverviewHotSkip(info) {
+  const now = Date.now();
+  if (now - lastOverviewHotSkipLogAt < 60000) return;
+  lastOverviewHotSkipLogAt = now;
+  console.log(JSON.stringify({
+    level: "dashboard-overview-refresh-skipped",
+    reason: "buy-hot-window",
+    startsAt: info.startsAt,
+    msUntilStart: info.msUntilStart,
+    at: new Date().toISOString()
+  }));
 }
 
 function logOverviewRefreshError(error) {
@@ -105,12 +143,14 @@ function logOverviewRefreshError(error) {
 
 async function buildOverview() {
   const cfg = readConfig();
-  const [status, positions, walletActivity, newMarkets, bot] = await Promise.all([
-    runEvent(["status", ...walletArgs()], { timeoutMs: 30000 }),
-    runEvent(["positions", ...walletArgs()], { timeoutMs: 30000 }),
-    fetchUserActivity(),
-    fetchNewMarketsFeed(),
+  const [status, bot] = await Promise.all([
+    runEvent(["status", ...walletArgs()], { timeoutMs: dashboardEventTimeoutMs }),
     getBotState()
+  ]);
+  const [positions, walletActivity, newMarkets] = await Promise.all([
+    runEvent(["positions", ...walletArgs()], { timeoutMs: dashboardEventTimeoutMs }),
+    fetchUserActivity(),
+    fetchNewMarketsFeed()
   ]);
   const holdings = normalizeHoldings(positions, walletActivity);
   const recentRows = readRecentActivity();
@@ -1236,14 +1276,28 @@ async function fetchNewMarketsFeed() {
 
 async function runEvent(args, { timeoutMs = 30000, env = {} } = {}) {
   const script = path.join(rootDir, "src/event-sniper.js");
+  const childEnv = {
+    NO_GUI_PROMPT: "1",
+    ...(dashboardChildLowPriority ? {
+      DASHBOARD_CHILD_LOW_PRIORITY: "1",
+      DASHBOARD_CHILD_NICE: String(dashboardChildNice)
+    } : {}),
+    ...env
+  };
   const { stdout } = await execFileAsync(process.execPath, [script, ...args], {
     cwd: rootDir,
     timeoutMs,
-    env: { ...process.env, ...env }
+    env: { ...process.env, ...childEnv }
   });
   const parsed = parseLastJson(stdout);
   if (!parsed) throw new Error("No data returned");
   return parsed;
+}
+
+function envBool(key, fallback = false) {
+  const raw = process.env[key];
+  if (raw === undefined || raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(raw).trim().toLowerCase());
 }
 
 function execFileAsync(command, args, { timeoutMs = 30000, ...options } = {}) {
