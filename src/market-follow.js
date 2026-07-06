@@ -8,7 +8,9 @@ const MANUAL_OVERRIDE_REASONS = new Set([
   "short-duration",
   "missing-time",
   "category",
-  "created-at-floor"
+  "created-at-floor",
+  "event-intel-missing",
+  "event-intel-relation"
 ]);
 
 export function readMarketFollowState(file) {

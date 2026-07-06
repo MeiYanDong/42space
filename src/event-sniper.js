@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import { randomInt } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,14 +11,17 @@ import { promisify } from "node:util";
 import { formatUnits, parseGwei, parseUnits } from "viem";
 import WebSocket from "ws";
 import { appendJsonl, loadSeen, normalizeRuntimeConfig, parseArgs, readConfig, saveSeen } from "./config.js";
+import { appendGasLedgerEntries, bnbUsdtPriceForBlock, buildGasLedgerEntry } from "./gas-ledger.js";
 import {
   approveRouterMax,
+  assertExecutionAllowed,
   buildDirectSellPlan,
   buildFastBuyBundlePlan,
   buildDirectBuyAllOutcomesPlan,
   buildMarketFromCreationLog,
   buildMarketsFromControllerLogs,
   buyOutcomesBatch,
+  broadcastSignedTransaction,
   calculateFastGasReserve,
   describeFastBundlePlan,
   describeEventPlan,
@@ -35,6 +39,7 @@ import {
   getWalletStatusForAddress,
   makeClients,
   makeWsClient,
+  preSignSellOutcomesBatch,
   preSignFastBundleTransaction,
   preSignFastBuyTransaction,
   quoteSellOutcome,
@@ -43,6 +48,7 @@ import {
   roundDownSellAmount,
   sellOutcome,
   sellOutcomesBatch,
+  simulateMintAmount,
   warmBroadcastRpcClients,
   withPrebuiltFastExecution,
   watchControllerLogs
@@ -52,9 +58,19 @@ import {
   eventDurationMs,
   filterEventMarkets,
   getEventMarketDecision,
+  getEventMarketDisplayDecision,
+  isPriceMarket,
   selectEventMarket,
   summarizeEventMarket
 } from "./event-strategy.js";
+import { isSportsExactScoreMarket, isSportsSideMarketQuestion } from "./event-intel.js";
+import {
+  annotateBot3FifaExactScorePlan,
+  bot3FifaExactScoreAutoBuyActive,
+  bot3FifaExactScoreConfigForMarket,
+  previewBot3FifaExactScoreMarket
+} from "./bot3-fifa-exact-score.js";
+import { FOLLOW_RULE_EVENT_LIBRARY, FOLLOW_RULE_LIBRARY_CONFIG } from "./event-library.js";
 import { isMarketFollowBlocked } from "./market-follow.js";
 
 const execFileAsync = promisify(execFile);
@@ -62,10 +78,12 @@ const PUBLIC_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5
 const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const alertCooldowns = new Map();
 const marketDecisionDedupe = new Set();
+const plannedBuysFileCache = new Map();
 const WILL_BUY_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SELL_BATCH_BASE_GAS = 1_500_000;
 const SELL_BATCH_PER_OUTCOME_GAS = 1_000_000;
 const OPERATOR_APPROVAL_GAS = 250_000;
+const AUTO_SELL_TRANSIENT_POSITIONS_ALERT_AFTER = 12;
 
 async function main() {
   const [command = "scan", ...rest] = process.argv.slice(2);
@@ -79,6 +97,10 @@ async function main() {
   }
   if (command === "plan") {
     await plan(cfg, args);
+    return;
+  }
+  if (command === "bot3-fifa-preview") {
+    await bot3FifaPreview(cfg, args);
     return;
   }
   if (command === "positions") {
@@ -111,6 +133,10 @@ async function main() {
   }
   if (command === "bench") {
     await bench(cfg, args);
+    return;
+  }
+  if (command === "premium-probe") {
+    await premiumProbe(cfg, args);
     return;
   }
   if (command === "rpc") {
@@ -206,6 +232,32 @@ async function plan(cfg, args) {
   console.log(JSON.stringify({ level: "event-plan", plan: describeEventPlan(eventPlan) }, null, 2));
 }
 
+async function bot3FifaPreview(cfg, args = {}) {
+  const limit = Number(args.limit ?? cfg.watchScanLimit ?? 50);
+  if (args.market) {
+    const market = await fetchMarket(cfg, args.market);
+    console.log(JSON.stringify({
+      level: "bot3-fifa-exact-score-preview",
+      enabled: bot3FifaExactScoreAutoBuyActive(cfg),
+      preview: previewBot3FifaExactScoreMarket(market)
+    }, null, 2));
+    return;
+  }
+
+  const markets = await loadRawRestMarkets(cfg, { status: args.status ?? "all", limit });
+  const previews = sortMarketsByStartAsc(markets)
+    .map((market) => previewBot3FifaExactScoreMarket(market))
+    .filter((preview) => preview.skipReason !== "not_fifa_sports_exact_score")
+    .slice(0, Number(args.show ?? 20));
+  console.log(JSON.stringify({
+    level: "bot3-fifa-exact-score-previews",
+    enabled: bot3FifaExactScoreAutoBuyActive(cfg),
+    checked: markets.length,
+    shown: previews.length,
+    previews
+  }, null, 2));
+}
+
 async function positions(cfg, args) {
   const walletAddress = args.wallet ?? cfg.walletAddress;
   if (!walletAddress) throw new Error("positions requires --wallet or WALLET_ADDRESS");
@@ -215,7 +267,7 @@ async function positions(cfg, args) {
     market: args.market,
     limit: Number(args.limit ?? 100)
   });
-  const rows = openPositions.map(summarizePosition);
+  const rows = openPositions.map((position) => summarizePosition(position, cfg));
   const totals = rows.reduce(
     (acc, row) => {
       acc.costBasis += row.costBasisUsdt;
@@ -251,7 +303,7 @@ async function funding(cfg, args) {
   const restMarkets = await loadRestEventMarkets(cfg, { status: "all", limit: cfg.watchScanLimit });
   const knownEventMarkets = mergeKnownEventMarkets(chain.eventMarkets, restMarkets);
   const requirement = computeFundingRequirement(cfg, knownEventMarkets);
-  const gasReserve = await estimateFastGasReserve(publicClient, cfg, requirement);
+  const gasReserve = await estimateFundingGasReserve(publicClient, cfg, requirement);
   const walletAddress = args.wallet ?? cfg.walletAddress ?? account?.address;
 
   let wallet = null;
@@ -344,7 +396,26 @@ async function sell(cfg, args) {
   const executions = [];
   if (!cfg.dryRun && cfg.execute) {
     for (const item of plans) {
-      executions.push(await sellOutcome(cfg, item.plan));
+      const execution = await sellOutcome(cfg, item.plan);
+      executions.push(execution);
+      await appendGasLedgerFromExecution(cfg, execution, {
+        action: "sell",
+        source: "manual-sell-cli",
+        wallet: walletAddress,
+        allocations: gasAllocationsFromSellItem(item)
+      });
+      await appendGasLedgerFromExecution(cfg, execution, {
+        action: "approval",
+        source: "manual-sell-cli-approval",
+        wallet: walletAddress,
+        txHashKey: "operatorApprovalHash",
+        fieldPrefix: "operatorApproval",
+        allocations: gasAllocationsFromSellItem(item).map((allocation) => ({
+          ...allocation,
+          action: "approval",
+          weight: 1
+        }))
+      });
     }
   }
 
@@ -465,7 +536,7 @@ async function status(cfg, args) {
       const statusResult = await getWalletStatusForAddress(publicClient, walletAddress);
       executablePlan = selectAffordableMarketSummaries(cfg, funding.nextBatchMarkets, statusResult);
       const executableFunding = fundingForMarketSummaries(cfg, executablePlan.selected, funding);
-      const gasReserveForWallet = await estimateFastGasReserve(publicClient, cfg, executableFunding);
+      const gasReserveForWallet = await estimateFundingGasReserve(publicClient, cfg, executableFunding);
       wallet = {
         ...statusResult,
         requiredBusdt: funding.requiredBusdt,
@@ -488,7 +559,7 @@ async function status(cfg, args) {
       wallet = { ok: false, message: errorMessage(error) };
     }
   }
-  const gasReserve = await estimateFastGasReserve(
+  const gasReserve = await estimateFundingGasReserve(
     publicClient,
     cfg,
     executablePlan?.selected?.length ? fundingForMarketSummaries(cfg, executablePlan.selected, funding) : funding
@@ -533,6 +604,8 @@ async function status(cfg, args) {
     autoSellCircuit: summarizeAutoSellCircuit(cfg),
     requiredBusdtUpperBound: funding.upperBoundRequiredBusdt,
     watchConfig: {
+      botName: cfg.botName,
+      profileRole: cfg.profileRole || "",
       eventDiscovery: cfg.eventDiscovery,
       wsProvider: wsProviderLabel(cfg.wsUrl),
       eventBuyMode: cfg.eventBuyMode,
@@ -545,12 +618,18 @@ async function status(cfg, args) {
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
       filterMode: cfg.filterMode ?? "production",
+      marketQuestionAllowlistRegex: cfg.marketQuestionAllowlistRegex?.source ?? null,
       autoSellEnabled: cfg.autoSellEnabled,
       autoSellStrategy: cfg.autoSellStrategy,
       autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
       autoSellApplyAfterIso: cfg.autoSellApplyAfterIso,
+      autoSellOpenExitDelaySeconds: cfg.autoSellOpenExitDelaySeconds,
+      autoSellOpenExitPercent: cfg.autoSellOpenExitPercent,
+      autoSellFastOpenExitEnabled: cfg.autoSellFastOpenExitEnabled,
+      autoSellFastOpenExitMinDelayMs: cfg.autoSellFastOpenExitMinDelayMs,
+      autoSellFastOpenExitMaxDelayMs: cfg.autoSellFastOpenExitMaxDelayMs,
       autoSellStopLossEnabled: cfg.autoSellStopLossEnabled,
       autoSellStopLossPercent: cfg.autoSellStopLossPercent,
       autoSellStopLossSellPercent: cfg.autoSellStopLossSellPercent,
@@ -579,6 +658,13 @@ async function status(cfg, args) {
       allowPreopenBroadcast: cfg.allowPreopenBroadcast,
       prebroadcastMs: cfg.prebroadcastMs,
       openBroadcastDelayMs: cfg.openBroadcastDelayMs,
+      openBroadcastMode: cfg.openBroadcastMode,
+      openBroadcastBlockTargetOffsetMs: cfg.openBroadcastBlockTargetOffsetMs,
+      openBroadcastBlockAwareLeadMs: cfg.openBroadcastBlockAwareLeadMs,
+      openBroadcastBlockAwareMaxWaitMs: cfg.openBroadcastBlockAwareMaxWaitMs,
+      openBroadcastBlockAwarePreTargetCount: cfg.openBroadcastBlockAwarePreTargetCount,
+      openBroadcastBlockAwarePreTargetSendMs: cfg.openBroadcastBlockAwarePreTargetSendMs,
+      openBroadcastBlockAwareHeadMaxAgeMs: cfg.openBroadcastBlockAwareHeadMaxAgeMs,
       openBroadcastScheduleAheadMs: cfg.openBroadcastScheduleAheadMs,
       openBroadcastSpinMs: cfg.openBroadcastSpinMs,
       nonceSyncBeforePreSign: cfg.nonceSyncBeforePreSign,
@@ -602,6 +688,11 @@ async function status(cfg, args) {
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
       autoSellApplyAfterIso: cfg.autoSellApplyAfterIso,
+      autoSellOpenExitDelaySeconds: cfg.autoSellOpenExitDelaySeconds,
+      autoSellOpenExitPercent: cfg.autoSellOpenExitPercent,
+      autoSellFastOpenExitEnabled: cfg.autoSellFastOpenExitEnabled,
+      autoSellFastOpenExitMinDelayMs: cfg.autoSellFastOpenExitMinDelayMs,
+      autoSellFastOpenExitMaxDelayMs: cfg.autoSellFastOpenExitMaxDelayMs,
       autoSellStopLossEnabled: cfg.autoSellStopLossEnabled,
       autoSellStopLossPercent: cfg.autoSellStopLossPercent,
       autoSellStopLossSellPercent: cfg.autoSellStopLossSellPercent,
@@ -782,6 +873,9 @@ async function bench(cfg, args) {
       autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
+      autoSellFastOpenExitEnabled: cfg.autoSellFastOpenExitEnabled,
+      autoSellFastOpenExitMinDelayMs: cfg.autoSellFastOpenExitMinDelayMs,
+      autoSellFastOpenExitMaxDelayMs: cfg.autoSellFastOpenExitMaxDelayMs,
       autoSellPollMs: cfg.autoSellPollMs,
       autoSellBuyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
       autoSellBuyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
@@ -801,6 +895,401 @@ async function bench(cfg, args) {
     samples: results,
     summary: summarizeBenchResults(results)
   }, null, 2));
+}
+
+async function premiumProbe(cfg, args) {
+  const { publicClient } = makeClients(cfg);
+  const probeCfg = {
+    ...cfg,
+    dryRun: true,
+    execute: false,
+    eventBuyMode: "quoted",
+    eventOutcomeSelection: "lowest_odds",
+    eventOutcomeCount: 1,
+    stakePerOutcomeUsdt: Number(args.stake ?? args.stakeUsdt ?? 1),
+    maxMarketStakeUsdt: Math.max(Number(args.stake ?? args.stakeUsdt ?? 1), Number(cfg.maxMarketStakeUsdt ?? 1)),
+    maxOutcomesPerMarket: cfg.maxOutcomesPerMarket
+  };
+  if (!Number.isFinite(probeCfg.stakePerOutcomeUsdt) || probeCfg.stakePerOutcomeUsdt <= 0) {
+    throw new Error("--stake must be a positive number");
+  }
+
+  const { markets, startDate, discovery } = await loadPremiumProbeBatch(probeCfg, args);
+  if (markets.length === 0) throw new Error("No upcoming probeable Event Markets found");
+
+  const startMs = new Date(startDate).getTime();
+  const waitMs = startMs - Date.now();
+  const wait = args.noWait ? false : true;
+  const maxWaitMs = args.maxWaitMs === undefined ? Infinity : Number(args.maxWaitMs);
+  const outputBase = premiumProbeOutputBase(args.outputDir ?? "output", startDate);
+  const jsonlFile = `${outputBase}.jsonl`;
+  const mdFile = `${outputBase}.md`;
+
+  const header = {
+    level: "event-premium-probe",
+    mode: "read-only",
+    note: "simulateMint only; no signing, broadcast, seen/fills/runtime mutation",
+    startDate,
+    waitMs: Math.max(0, waitMs),
+    wait,
+    marketCount: markets.length,
+    stakeUsdt: probeCfg.stakePerOutcomeUsdt,
+    files: { jsonlFile, mdFile },
+    discovery,
+    markets: markets.map((market) => ({
+      question: market.question,
+      address: market.address,
+      status: market.status,
+      outcomeCount: market.outcomes?.length ?? 0
+    }))
+  };
+  console.log(JSON.stringify(header, null, 2));
+
+  if (waitMs > 0) {
+    if (!wait || (Number.isFinite(maxWaitMs) && maxWaitMs >= 0 && waitMs > maxWaitMs)) {
+      writePremiumProbeFiles({ header, samples: [], summaries: [], aggregate: [], jsonlFile, mdFile });
+      return;
+    }
+    await sleepUntil(startMs);
+  }
+
+  const samples = [];
+  let nextSampleAt = Math.max(Date.now(), startMs);
+  let validBaselineSamples = 0;
+  while (true) {
+    await sleepUntil(nextSampleAt);
+    const localNow = Date.now();
+    const sample = await samplePremiumProbeBatch(publicClient, probeCfg, markets, startMs, localNow);
+    samples.push(...sample.rows);
+    if (sample.rows.some((row) => row.ok && Number(row.chainOffsetSeconds) >= 20)) {
+      validBaselineSamples += 1;
+    }
+
+    const localOffsetMs = localNow - startMs;
+    const maxLocalOffsetMs = Number(args.maxOffsetMs ?? 23000);
+    if ((validBaselineSamples >= 3 && localOffsetMs >= 20000) || localOffsetMs >= maxLocalOffsetMs) break;
+    const intervalMs = localOffsetMs < 15000 ? 1000 : 500;
+    nextSampleAt += intervalMs;
+    if (nextSampleAt <= Date.now()) nextSampleAt = Date.now();
+  }
+
+  const { enriched, summaries, aggregate } = analyzePremiumProbeSamples(samples);
+  writePremiumProbeFiles({ header, samples: enriched, summaries, aggregate, jsonlFile, mdFile });
+  console.log(JSON.stringify({
+    level: "event-premium-probe-complete",
+    startDate,
+    marketCount: markets.length,
+    sampleRows: enriched.length,
+    summaries,
+    aggregate,
+    files: { jsonlFile, mdFile }
+  }, null, 2));
+}
+
+async function loadPremiumProbeBatch(cfg, args = {}) {
+  const rawMarkets = await loadRawRestMarkets(cfg, { status: "all", limit: Number(args.limit ?? cfg.watchScanLimit) });
+  const candidates = rawMarkets
+    .filter((market) => isPremiumProbeCandidate(market, cfg))
+    .sort(compareStartAsc);
+  const startDate = args.startDate ?? candidates[0]?.startDate;
+  if (!startDate) return { markets: [], startDate: null, discovery: { rawRestMarkets: rawMarkets.length, candidates: 0 } };
+  const startMs = new Date(startDate).getTime();
+  const selected = candidates.filter((market) => new Date(market.startDate).getTime() === startMs);
+  const hydrated = await Promise.all(selected.map((market) => maybeHydrateMarketOdds(cfg, market)));
+  return {
+    markets: hydrated.filter((market) => isPremiumProbeCandidate(market, cfg)),
+    startDate: new Date(startMs).toISOString(),
+    discovery: {
+      rawRestMarkets: rawMarkets.length,
+      candidates: candidates.length,
+      selectedAtStart: selected.length
+    }
+  };
+}
+
+function isPremiumProbeCandidate(market, cfg) {
+  if (!market?.address) return false;
+  if (!["live", "not_started"].includes(String(market.status ?? ""))) return false;
+  const startMs = new Date(market.startDate).getTime();
+  if (!Number.isFinite(startMs) || startMs < Date.now() - 1000) return false;
+  if (Number(market.contractVersion) !== 2) return false;
+  if (!Array.isArray(market.outcomes) || market.outcomes.length === 0) return false;
+  if (isPriceMarket(market, { ...cfg, marketCategoryBlocklist: ["Price"], marketTagBlocklist: ["Price"] })) return false;
+  return true;
+}
+
+async function samplePremiumProbeBatch(publicClient, cfg, markets, startMs, localNow) {
+  let block = null;
+  let blockError = null;
+  try {
+    block = await publicClient.getBlock({ blockTag: "latest" });
+  } catch (error) {
+    blockError = errorMessage(error);
+  }
+  const chainTimestampMs = block?.timestamp !== undefined ? Number(block.timestamp) * 1000 : null;
+  const chainOffsetSeconds = Number.isFinite(chainTimestampMs) ? (chainTimestampMs - startMs) / 1000 : null;
+  const common = {
+    sampleAt: new Date(localNow).toISOString(),
+    localOffsetMs: Math.round(localNow - startMs),
+    chainBlock: block?.number?.toString() ?? null,
+    chainTimestamp: Number.isFinite(chainTimestampMs) ? new Date(chainTimestampMs).toISOString() : null,
+    chainOffsetSeconds: chainOffsetSeconds === null ? null : roundNumber(chainOffsetSeconds, 3),
+    blockError
+  };
+  const rows = await Promise.all(markets.map((market) => samplePremiumProbeMarket(publicClient, cfg, market, common)));
+  return { rows };
+}
+
+async function samplePremiumProbeMarket(publicClient, cfg, market, common) {
+  try {
+    const quote = await quoteBuyAllOutcomes(publicClient, market, cfg);
+    const outcome = quote.outcomes[0];
+    if (!outcome) throw new Error("No selected outcome");
+    const simulated = outcome.simulated;
+    const amount = simulated.amount;
+    const otToUser = tokenNumber(simulated.otToUser);
+    const stakeUsdt = tokenNumber(amount);
+    const effectiveCost = otToUser > 0 ? stakeUsdt / otToUser : null;
+    const post = simulated.post ?? {};
+    return {
+      ok: true,
+      ...common,
+      market: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      tokenId: String(outcome.tokenId),
+      outcomeName: outcome.name ?? outcome.title ?? "",
+      rankSource: outcome.selectionRankSource ?? quote.selection?.rankSource ?? null,
+      selectionScore: outcome.selectionScore ?? null,
+      stakeUsdt,
+      otToUser: roundNumber(otToUser, 9),
+      otPerUsdt: stakeUsdt > 0 ? roundNumber(otToUser / stakeUsdt, 9) : null,
+      effectiveCost: effectiveCost === null ? null : roundNumber(effectiveCost, 9),
+      postPayoutPerOt: roundNumber(tokenNumber(post.payoutPerOt ?? post[4] ?? 0n), 9),
+      postTotalMarketCap: roundNumber(tokenNumber(post.totalMarketCap ?? post[3] ?? 0n), 6),
+      collateralFromUser: roundNumber(tokenNumber(simulated.collateralFromUser), 9),
+      collateralToTreasury: roundNumber(tokenNumber(simulated.collateralToTreasury), 9),
+      collateralToIntegrator: roundNumber(tokenNumber(simulated.collateralToIntegrator), 9),
+      error: null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      ...common,
+      market: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      tokenId: null,
+      outcomeName: null,
+      rankSource: null,
+      selectionScore: null,
+      error: errorMessage(error)
+    };
+  }
+}
+
+function analyzePremiumProbeSamples(samples) {
+  const byMarket = new Map();
+  for (const sample of samples) {
+    const key = String(sample.market ?? "unknown").toLowerCase();
+    const rows = byMarket.get(key) ?? [];
+    rows.push(sample);
+    byMarket.set(key, rows);
+  }
+
+  const summaries = [];
+  const enriched = [];
+  for (const rows of byMarket.values()) {
+    rows.sort((a, b) => Number(a.localOffsetMs ?? 0) - Number(b.localOffsetMs ?? 0));
+    const baseline = rows.find((row) => row.ok && Number(row.chainOffsetSeconds) >= 20 && Number(row.effectiveCost) > 0);
+    const peakEstimates = [];
+    for (const row of rows) {
+      const next = { ...row };
+      if (baseline && row.ok && Number(row.effectiveCost) > 0 && Number(row.otToUser) > 0) {
+        next.baselineLocalOffsetMs = baseline.localOffsetMs;
+        next.baselineChainOffsetSeconds = baseline.chainOffsetSeconds;
+        next.observedPremiumPct = roundNumber((Number(row.effectiveCost) / Number(baseline.effectiveCost) - 1) * 100, 4);
+        next.otShortfallPct = roundNumber((1 - Number(row.otToUser) / Number(baseline.otToUser)) * 100, 4);
+        const remainingFraction = Math.max(0, (20 - Number(row.chainOffsetSeconds ?? 20)) / 20);
+        next.remainingPremiumFraction = roundNumber(remainingFraction, 4);
+        if (remainingFraction > 0.05 && Number.isFinite(next.observedPremiumPct)) {
+          peakEstimates.push(next.observedPremiumPct / remainingFraction);
+        }
+      } else {
+        next.baselineLocalOffsetMs = baseline?.localOffsetMs ?? null;
+        next.baselineChainOffsetSeconds = baseline?.chainOffsetSeconds ?? null;
+        next.observedPremiumPct = null;
+        next.otShortfallPct = null;
+        next.remainingPremiumFraction = null;
+      }
+      enriched.push(next);
+    }
+    const validRows = rows.filter((row) => row.ok);
+    summaries.push({
+      market: rows[0]?.market ?? null,
+      question: rows[0]?.question ?? null,
+      tokenId: validRows[0]?.tokenId ?? null,
+      outcomeName: validRows[0]?.outcomeName ?? null,
+      rankSource: validRows[0]?.rankSource ?? null,
+      sampleCount: rows.length,
+      validSampleCount: validRows.length,
+      baselineLocalOffsetMs: baseline?.localOffsetMs ?? null,
+      baselineChainOffsetSeconds: baseline?.chainOffsetSeconds ?? null,
+      baselineEffectiveCost: baseline?.effectiveCost ?? null,
+      inferredPeakPremiumPctMedian: peakEstimates.length ? roundNumber(median(peakEstimates), 4) : null,
+      firstError: rows.find((row) => !row.ok)?.error ?? null
+    });
+  }
+
+  return {
+    enriched: enriched.sort((a, b) => String(a.market).localeCompare(String(b.market)) || Number(a.localOffsetMs ?? 0) - Number(b.localOffsetMs ?? 0)),
+    summaries,
+    aggregate: {
+      chainOffset: aggregatePremiumProbe(enriched, {
+        field: "chainOffsetSeconds",
+        bucketSize: 0.5,
+        outputField: "chainOffsetSeconds"
+      }),
+      localOffset: aggregatePremiumProbe(enriched, {
+        field: "localOffsetMs",
+        bucketSize: 500,
+        outputField: "localOffsetMs"
+      })
+    }
+  };
+}
+
+function aggregatePremiumProbe(rows, { field, bucketSize, outputField }) {
+  const buckets = new Map();
+  for (const row of rows) {
+    if (!row.ok || row.observedPremiumPct === null || row.observedPremiumPct === undefined) continue;
+    const value = Number(row[field]);
+    if (!Number.isFinite(value)) continue;
+    const bucketValue = Math.round(value / bucketSize) * bucketSize;
+    const bucket = buckets.get(bucketValue) ?? [];
+    bucket.push(Number(row.observedPremiumPct));
+    buckets.set(bucketValue, bucket);
+  }
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([bucketValue, values]) => ({
+      [outputField]: roundNumber(bucketValue, 3),
+      medianObservedPremiumPct: roundNumber(median(values), 4),
+      p25ObservedPremiumPct: roundNumber(quantile(values, 0.25), 4),
+      p75ObservedPremiumPct: roundNumber(quantile(values, 0.75), 4),
+      minObservedPremiumPct: roundNumber(Math.min(...values), 4),
+      maxObservedPremiumPct: roundNumber(Math.max(...values), 4),
+      sampleCount: values.length
+    }));
+}
+
+function writePremiumProbeFiles({ header, samples, summaries, aggregate, jsonlFile, mdFile }) {
+  fs.mkdirSync(path.dirname(jsonlFile), { recursive: true });
+  fs.writeFileSync(jsonlFile, samples.map((row) => JSON.stringify(row)).join("\n") + (samples.length ? "\n" : ""));
+  fs.writeFileSync(mdFile, renderPremiumProbeMarkdown({ header, samples, summaries, aggregate }));
+}
+
+function renderPremiumProbeMarkdown({ header, samples, summaries, aggregate }) {
+  const lines = [
+    "# Anti-Sniping Premium Probe",
+    "",
+    `- Mode: ${header.mode}`,
+    `- Start date: ${header.startDate ?? "n/a"}`,
+    `- Stake: ${header.stakeUsdt}U simulated per quote`,
+    `- Markets: ${header.marketCount}`,
+    `- Note: ${header.note}`,
+    "",
+    "## Aggregate By Chain Offset",
+    "",
+    "| chain offset | median premium % | p25 | p75 | min | max | n |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+  ];
+  const chainAggregate = aggregate?.chainOffset ?? [];
+  if (chainAggregate.length === 0) {
+    lines.push("| n/a | n/a | n/a | n/a | n/a | n/a | 0 |");
+  } else {
+    for (const row of chainAggregate) {
+      lines.push(`| T+${fmt(row.chainOffsetSeconds)}s | ${fmt(row.medianObservedPremiumPct)} | ${fmt(row.p25ObservedPremiumPct)} | ${fmt(row.p75ObservedPremiumPct)} | ${fmt(row.minObservedPremiumPct)} | ${fmt(row.maxObservedPremiumPct)} | ${row.sampleCount} |`);
+    }
+  }
+
+  lines.push(
+    "",
+    "## Aggregate By Local Offset",
+    "",
+    "| local offset | median premium % | p25 | p75 | min | max | n |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+  );
+  const localAggregate = aggregate?.localOffset ?? [];
+  if (localAggregate.length === 0) {
+    lines.push("| n/a | n/a | n/a | n/a | n/a | n/a | 0 |");
+  } else {
+    for (const row of localAggregate) {
+      lines.push(`| ${formatOffset(row.localOffsetMs)} | ${fmt(row.medianObservedPremiumPct)} | ${fmt(row.p25ObservedPremiumPct)} | ${fmt(row.p75ObservedPremiumPct)} | ${fmt(row.minObservedPremiumPct)} | ${fmt(row.maxObservedPremiumPct)} | ${row.sampleCount} |`);
+    }
+  }
+
+  lines.push("", "## Markets", "");
+  for (const summary of summaries) {
+    lines.push(`### ${summary.question ?? summary.market}`);
+    lines.push("");
+    lines.push(`- Market: \`${summary.market}\``);
+    lines.push(`- Outcome: ${summary.outcomeName ?? "n/a"} (${summary.tokenId ?? "n/a"})`);
+    lines.push(`- Rank source: ${summary.rankSource ?? "n/a"}`);
+    lines.push(`- Baseline: local ${formatOffset(summary.baselineLocalOffsetMs)}, chain ${summary.baselineChainOffsetSeconds ?? "n/a"}s`);
+    lines.push(`- Inferred peak premium median: ${fmt(summary.inferredPeakPremiumPctMedian)}%`);
+    if (summary.firstError) lines.push(`- First error: ${summary.firstError}`);
+    lines.push("");
+    lines.push("| local offset | chain offset | block | ot/user | ot/USDT | effective cost | premium % | OT shortfall % |");
+    lines.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    const rows = samples.filter((row) => String(row.market).toLowerCase() === String(summary.market).toLowerCase());
+    for (const row of rows) {
+      lines.push(`| ${formatOffset(row.localOffsetMs)} | ${fmt(row.chainOffsetSeconds)} | ${row.chainBlock ?? ""} | ${fmt(row.otToUser)} | ${fmt(row.otPerUsdt)} | ${fmt(row.effectiveCost)} | ${fmt(row.observedPremiumPct)} | ${fmt(row.otShortfallPct)} |`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function premiumProbeOutputBase(outputDir, startDate) {
+  const safeDate = String(startDate ?? new Date().toISOString()).replace(/[:.]/g, "-");
+  return path.join(String(outputDir), `premium-probe-${safeDate}`);
+}
+
+function tokenNumber(value) {
+  if (value === null || value === undefined) return 0;
+  return Number(formatUnits(BigInt(value), 18));
+}
+
+function roundNumber(value, digits = 6) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Number(number.toFixed(digits));
+}
+
+function median(values) {
+  return quantile(values, 0.5);
+}
+
+function quantile(values, p) {
+  const sorted = values.filter((value) => Number.isFinite(Number(value))).map(Number).sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  const pos = (sorted.length - 1) * p;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  if (sorted[base + 1] === undefined) return sorted[base];
+  return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+}
+
+function formatOffset(ms) {
+  if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return "n/a";
+  const sign = Number(ms) < 0 ? "-" : "";
+  return `${sign}T+${(Math.abs(Number(ms)) / 1000).toFixed(3)}s`;
+}
+
+function fmt(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "";
+  return String(value);
 }
 
 async function rpc(cfg) {
@@ -1168,6 +1657,13 @@ async function selfTest(cfg) {
     autoSellStartDelaySeconds: 10,
     autoSellIntervalSeconds: 10,
     autoSellChunkPercent: 10,
+    autoSellLadderProfitPercent: 100,
+    autoSellOpenExitDelaySeconds: 36,
+    autoSellOpenExitPercent: 100,
+    autoSellTakeProfitSteps: 0,
+    autoSellBeforeMarketStartSeconds: 0,
+    autoSellMarketStartEndOffsetSeconds: 0,
+    autoSellGasPriceGwei: "",
     autoSellStopLossEnabled: true,
     autoSellStopLossPercent: 10,
     autoSellStopLossSellPercent: 100,
@@ -1224,6 +1720,637 @@ async function selfTest(cfg) {
   );
   passed.push("speed fallback selects token order when odds are missing");
 
+  const middlePlan = buildDirectBuyAllOutcomesPlan(mockEventMarket(), {
+    ...testCfg,
+    eventOutcomeSelection: "middle",
+    eventOutcomeCount: 3,
+    stakePerOutcomeUsdt: 6,
+    maxMarketStakeUsdt: 18
+  });
+  assertSelfTest(
+    middlePlan.selection?.rankSource === "token_order",
+    `expected token_order middle selection, got ${middlePlan.selection?.rankSource}`
+  );
+  assertArrayEqual(
+    middlePlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["2", "4", "8"],
+    "middle outcome selection"
+  );
+  assertSelfTest(middlePlan.totalStakeUsdt === 18, `expected middle plan total 18U, got ${middlePlan.totalStakeUsdt}`);
+  passed.push("middle selection buys the centered three outcomes at the configured stake");
+
+  const namedLargePlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000942",
+    outcomes: Array.from({ length: 16 }, (_, index) => ({
+      tokenId: (1n << BigInt(index)).toString(),
+      name: `Team ${index + 1}`
+    }))
+  }), {
+    ...testCfg,
+    eventOutcomeSelection: "names",
+    eventOutcomeNames: "Team 4,Team 8,Team 12",
+    stakePerOutcomeUsdt: 10,
+    maxMarketStakeUsdt: 30
+  });
+  assertArrayEqual(
+    namedLargePlan.outcomes.map((outcome) => outcome.name),
+    ["Team 4", "Team 8", "Team 12"],
+    "named explicit outcome selection"
+  );
+  assertSelfTest(namedLargePlan.totalStakeUsdt === 30, `expected named plan total 30U, got ${namedLargePlan.totalStakeUsdt}`);
+  passed.push("named selection buys explicit outcomes and allows large candidate lists");
+
+  const comparatorNamedPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000943",
+    outcomes: [
+      { tokenId: "1", name: ">900B" },
+      { tokenId: "2", name: "≥ 1.05T" }
+    ]
+  }), {
+    ...testCfg,
+    eventOutcomeSelection: "names",
+    eventOutcomeNames: "> 900B,>= 1.05T",
+    stakePerOutcomeUsdt: 1,
+    maxMarketStakeUsdt: 2
+  });
+  assertArrayEqual(
+    comparatorNamedPlan.outcomes.map((outcome) => outcome.name),
+    [">900B", "≥ 1.05T"],
+    "named comparator outcome normalization"
+  );
+  passed.push("named selection normalizes comparator spacing and symbols");
+
+  const fifaExactScoreMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000001042",
+    question: "Ecuador vs Curacao",
+    categories: ["Sports", "FIFA World Cup"],
+    tags: ["soccer_match", "world_cup"],
+    outcomes: mockFifaExactScoreOutcomes({
+      homePrice: 0.22,
+      awayPrice: 0.35,
+      drawPrice: 0.9
+    })
+  });
+  const fifaPreview = previewBot3FifaExactScoreMarket(fifaExactScoreMarket);
+  assertSelfTest(!fifaPreview.skipReason, `FIFA exact-score preview should pass, got ${fifaPreview.skipReason}`);
+  assertSelfTest(fifaPreview.selectedSide === "home_win", `expected home_win side, got ${fifaPreview.selectedSide}`);
+  assertArrayEqual(
+    fifaPreview.selectedOutcomeNames,
+    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 2-1 CUW"],
+    "Bot3 FIFA exact-score preview selected home win tier"
+  );
+  const fifaAwayMarket = {
+    ...fifaExactScoreMarket,
+    address: "0x0000000000000000000000000000000000001043",
+    outcomes: mockFifaExactScoreOutcomes({
+      homePrice: 0.35,
+      awayPrice: 0.22,
+      drawPrice: 0.9
+    })
+  };
+  assertArrayEqual(
+    previewBot3FifaExactScoreMarket(fifaAwayMarket).selectedOutcomeNames,
+    ["ECU 0-1 CUW", "ECU 0-2 CUW", "ECU 1-2 CUW"],
+    "Bot3 FIFA exact-score preview selected away win tier"
+  );
+  const sideMarketPreview = previewBot3FifaExactScoreMarket({
+    ...fifaExactScoreMarket,
+    question: "Ecuador vs Curacao - Total Goals",
+    tags: ["soccer_match_tg", "world_cup_prop"]
+  });
+  assertSelfTest(
+    sideMarketPreview.skipReason === "not_fifa_sports_exact_score",
+    `side market should skip, got ${sideMarketPreview.skipReason}`
+  );
+  const bot3AutoCfg = {
+    ...testCfg,
+    botName: "42space-3",
+    watchFundingMode: "next_batch",
+    bot3FifaExactScoreAutoBuyEnabled: true,
+    bot3FifaExactScoreAutoStakeUsdt: 1,
+    marketQuestionAllowlistRegex: /a^/iu,
+    marketBuyQuestionAllowlistRegex: /a^/iu
+  };
+  const bot3AutoDecision = marketFilterDecision(fifaExactScoreMarket, bot3AutoCfg);
+  assertSelfTest(
+    bot3AutoDecision.eligible && bot3AutoDecision.reason === "bot3-fifa-exact-score-auto-buy",
+    `Bot3 FIFA auto decision should bypass ordinary buy allowlists, got ${JSON.stringify(bot3AutoDecision)}`
+  );
+  const bot3AutoBuyCfg = eventBuyConfigForMarket(bot3AutoCfg, fifaExactScoreMarket);
+  const bot3AutoPlan = annotateBuyConfigPlan(buildDirectBuyAllOutcomesPlan(fifaExactScoreMarket, bot3AutoBuyCfg), bot3AutoBuyCfg);
+  assertArrayEqual(
+    bot3AutoPlan.outcomes.map((outcome) => outcome.name),
+    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 2-1 CUW"],
+    "Bot3 FIFA auto plan selected names"
+  );
+  assertSelfTest(bot3AutoPlan.totalStakeUsdt === 3, `Bot3 FIFA auto plan should use 1U x 3, got ${bot3AutoPlan.totalStakeUsdt}`);
+  assertSelfTest(bot3AutoPlan.selection?.bot3FifaExactScoreAutoBuy, "Bot3 FIFA auto plan should be annotated");
+  const bot3AutoFunding = computeFundingRequirement(bot3AutoCfg, []);
+  assertSelfTest(
+    bot3AutoFunding.requiredBusdt === 3 && bot3AutoFunding.reason === "bot3_fifa_exact_score_auto_single_market_fallback",
+    `Bot3 FIFA auto funding fallback should require 3U before the next batch is known, got ${JSON.stringify(bot3AutoFunding)}`
+  );
+  assertSelfTest(
+    !marketFilterDecision(fifaExactScoreMarket, { ...bot3AutoCfg, botName: "42space-2" }).eligible,
+    "Bot3 FIFA auto switch should not activate on Bot2"
+  );
+  passed.push("Bot3 FIFA exact-score preview and 1U auto selection are profile-gated");
+
+  const plannedBuyDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-planned-buy-test-"));
+  try {
+    const plannedMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001142",
+      question: "Ecuador vs Curacao",
+      categories: ["Sports", "FIFA World Cup"],
+      tags: ["soccer_match", "world_cup"],
+      startDate: new Date(Date.now() + 120000).toISOString(),
+      outcomes: [
+        { tokenId: "1", name: "ECU 0-0 CUW" },
+        { tokenId: "2", name: "ECU 1-0 CUW" },
+        { tokenId: "4", name: "ECU 2-0 CUW" },
+        { tokenId: "8", name: "ECU 3-0 CUW" }
+      ]
+    });
+    const holdMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001144",
+      question: "Hold to settlement test",
+      categories: ["Sports", "FIFA World Cup"],
+      tags: ["soccer_match", "world_cup"],
+      startDate: new Date(Date.now() + 120000).toISOString(),
+      outcomes: [
+        { tokenId: "1", name: "HOLD 1" }
+      ]
+    });
+    const preStartMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001145",
+      question: "Pre start exit test",
+      categories: ["Sports", "FIFA World Cup"],
+      tags: ["soccer_match", "world_cup"],
+      startDate: new Date(Date.now() + 120000).toISOString(),
+      endDate: new Date(Date.now() + 5 * 86400000 + 45 * 60000).toISOString(),
+      outcomes: [
+        { tokenId: "1", name: "PRE 0-1" }
+      ]
+    });
+    const retainedMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001146",
+      question: "Retained settlement test",
+      categories: ["Sports", "FIFA World Cup"],
+      tags: ["soccer_match", "world_cup"],
+      startDate: new Date(Date.now() + 120000).toISOString(),
+      endDate: new Date(Date.now() + 5 * 86400000 + 45 * 60000).toISOString(),
+      outcomes: [
+        { tokenId: "1", name: "RET 0-1" },
+        { tokenId: "2", name: "RET 0-2" }
+      ]
+    });
+    const regexPlannedMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001147",
+      question: "BNB/USDT Futures Daily Volume, June 27th?",
+      categories: ["Crypto"],
+      tags: ["Normal"],
+      startDate: new Date(Date.now() + 120000).toISOString(),
+      outcomes: [
+        { tokenId: "1", name: "< $150M" },
+        { tokenId: "2", name: "$150M - $300M" },
+        { tokenId: "4", name: "$300M - $450M" }
+      ]
+    });
+    const plannedOverridesAutoMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001151",
+      question: "Ecuador vs Curacao",
+      categories: ["Sports", "FIFA World Cup"],
+      tags: ["soccer_match", "world_cup"],
+      outcomes: mockFifaExactScoreOutcomes({
+        homePrice: 0.22,
+        awayPrice: 0.35,
+        drawPrice: 0.9
+      })
+    });
+    const plannedBuysFile = path.join(plannedBuyDir, "planned-buys.json");
+    fs.writeFileSync(plannedBuysFile, JSON.stringify({
+      plans: [
+        {
+          market: plannedMarket.address,
+          outcomes: ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW"],
+          stakePerOutcomeUsdt: 10
+        },
+        {
+          market: holdMarket.address,
+          outcomes: ["HOLD 1"],
+          stakePerOutcomeUsdt: 2,
+          autoSell: {
+            enabled: false,
+            strategy: "hold_to_settlement",
+            stopLossEnabled: false
+          }
+        },
+        {
+          market: preStartMarket.address,
+          outcomes: ["PRE 0-1"],
+          stakePerOutcomeUsdt: 10,
+          openBroadcastDelayMs: 20000,
+          gasPriceGwei: "0.15",
+          broadcastRpcUrls: ["https://rpc-a.example", "https://rpc-b.example"],
+          autoSell: {
+            strategy: "pre_start_exit",
+            beforeMarketStartSeconds: 36000,
+            stopLossEnabled: true,
+            stopLossPercent: 10,
+            stopLossSellPercent: 100
+          }
+        },
+        {
+          market: retainedMarket.address,
+          outcomes: ["RET 0-1", "RET 0-2"],
+          stakePerOutcomeUsdt: 10,
+          autoSell: {
+            strategy: "pre_start_exit",
+            beforeMarketStartSeconds: 36000,
+            stopLossEnabled: false,
+            retainPositions: [
+              { outcome: "RET 0-1", retainPercent: 10 }
+            ]
+          }
+        },
+        {
+          questionRegex: "BNB\\/USDT\\s+Futures\\s+Daily\\s+Volume",
+          outcomes: ["$150M - $300M", "$300M - $450M"],
+          stakePerOutcomeUsdt: 5,
+          gasPriceGwei: "0.15"
+        },
+        {
+          market: plannedOverridesAutoMarket.address,
+          outcomes: ["ECU 0-1 CUW", "ECU 0-2 CUW", "ECU 1-2 CUW"],
+          stakePerOutcomeUsdt: 2
+        }
+      ]
+    }));
+    const plannedCfg = {
+      ...testCfg,
+      eventPlannedBuysFile: plannedBuysFile,
+      eventOutcomeSelection: "middle",
+      eventOutcomeCount: 3,
+      stakePerOutcomeUsdt: 6,
+      maxStakeUsdt: 6,
+      maxMarketStakeUsdt: 18,
+      maxBatchStakeUsdt: 18,
+      eventMaxDueMarketsPerOpen: 1,
+      openBroadcastDelayMs: 19000
+    };
+    const plannedBuyCfg = plannedBuyConfigForMarket(plannedCfg, plannedMarket);
+    const plannedPlan = annotatePlannedBuyPlan(buildDirectBuyAllOutcomesPlan(plannedMarket, plannedBuyCfg), plannedBuyCfg);
+    const plannedExecutionCfg = executionConfigForPlan(plannedCfg, plannedPlan);
+    assertArrayEqual(
+      plannedPlan.outcomes.map((outcome) => outcome.name),
+      ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW"],
+      "planned buy outcome selection"
+    );
+    assertSelfTest(plannedPlan.selection?.plannedBuy, "planned buy plan should be marked");
+    assertSelfTest(plannedPlan.totalStakeUsdt === 30, `expected planned buy total 30U, got ${plannedPlan.totalStakeUsdt}`);
+    assertSelfTest(plannedBuyCfg.maxStakeUsdt === 10, `expected planned config maxStakeUsdt 10U, got ${plannedBuyCfg.maxStakeUsdt}`);
+    assertSelfTest(plannedExecutionCfg.maxStakeUsdt === 10, `expected planned execution maxStakeUsdt 10U, got ${plannedExecutionCfg.maxStakeUsdt}`);
+    const regexPlannedBuyCfg = plannedBuyConfigForMarket(plannedCfg, regexPlannedMarket);
+    assertArrayEqual(
+      buildDirectBuyAllOutcomesPlan(regexPlannedMarket, regexPlannedBuyCfg).outcomes.map((outcome) => outcome.name),
+      ["$150M - $300M", "$300M - $450M"],
+      "regex planned buy outcome selection"
+    );
+    const regexFunding = computeFundingRequirement(plannedCfg, [regexPlannedMarket]);
+    assertSelfTest(
+      regexFunding.nextBatchMarkets?.[0]?.gasPriceGwei === "0.15",
+      `funding summary should inherit regex planned buy gasPriceGwei, got ${regexFunding.nextBatchMarkets?.[0]?.gasPriceGwei}`
+    );
+    const plannedAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
+      marketAddress: plannedMarket.address,
+      question: { title: plannedMarket.question }
+    });
+    assertSelfTest(isAutoSellEnabledForPosition(plannedAutoSellCfg), "normal planned buy should keep global auto-sell enabled");
+    const holdAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
+      marketAddress: holdMarket.address,
+      question: { title: holdMarket.question }
+    });
+    assertSelfTest(
+      holdAutoSellCfg.autoSellEnabled === false && holdAutoSellCfg.autoSellStrategy === "hold_to_settlement",
+      `hold planned buy should normalize auto-sell disabled, got ${JSON.stringify(holdAutoSellCfg.plannedAutoSellOverride)}`
+    );
+    assertSelfTest(!isAutoSellEnabledForPosition(holdAutoSellCfg), "hold-to-settlement planned buy should skip auto-sell");
+    const preStartBuyCfg = plannedBuyConfigForMarket(plannedCfg, preStartMarket);
+    assertSelfTest(
+      preStartBuyCfg.plannedBuy?.openBroadcastDelayMs === 20000,
+      `planned buy should carry per-record openBroadcastDelayMs, got ${preStartBuyCfg.plannedBuy?.openBroadcastDelayMs}`
+    );
+    assertSelfTest(
+      preStartBuyCfg.gasPriceGwei === "0.15" && preStartBuyCfg.plannedBuy?.gasPriceGwei === "0.15",
+      `planned buy should carry per-record gasPriceGwei, got cfg=${preStartBuyCfg.gasPriceGwei} plan=${preStartBuyCfg.plannedBuy?.gasPriceGwei}`
+    );
+    assertSelfTest(
+      executionConfigForPlan(plannedCfg, annotatePlannedBuyPlan(buildDirectBuyAllOutcomesPlan(preStartMarket, preStartBuyCfg), preStartBuyCfg)).gasPriceGwei === "0.15",
+      "planned execution config should inherit per-record gasPriceGwei"
+    );
+    const plannedOverridesAutoCfg = {
+      ...plannedCfg,
+      botName: "42space-3",
+      bot3FifaExactScoreAutoBuyEnabled: true,
+      bot3FifaExactScoreAutoStakeUsdt: 1,
+      maxBatchStakeUsdt: 30
+    };
+    const plannedOverridesAutoBuyCfg = eventBuyConfigForMarket(plannedOverridesAutoCfg, plannedOverridesAutoMarket);
+    const plannedOverridesAutoPlan = annotateBuyConfigPlan(
+      buildDirectBuyAllOutcomesPlan(plannedOverridesAutoMarket, plannedOverridesAutoBuyCfg),
+      plannedOverridesAutoBuyCfg
+    );
+    assertArrayEqual(
+      plannedOverridesAutoPlan.outcomes.map((outcome) => outcome.name),
+      ["ECU 0-1 CUW", "ECU 0-2 CUW", "ECU 1-2 CUW"],
+      "planned buy should override Bot3 FIFA auto selection"
+    );
+    assertSelfTest(plannedOverridesAutoPlan.selection?.plannedBuy, "planned override should remain marked as planned buy");
+    assertSelfTest(
+      !plannedOverridesAutoPlan.selection?.bot3FifaExactScoreAutoBuy,
+      "planned override should not be marked as Bot3 FIFA auto buy"
+    );
+    assertSelfTest(
+      preStartBuyCfg.broadcastRpcUrls?.length === 2 &&
+      preStartBuyCfg.plannedBuy?.broadcastRpcUrls?.length === 2,
+      `planned buy should carry per-record broadcastRpcUrls, got cfg=${preStartBuyCfg.broadcastRpcUrls?.length ?? 0} plan=${preStartBuyCfg.plannedBuy?.broadcastRpcUrls?.length ?? 0}`
+    );
+    assertSelfTest(
+      executionConfigForPlan(plannedCfg, annotatePlannedBuyPlan(buildDirectBuyAllOutcomesPlan(preStartMarket, preStartBuyCfg), preStartBuyCfg)).broadcastRpcUrls?.length === 2,
+      "planned execution config should inherit per-record broadcastRpcUrls"
+    );
+    const plannedGasReserve = calculateFastGasReserve(plannedCfg, fundingForMarketSummaries(plannedCfg, [{
+      ...preStartMarket,
+      totalStakeUsdt: 10,
+      outcomeCount: 1,
+      gasPriceGwei: "0.15"
+    }]));
+    assertSelfTest(
+      plannedGasReserve.gasPriceGwei === "0.15",
+      `planned funding reserve should use per-record gasPriceGwei, got ${plannedGasReserve.gasPriceGwei}`
+    );
+    const preStartAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
+      marketAddress: preStartMarket.address,
+      question: { title: preStartMarket.question }
+    });
+    assertSelfTest(
+      preStartAutoSellCfg.autoSellStrategy === "pre_start_exit" &&
+        preStartAutoSellCfg.autoSellBeforeMarketStartSeconds === 36000 &&
+        preStartAutoSellCfg.autoSellStopLossEnabled === true,
+      `pre-start planned auto-sell override should keep stop-loss and pre-start exit, got ${JSON.stringify(preStartAutoSellCfg.plannedAutoSellOverride)}`
+    );
+    const retainedAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
+      marketAddress: retainedMarket.address,
+      question: { title: retainedMarket.question },
+      outcome: { name: "RET 0-1" }
+    });
+    assertSelfTest(
+      retainedAutoSellCfg.autoSellStrategy === "pre_start_exit" &&
+        retainedAutoSellCfg.autoSellBeforeMarketStartSeconds === 36000 &&
+        retainedAutoSellCfg.autoSellStopLossEnabled === false &&
+        retainedAutoSellCfg.autoSellRetainPosition?.retainPercent === 10,
+      `retained planned auto-sell should resolve 10% retained outcome with stop-loss off, got ${JSON.stringify(retainedAutoSellCfg.autoSellRetainPosition)}`
+    );
+    const retainedSell = resolveAutoSellRetainedPosition(
+      retainedAutoSellCfg,
+      { initialSize: "1000", remainingSize: "1000" },
+      { size: "1000", outcome: { name: "RET 0-1" } }
+    );
+    assertSelfTest(
+      retainedSell?.shouldSell && retainedSell.sellAmountOt === "900" && retainedSell.retainedTargetOt === "100",
+      `1000 chips with 10% retained should sell 900, got ${JSON.stringify(retainedSell)}`
+    );
+    const nonRetainedAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
+      marketAddress: retainedMarket.address,
+      question: { title: retainedMarket.question },
+      outcome: { name: "RET 0-2" }
+    });
+    assertSelfTest(
+      !nonRetainedAutoSellCfg.autoSellRetainPosition,
+      "non-retained outcome in same match should not inherit retained config"
+    );
+    const nonRetainedEntry = { remainingSize: "1000", initialSize: "1000", nextStep: 1 };
+    markAutoSellActionApplied(nonRetainedAutoSellCfg, nonRetainedEntry, { trigger: "pre_start_exit" });
+    assertSelfTest(
+      nonRetainedEntry.completed && nonRetainedEntry.remainingSize === "0",
+      `non-retained pre-start exit should still clear full position, got ${JSON.stringify(nonRetainedEntry)}`
+    );
+    const retainedNoSell = resolveAutoSellRetainedPosition(
+      retainedAutoSellCfg,
+      { initialSize: "1000", remainingSize: "80" },
+      { size: "80", outcome: { name: "RET 0-1" } }
+    );
+    assertSelfTest(
+      retainedNoSell && !retainedNoSell.shouldSell && retainedNoSell.remainingAfterSellOt === "80",
+      `current chips below retained target should produce no-sell, got ${JSON.stringify(retainedNoSell)}`
+    );
+    const retainedNoSellEntry = { remainingSize: "80", initialSize: "1000", nextStep: 1 };
+    markAutoSellActionApplied(retainedAutoSellCfg, retainedNoSellEntry, {
+      trigger: "retained_to_settlement",
+      noSell: true,
+      ...retainedAutoSellFields(retainedNoSell)
+    });
+    assertSelfTest(
+      retainedNoSellEntry.completed &&
+        retainedNoSellEntry.retainedToSettlement &&
+        retainedNoSellEntry.remainingSize === "80",
+      `retained no-sell should mark held tail without zeroing size, got ${JSON.stringify(retainedNoSellEntry)}`
+    );
+    const retainedPartialEntry = { remainingSize: "1000", initialSize: "1000", nextStep: 1 };
+    markAutoSellActionApplied(retainedAutoSellCfg, retainedPartialEntry, {
+      trigger: "pre_start_retained_exit",
+      sellAmountOt: "900",
+      remainingAfterSellOt: "100",
+      currentSizeOt: "1000",
+      retainedTargetOt: "100",
+      retainPercent: 10
+    });
+    assertSelfTest(
+      retainedPartialEntry.completed &&
+        retainedPartialEntry.retainedToSettlement &&
+        retainedPartialEntry.remainingSize === "100",
+      `retained partial pre-start sell should keep 100 chips in state, got ${JSON.stringify(retainedPartialEntry)}`
+    );
+    const invalidRetainedRows = [
+      {
+        question: "Invalid retained outcome",
+        outcomes: ["A 1-0 B"],
+        autoSell: { retainPositions: [{ outcome: "A 2-0 B", retainPercent: 10 }] }
+      },
+      {
+        question: "Duplicate retained outcome",
+        outcomes: ["A 1-0 B"],
+        autoSell: {
+          retainPositions: [
+            { outcome: "A 1-0 B", retainPercent: 10 },
+            { outcome: "A 1-0 B", retainPercent: 10 }
+          ]
+        }
+      },
+      {
+        question: "Invalid retained percent",
+        outcomes: ["A 1-0 B"],
+        autoSell: { retainPositions: [{ outcome: "A 1-0 B", retainPercent: 0 }] }
+      }
+    ];
+    for (const row of invalidRetainedRows) {
+      let rejected = false;
+      try {
+        normalizePlannedBuy(row);
+      } catch {
+        rejected = true;
+      }
+      assertSelfTest(rejected, `invalid retained planned-buy row should be rejected: ${row.question}`);
+    }
+    const preStartRecord = await preparePendingRecord(plannedCfg, preStartMarket, { receiverAddress: PUBLIC_TEST_RECEIVER });
+    const preStartMs = new Date(preStartMarket.startDate).getTime();
+    assertSelfTest(
+      preStartRecord.openBroadcastDelayMs === 20000 &&
+        marketActionTimeMsForRecord(preStartRecord, plannedCfg) === preStartMs + 20000,
+      "planned buy record should use per-record T+20s action time"
+    );
+    const normalPlannedRecord = await preparePendingRecord(plannedCfg, plannedMarket, { receiverAddress: PUBLIC_TEST_RECEIVER });
+    const normalPlannedMs = new Date(plannedMarket.startDate).getTime();
+    assertSelfTest(
+      normalPlannedRecord.openBroadcastDelayMs === null &&
+        marketActionTimeMsForRecord(normalPlannedRecord, plannedCfg) === normalPlannedMs + 19000,
+      "planned buy record without per-record delay should inherit global T+19s action time"
+    );
+    assertSelfTest(
+      marketActionTimeMs(preStartMarket, plannedCfg) === preStartMs + 19000,
+      "global action time should remain T+19s for unplanned records"
+    );
+    const approvalCandidates = autoSellOperatorPreapprovalCandidates(plannedCfg, {
+      openPositions: [
+        {
+          marketAddress: plannedMarket.address,
+          tokenId: "2",
+          size: "1",
+          costBasis: "1",
+          question: { title: plannedMarket.question }
+        },
+        {
+          marketAddress: holdMarket.address,
+          tokenId: "1",
+          size: "1",
+          costBasis: "1",
+          question: { title: holdMarket.question }
+        },
+        {
+          marketAddress: preStartMarket.address,
+          tokenId: "1",
+          size: "1",
+          costBasis: "1",
+          question: { title: preStartMarket.question }
+        }
+      ],
+      eligibleMarkets: new Map([
+        [plannedMarket.address.toLowerCase(), "2030-01-01T00:00:00.000Z"],
+        [holdMarket.address.toLowerCase(), "2030-01-01T00:00:00.000Z"],
+        [preStartMarket.address.toLowerCase(), "2030-01-01T00:00:00.000Z"]
+      ])
+    });
+    assertArrayEqual(
+      approvalCandidates.markets.map((market) => String(market).toLowerCase()),
+      [plannedMarket.address.toLowerCase(), preStartMarket.address.toLowerCase()],
+      "hold-to-settlement planned buy operator preapproval candidates"
+    );
+    assertSelfTest(approvalCandidates.disabled === 1, "hold-to-settlement planned buy should also skip operator preapproval");
+    const livePlannedRecord = await preparePendingRecord({
+      ...plannedCfg,
+      dryRun: false,
+      execute: true,
+      riskAck: "YES",
+      eligibilityAck: "YES",
+      privateKey: PUBLIC_TEST_PRIVATE_KEY,
+      walletAddress: PUBLIC_TEST_RECEIVER
+    }, plannedMarket, { receiverAddress: PUBLIC_TEST_RECEIVER });
+    assertSelfTest(
+      livePlannedRecord.preparedPlan && !livePlannedRecord.prepareError,
+      `planned buy should pass prepare-time execution validation, got ${livePlannedRecord.prepareError ?? "no plan"}`
+    );
+    const invalidManualRecord = await preparePendingRecord({
+      ...plannedCfg,
+      eventPlannedBuysFile: "",
+      eventOutcomeSelection: "names",
+      eventOutcomeNames: "ECU 1-0 CUW,ECU 2-0 CUW,ECU 3-0 CUW",
+      stakePerOutcomeUsdt: 10,
+      maxMarketStakeUsdt: 30,
+      maxBatchStakeUsdt: 30,
+      dryRun: false,
+      execute: true,
+      riskAck: "YES",
+      eligibilityAck: "YES",
+      privateKey: PUBLIC_TEST_PRIVATE_KEY,
+      walletAddress: PUBLIC_TEST_RECEIVER
+    }, plannedMarket, { receiverAddress: PUBLIC_TEST_RECEIVER });
+    assertSelfTest(
+      !invalidManualRecord.preparedPlan && invalidManualRecord.prepareError?.includes("MAX_STAKE_USDT"),
+      `prepare-time validation should catch MAX_STAKE_USDT mismatch, got ${invalidManualRecord.prepareError ?? "no error"}`
+    );
+    const sameOpenPlanned = [
+      { market: plannedMarket, preparedPlan: plannedPlan },
+      { market: mockEventMarket({ address: "0x0000000000000000000000000000000000001143", startDate: plannedMarket.startDate }) }
+    ];
+    const allowedKeys = recordKeysWithinOpenLimit(plannedCfg, sameOpenPlanned);
+    assertSelfTest(
+      allowedKeys.has(eventSeenKey(plannedMarket, plannedCfg)),
+      "planned buy should bypass single-market open limit"
+    );
+    const staleSeen = new Set([eventSeenKey(plannedMarket, plannedCfg)]);
+    assertSelfTest(
+      clearSeenForFuturePlannedBuy(plannedCfg, staleSeen, plannedMarket, "self-test"),
+      "future planned buy should override a prior seen record"
+    );
+    assertSelfTest(
+      !staleSeen.has(eventSeenKey(plannedMarket, plannedCfg)),
+      "future planned buy should remove the stale seen key"
+    );
+    const globalFutureMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001150",
+      question: "$TEST FDV by end of self test?",
+      status: "not_started",
+      categories: ["Crypto", "Meme"]
+    });
+    const globalBuyCfg = {
+      ...plannedCfg,
+      eventPlannedBuysFile: "",
+      eventIntelBuyFilter: "strong",
+      minEventDurationHours: 0
+    };
+    const globalSeen = new Set([eventSeenKey(globalFutureMarket, globalBuyCfg)]);
+    const globalDecision = marketFilterDecision(globalFutureMarket, globalBuyCfg);
+    assertSelfTest(
+      clearSeenForFutureEligibleBuy(globalBuyCfg, globalSeen, globalFutureMarket, "self-test"),
+      `future eligible global buy should override a prior seen record, decision=${JSON.stringify(globalDecision)}`
+    );
+    assertSelfTest(
+      !globalSeen.has(eventSeenKey(globalFutureMarket, globalBuyCfg)),
+      "future eligible global buy should remove the stale seen key"
+    );
+    const openedBeforeActionMarket = {
+      ...plannedMarket,
+      startDate: new Date(Date.now() - 5000).toISOString()
+    };
+    const openedBeforeActionSeen = new Set([eventSeenKey(openedBeforeActionMarket, plannedCfg)]);
+    assertSelfTest(
+      !clearSeenForFuturePlannedBuy(plannedCfg, openedBeforeActionSeen, openedBeforeActionMarket, "self-test"),
+      "planned buy should not override seen after market start even before configured action time"
+    );
+    const duePlannedMarket = {
+      ...plannedMarket,
+      startDate: new Date(Date.now() - 60000).toISOString()
+    };
+    const dueSeen = new Set([eventSeenKey(duePlannedMarket, plannedCfg)]);
+    assertSelfTest(
+      !clearSeenForFuturePlannedBuy(plannedCfg, dueSeen, duePlannedMarket, "self-test"),
+      "planned buy should not override seen after the action time"
+    );
+    passed.push("planned buy file overrides global middle selection per market");
+  } finally {
+    fs.rmSync(plannedBuyDir, { recursive: true, force: true });
+  }
+
   let strictOddsError = "";
   try {
     buildDirectBuyAllOutcomesPlan(mockEventMarket({
@@ -1263,6 +2390,31 @@ async function selfTest(cfg) {
     runtimeAutoSellPauseInfo(lockRuntime)?.reason === "self-test-presign",
     "auto-sell pause was not recorded"
   );
+  assertSelfTest(
+    autoSellPresignPauseHoldMs({
+      ...testCfg,
+      autoSellStrategy: "open_timed_exit",
+      preSignWindowMs: 60000,
+      openBroadcastDelayMs: 19000,
+      autoSellPollMs: 1000
+    }) === 80000,
+    "open timed exit should resume auto-sell before the configured sell point"
+  );
+  assertSelfTest(
+    shouldStartAutoSellBeforeFunding({ armWaitForFunding: true, autoSellEnabled: true }),
+    "auto-sell should start before funding wait when both switches are enabled"
+  );
+  assertSelfTest(
+    !shouldStartAutoSellBeforeFunding({ armWaitForFunding: true, autoSellEnabled: false }),
+    "auto-sell should not start before funding wait when auto-sell is disabled"
+  );
+  const waitRuntime = { txLock: { owner: "auto-sell-batch", since: new Date().toISOString() } };
+  setTimeout(() => {
+    waitRuntime.txLock.owner = null;
+    waitRuntime.txLock.since = null;
+  }, 10);
+  await waitForRuntimeTransactionIdle(waitRuntime, "self-test", { timeoutMs: 1000, pollMs: 5 });
+  assertSelfTest(!runtimeTransactionBusy(waitRuntime), "runtime transaction idle wait did not observe lock release");
   passed.push("transaction lock and auto-sell pause protect hot buy window");
 
   const sellQuoteCfg = { ...testCfg, dryRun: false, execute: true };
@@ -1285,7 +2437,344 @@ async function selfTest(cfg) {
   );
   const noAutoSellTrigger = resolveAutoSellTrigger(testCfg, { profitMultiple: 1.1, lossPercent: 9.9 });
   assertSelfTest(!noAutoSellTrigger, `expected no auto-sell trigger, got ${JSON.stringify(noAutoSellTrigger)}`);
-  passed.push("auto-sell disables take-profit and keeps 10% stop-loss");
+  const profitPercent = autoSellProfitPercent(6, 12);
+  assertSelfTest(profitPercent === 100, `expected 100% profit, got ${profitPercent}`);
+  const halfPositionMetrics = autoSellReturnMetrics(
+    { costBasis: "9.9799", size: "3888.27" },
+    { initialSize: "7776.54", initialCostBasisUsdt: "9.9799" },
+    8.3686
+  );
+  assertSelfTest(
+    halfPositionMetrics.lossPercent === 0 && halfPositionMetrics.profitPercent > 60,
+    `half-position return should be positive, got ${JSON.stringify(halfPositionMetrics)}`
+  );
+  const losingHalfPositionMetrics = autoSellReturnMetrics(
+    { costBasis: "9.9799", size: "3888.27" },
+    { initialSize: "7776.54", initialCostBasisUsdt: "9.9799" },
+    4.2
+  );
+  assertSelfTest(
+    losingHalfPositionMetrics.lossPercent > 10,
+    `true half-position loss should still trigger stop-loss, got ${JSON.stringify(losingHalfPositionMetrics)}`
+  );
+  const staleRestHalfPositionMetrics = autoSellReturnMetrics(
+    { costBasis: "9.9799", size: "7776.54" },
+    { initialSize: "7776.54", initialCostBasisUsdt: "9.9799", remainingSize: "3888.27" },
+    8.3686
+  );
+  assertSelfTest(
+    staleRestHalfPositionMetrics.lossPercent === 0 && staleRestHalfPositionMetrics.profitPercent > 60,
+    `tracked remaining size should override stale REST size, got ${JSON.stringify(staleRestHalfPositionMetrics)}`
+  );
+  const trackedEntry = { initialSize: "100", initialCostBasisUsdt: "10", nextStep: 1 };
+  markAutoSellActionApplied(
+    { ...testCfg, autoSellChunkPercent: 50, autoSellTakeProfitSteps: 1, autoSellBeforeMarketStartSeconds: 36000 },
+    trackedEntry,
+    { trigger: "ladder_step", sellAmountOt: "50" }
+  );
+  assertSelfTest(
+    trackedEntry.remainingSize === "50" && trackedEntry.takeProfitCompleted,
+    `ladder sell should track remaining size, got ${JSON.stringify(trackedEntry)}`
+  );
+  assertSelfTest(
+    !isAutoSellLadderProfitReady(testCfg, 99.9),
+    "auto-sell ladder should wait below the 100% profit gate"
+  );
+  assertSelfTest(
+    isAutoSellLadderProfitReady(testCfg, 100),
+    "auto-sell ladder should start at the 100% profit gate"
+  );
+  assertSelfTest(
+    isAutoSellLadderProfitReady({ ...testCfg, autoSellLadderProfitPercent: 0 }, null),
+    "auto-sell ladder should preserve old behavior when the profit gate is off"
+  );
+  const quoteGuardPosition = {
+    marketAddress: "0x0000000000000000000000000000000000000a51",
+    tokenId: "1",
+    costBasis: "1",
+    size: "1",
+    question: { title: "Quote guard market" },
+    market: { startDate: new Date(Date.now() + 24 * 3600000).toISOString() }
+  };
+  const quoteGuardEntry = {
+    nextStep: 1,
+    initialSize: "1",
+    initialCostBasisUsdt: "1",
+    buyAt: new Date().toISOString(),
+    completed: false,
+    stopLossSold: false
+  };
+  let quoteGuardCalls = 0;
+  const quoteGuardClient = {
+    readContract: async () => {
+      quoteGuardCalls += 1;
+      throw new Error("quote guard should not be called");
+    },
+    simulateContract: async () => {
+      quoteGuardCalls += 1;
+      throw new Error("quote guard should not be called");
+    }
+  };
+  const preStartQuoteGuardAction = await buildPreStartExitAutoSellAction({
+    ...testCfg,
+    autoSellStrategy: "pre_start_exit",
+    autoSellBeforeMarketStartSeconds: 300,
+    autoSellStopLossEnabled: false
+  }, quoteGuardClient, PUBLIC_TEST_RECEIVER, quoteGuardPosition, quoteGuardEntry, Date.now());
+  assertSelfTest(
+    preStartQuoteGuardAction === null && quoteGuardCalls === 0,
+    `pre-start exit should not quote before due when stop-loss is off, calls=${quoteGuardCalls}`
+  );
+  const ladderQuoteGuardAction = await buildLadderAutoSellAction({
+    ...testCfg,
+    autoSellStrategy: "ladder",
+    autoSellStartDelaySeconds: 3600,
+    autoSellLadderProfitPercent: 0,
+    autoSellStopLossEnabled: false
+  }, quoteGuardClient, PUBLIC_TEST_RECEIVER, quoteGuardPosition, quoteGuardEntry, Date.now());
+  assertSelfTest(
+    ladderQuoteGuardAction === null && quoteGuardCalls === 0,
+    `ladder should not quote before due when stop-loss is off and no profit gate is configured, calls=${quoteGuardCalls}`
+  );
+  const ladderProfitGateEntry = {
+    ...quoteGuardEntry,
+    buyAt: new Date(Date.now() - 60000).toISOString()
+  };
+  const ladderProfitGateAction = await buildLadderAutoSellAction({
+    ...testCfg,
+    autoSellStrategy: "ladder",
+    autoSellStartDelaySeconds: 0,
+    autoSellLadderProfitPercent: 100,
+    autoSellStopLossEnabled: false
+  }, quoteGuardClient, PUBLIC_TEST_RECEIVER, quoteGuardPosition, ladderProfitGateEntry, Date.now());
+  assertSelfTest(
+    ladderProfitGateAction === null && quoteGuardCalls > 0,
+    "ladder should still quote at due time when a profit gate is configured"
+  );
+  passed.push("auto-sell skips return quotes unless stop-loss or a profit gate needs them");
+  const oneStepEntry = {
+    nextStep: 1,
+    initialSize: "100",
+    buyAt: new Date(Date.now() - 60000).toISOString(),
+    completed: false
+  };
+  markAutoSellActionApplied({
+    ...testCfg,
+    autoSellChunkPercent: 50,
+    autoSellTakeProfitSteps: 1,
+    autoSellBeforeMarketStartSeconds: 300
+  }, oneStepEntry, {
+    trigger: "ladder_step"
+  });
+  assertSelfTest(
+    oneStepEntry.takeProfitCompleted && !oneStepEntry.completed,
+    "one-step take-profit should leave remaining position for pre-start exit"
+  );
+  const gasBudget = await ensureAutoSellGasBudget(
+    { ...testCfg, dryRun: false, execute: true, autoSellGasPriceGwei: "0.15", autoSellMinBnbReserve: 0 },
+    {
+      getBalance: async () => parseUnits("1", 18),
+      getGasPrice: async () => parseGwei("9")
+    },
+    PUBLIC_TEST_RECEIVER,
+    1_000_000
+  );
+  assertSelfTest(gasBudget.gasPriceGwei === "0.15", `auto-sell gas should use sell-only gas price, got ${gasBudget.gasPriceGwei}`);
+  const kickoffPlanDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-kickoff-plan-test-"));
+  try {
+    const kickoffFile = path.join(kickoffPlanDir, "planned-buys.json");
+    const kickoffMarket = "0x00000000000000000000000000000000000000aa";
+    const holdFastExitMarket = "0x00000000000000000000000000000000000000bb";
+    fs.writeFileSync(kickoffFile, JSON.stringify({
+      plans: [
+        {
+          market: kickoffMarket,
+          outcomes: ["A"],
+          stakePerOutcomeUsdt: 1,
+          kickoffAt: "2030-01-02T03:04:05Z"
+        },
+        {
+          market: holdFastExitMarket,
+          outcomes: ["A"],
+          stakePerOutcomeUsdt: 1,
+          autoSell: {
+            enabled: false,
+            strategy: "hold_to_settlement"
+          }
+        }
+      ]
+    }));
+    const kickoffCfg = {
+      ...testCfg,
+      eventPlannedBuysFile: kickoffFile,
+      autoSellBeforeMarketStartSeconds: 300,
+      autoSellMarketStartEndOffsetSeconds: 2700
+    };
+    const kickoffPosition = {
+      marketAddress: kickoffMarket,
+      tokenId: "1",
+      costBasis: "1",
+      size: "1",
+      market: {
+        startDate: "2030-01-01T00:00:00Z",
+        endDate: "2030-01-09T09:09:09Z"
+      }
+    };
+    assertSelfTest(
+      autoSellMarketStartDate(kickoffCfg, kickoffPosition) === "2030-01-02T03:04:05.000Z",
+      "planned-buy kickoffAt should override market start/end fallback"
+    );
+    assertSelfTest(
+      autoSellPreStartDueAt(kickoffCfg, kickoffPosition) === Date.parse("2030-01-02T02:59:05Z"),
+      "pre-start exit should be scheduled 5 minutes before planned kickoffAt"
+    );
+    const autoExactScorePosition = {
+      marketAddress: "0x00000000000000000000000000000000000000cc",
+      tokenId: "1",
+      costBasis: "1",
+      size: "1",
+      outcome: { name: "FRA 1-0 MAR" },
+      market: {
+        question: "France vs Morocco",
+        startDate: "2030-01-02T03:00:00Z",
+        endDate: "2030-01-09T09:09:09Z"
+      }
+    };
+    const autoExactScoreCfg = {
+      ...testCfg,
+      autoSellBeforeMarketStartSeconds: 300,
+      autoSellMarketStartEndOffsetSeconds: 0
+    };
+    assertSelfTest(
+      autoSellMarketStartDate(autoExactScoreCfg, autoExactScorePosition) === "2030-01-09T09:09:09.000Z",
+      "auto exact-score positions should use match endDate as the pre-start anchor when no planned kickoffAt exists"
+    );
+    assertSelfTest(
+      autoSellPreStartDueAt(autoExactScoreCfg, autoExactScorePosition) === Date.parse("2030-01-09T09:04:09Z"),
+      "auto exact-score pre-start exit should be scheduled before match endDate, not market open startDate"
+    );
+    assertSelfTest(
+      autoSellMarketStartDate({ ...autoExactScoreCfg, autoSellMarketStartEndOffsetSeconds: 2700 }, autoExactScorePosition) === "2030-01-09T08:24:09.000Z",
+      "auto exact-score endDate fallback should still respect AUTO_SELL_MARKET_START_END_OFFSET_SECONDS"
+    );
+    const totalGoalsPosition = {
+      ...autoExactScorePosition,
+      marketAddress: "0x00000000000000000000000000000000000000cd",
+      outcome: { name: "0-1 goals" },
+      market: {
+        ...autoExactScorePosition.market,
+        question: "France vs Morocco - Total Goals"
+      }
+    };
+    assertSelfTest(
+      autoSellMarketStartDate(autoExactScoreCfg, totalGoalsPosition) === "2030-01-02T03:00:00Z",
+      "sports side markets should not use the exact-score endDate fallback"
+    );
+    assertSelfTest(
+      autoSellOpenExitDueAt({
+        ...testCfg,
+        autoSellOpenExitDelaySeconds: 36
+      }, kickoffPosition) === Date.parse("2030-01-01T00:00:36Z"),
+      "open timed exit should use market open startDate, not planned kickoffAt"
+    );
+    const openExitEntry = {
+      nextStep: 1,
+      initialSize: "100",
+      buyAt: "2030-01-01T00:00:19Z",
+      completed: false
+    };
+    markAutoSellActionApplied(testCfg, openExitEntry, {
+      trigger: "open_timed_exit"
+    });
+    assertSelfTest(
+      openExitEntry.completed && openExitEntry.openTimedExitSold,
+      "open timed exit should complete the position after one sell"
+    );
+    const fastExitCfg = {
+      ...testCfg,
+      dryRun: false,
+      execute: true,
+      autoSellStrategy: "open_timed_exit",
+      autoSellFastOpenExitEnabled: true,
+      autoSellFastOpenExitMinDelayMs: 24500,
+      autoSellFastOpenExitMaxDelayMs: 26000
+    };
+    const randomDelay = fastOpenExitRandomDelayMs(fastExitCfg, (min, max) => {
+      assertSelfTest(min === 24500 && max === 26001, `fast exit random bounds wrong: ${min}-${max}`);
+      return 25555;
+    });
+    assertSelfTest(randomDelay === 25555, `fast open exit random delay mismatch: ${randomDelay}`);
+    const fastSchedule = fastOpenExitSchedule(fastExitCfg, kickoffPosition.market, "0xabc");
+    assertSelfTest(
+      fastSchedule.targetMs >= Date.parse(kickoffPosition.market.startDate) + 24500 &&
+        fastSchedule.targetMs <= Date.parse(kickoffPosition.market.startDate) + 26000,
+      `fast open exit schedule outside range: ${JSON.stringify(fastSchedule)}`
+    );
+    const fastRuntime = { txLock: { owner: null, since: null } };
+    const holdFastExitMarketDetails = {
+      ...kickoffPosition.market,
+      address: holdFastExitMarket,
+      question: "Hold fast open exit test"
+    };
+    const holdFastExitBuyCfg = plannedBuyConfigForMarket(kickoffCfg, holdFastExitMarketDetails);
+    assertSelfTest(
+      shouldScheduleFastOpenExitAfterBuy(
+        fastExitCfg,
+        { txHash: "0xabc", outcomes: [{ tokenId: "1", name: "A" }] },
+        { type: "single", marketDetails: [kickoffPosition.market] },
+        fastRuntime,
+        { status: "success" }
+      ),
+      "fast open exit should schedule after a successful single-buy receipt"
+    );
+    assertSelfTest(
+      !shouldScheduleFastOpenExitAfterBuy(
+        { ...fastExitCfg, autoSellFastOpenExitEnabled: false },
+        { txHash: "0xabc", outcomes: [{ tokenId: "1", name: "A" }] },
+        { type: "single", marketDetails: [kickoffPosition.market] },
+        fastRuntime,
+        { status: "success" }
+      ),
+      "fast open exit should stay disabled unless explicitly enabled"
+    );
+    assertSelfTest(
+      !shouldScheduleFastOpenExitAfterBuy(
+        fastExitCfg,
+        { txHash: "0xabc", outcomes: [{ tokenId: "1", name: "A" }] },
+        { type: "single", plannedBuy: holdFastExitBuyCfg.plannedBuy, marketDetails: [holdFastExitMarketDetails] },
+        fastRuntime,
+        { status: "success" }
+      ),
+      "fast open exit should respect planned-buy hold_to_settlement context"
+    );
+    assertSelfTest(
+      !shouldScheduleFastOpenExitAfterBuy(
+        { ...fastExitCfg, eventPlannedBuysFile: kickoffFile },
+        { txHash: "0xabc", outcomes: [{ tokenId: "1", name: "A" }] },
+        { type: "single", marketDetails: [holdFastExitMarketDetails] },
+        fastRuntime,
+        { status: "success" }
+      ),
+      "fast open exit should respect planned-buy hold_to_settlement file fallback"
+    );
+    const fastOpenExitEntry = {
+      nextStep: 1,
+      initialSize: "100",
+      buyAt: "2030-01-01T00:00:19Z",
+      completed: false
+    };
+    markAutoSellActionApplied(testCfg, fastOpenExitEntry, {
+      trigger: "fast_open_timed_exit",
+      sellAmountOt: "100"
+    });
+    assertSelfTest(
+      fastOpenExitEntry.completed && fastOpenExitEntry.openTimedExitSold,
+      "fast open timed exit should complete the position after one sell"
+    );
+  } finally {
+    fs.rmSync(kickoffPlanDir, { recursive: true, force: true });
+  }
+  passed.push("auto-sell waits for the 100% ladder profit gate, supports open timed exit, fast randomized open exit, one-step take-profit, sell-only gas, planned kickoffAt, and keeps 10% stop-loss");
 
   const hotRuntime = {
     pendingBuyRecords: new Map([
@@ -1376,6 +2865,19 @@ async function selfTest(cfg) {
   );
   assertSelfTest(noisyAutoSellError.length < 220, `auto-sell error should be compact, got ${noisyAutoSellError.length} chars`);
   assertSelfTest(!noisyAutoSellError.includes("a".repeat(96)), "auto-sell error should truncate long hex calldata");
+  assertSelfTest(
+    isTransientPositionsFetchErrorMessage("42 positions 503: <html><h1>Service Temporarily Unavailable</h1></html>"),
+    "42 positions 5xx should be treated as transient"
+  );
+  assertSelfTest(
+    isTransientPositionsFetchErrorMessage("42 positions invalid JSON: Unexpected token '<'"),
+    "42 positions invalid JSON should be treated as transient"
+  );
+  assertSelfTest(
+    !isTransientPositionsFetchErrorMessage("Failed to load auto-sell position state data/auto-sell-positions.json"),
+    "local auto-sell state errors must remain fatal"
+  );
+  passed.push("auto-sell positions API outages are retryable without monitor-exception alerts");
 
   const circuitState = defaultAutoSellCircuitState();
   const circuitNow = Date.parse("2030-01-01T00:00:00.000Z");
@@ -1435,6 +2937,84 @@ async function selfTest(cfg) {
     marketActionTimeMs({ startDate: fixedStart }, { ...testCfg, allowPreopenBroadcast: true, prebroadcastMs: 750, openBroadcastDelayMs: 25 }) === fixedStartMs - 750,
     "explicit pre-open action time should ignore post-open delay"
   );
+  const blockAwareCfg = {
+    ...testCfg,
+    allowPreopenBroadcast: false,
+    openBroadcastMode: "block_aware_20s",
+    openBroadcastDelayMs: 19900,
+    openBroadcastBlockTargetOffsetMs: 20000,
+    openBroadcastBlockAwareLeadMs: 95,
+    openBroadcastBlockAwareMaxWaitMs: 250,
+    openBroadcastBlockAwarePreTargetCount: 2,
+    openBroadcastBlockAwarePreTargetSendMs: 120,
+    openBroadcastBlockAwareHeadMaxAgeMs: 2000
+  };
+  const blockAwareRecord = { market: { startDate: fixedStart } };
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, null, fixedStartMs + 19800) === fixedStartMs + 19900,
+    "block-aware timing should not send before the configured arm delay"
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, null, fixedStartMs + 19900) === fixedStartMs + 19905,
+    "block-aware timing should fall back to the nominal target when no block heads are useful"
+  );
+  const targetHeadRuntime = { openBroadcastBlockClock: createOpenBroadcastBlockClockState() };
+  rememberOpenBroadcastBlockHead(
+    targetHeadRuntime.openBroadcastBlockClock,
+    { number: 100n, timestamp: BigInt((fixedStartMs + 20000) / 1000) },
+    fixedStartMs + 20080
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, targetHeadRuntime, fixedStartMs + 20080) === fixedStartMs + 20080,
+    "block-aware timing should release immediately after observing the target timestamp head"
+  );
+  const preTargetRuntime = { openBroadcastBlockClock: createOpenBroadcastBlockClockState() };
+  for (const [index, receivedAt] of [fixedStartMs + 19600, fixedStartMs + 19750, fixedStartMs + 19890].entries()) {
+    rememberOpenBroadcastBlockHead(
+      preTargetRuntime.openBroadcastBlockClock,
+      { number: BigInt(200 + index), timestamp: BigInt((fixedStartMs + 19000) / 1000) },
+      receivedAt
+    );
+  }
+  const onePreTargetRuntime = { openBroadcastBlockClock: createOpenBroadcastBlockClockState() };
+  rememberOpenBroadcastBlockHead(
+    onePreTargetRuntime.openBroadcastBlockClock,
+    { number: 199n, timestamp: BigInt((fixedStartMs + 19000) / 1000) },
+    fixedStartMs + 19890
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, onePreTargetRuntime, fixedStartMs + 19900) === fixedStartMs + 19905,
+    "block-aware timing should require enough repeated pre-target heads before arm-time release"
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, preTargetRuntime, fixedStartMs + 19880) === fixedStartMs + 19900,
+    "block-aware timing should not release before the configured arm delay even with repeated pre-target heads"
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, preTargetRuntime, fixedStartMs + 19900) === fixedStartMs + 19900,
+    "block-aware timing should allow arm-time release when repeated pre-target timestamp heads are seen"
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(blockAwareRecord, blockAwareCfg, preTargetRuntime, fixedStartMs + 19905) === fixedStartMs + 19905,
+    "block-aware timing should release when repeated fresh pre-target timestamp heads are seen near the boundary"
+  );
+  assertSelfTest(
+    marketActionTimeMsForRecord(
+      { market: { startDate: fixedStart }, openBroadcastDelayMs: 25000 },
+      blockAwareCfg,
+      preTargetRuntime,
+      fixedStartMs + 19905
+    ) === fixedStartMs + 25000,
+    "block-aware timing should not pull a record-level late delay back to the 20s boundary"
+  );
+  const oldDueBlockAwareGroups = groupRecordsByActionTime([
+    { market: { startDate: "2030-01-01T00:00:00.000Z" } },
+    { market: { startDate: "2030-01-01T00:01:00.000Z" } }
+  ], blockAwareCfg, preTargetRuntime);
+  assertSelfTest(
+    oldDueBlockAwareGroups.size === 2,
+    "block-aware grouping should use stable action keys instead of merging records by the current due instant"
+  );
   assertSelfTest(
     isTerminalMinedFailure({ usedPreSignedTransaction: true, status: "reverted", blockNumber: "100" }),
     "mined reverted pre-signed tx should be treated as terminal"
@@ -1447,7 +3027,47 @@ async function selfTest(cfg) {
     executionMarksSeen({ status: "broadcast" }),
     "RPC-accepted broadcast should be treated as submitted"
   );
-  passed.push("pre-open broadcast is opt-in after boundary-block revert");
+  passed.push("pre-open broadcast is opt-in and block-aware post-open timing is bounded");
+
+  const cheapGateQuote = summarizeEventPriceGateQuote(
+    { tokenId: "1", name: "cheap" },
+    {
+      collateralFromUser: parseUnits("1", 18),
+      otToUser: parseUnits("1000", 18),
+      stakeUsdt: 1
+    }
+  );
+  const expensiveGateQuote = summarizeEventPriceGateQuote(
+    { tokenId: "2", name: "expensive" },
+    {
+      collateralFromUser: parseUnits("1.3", 18),
+      otToUser: parseUnits("1000", 18),
+      stakeUsdt: 1.3
+    }
+  );
+  const gateCfg = { ...testCfg, eventPriceGateMaxEffectivePrice: 0.0012, eventPriceGateRequire: "any" };
+  assertSelfTest(isPriceGateQuotePassing(gateCfg, cheapGateQuote), "price gate should pass a cheap quote");
+  assertSelfTest(!isPriceGateQuotePassing(gateCfg, expensiveGateQuote), "price gate should reject an expensive quote");
+  assertSelfTest(
+    priceGatePasses(gateCfg, [expensiveGateQuote, cheapGateQuote]),
+    "any-mode price gate should pass when one selected outcome is below the threshold"
+  );
+  assertSelfTest(
+    !priceGatePasses({ ...gateCfg, eventPriceGateRequire: "all" }, [expensiveGateQuote, cheapGateQuote]),
+    "all-mode price gate should reject if any selected outcome is above the threshold"
+  );
+  const oneOpenStart = "2030-01-01T00:00:00.000Z";
+  const limitedOpenRecords = [
+    { market: mockEventMarket({ address: "0x0000000000000000000000000000000000000101", startDate: oneOpenStart }) },
+    { market: mockEventMarket({ address: "0x0000000000000000000000000000000000000102", startDate: oneOpenStart }) },
+    { market: mockEventMarket({ address: "0x0000000000000000000000000000000000000103", startDate: oneOpenStart }) }
+  ];
+  const limitedOpen = splitRecordsByOpenLimit({ ...testCfg, eventMaxDueMarketsPerOpen: 1 }, limitedOpenRecords);
+  assertSelfTest(
+    limitedOpen.selected.length === 1 && limitedOpen.skipped.length === 2,
+    `single-market open limit should keep one market and skip two, got ${limitedOpen.selected.length}/${limitedOpen.skipped.length}`
+  );
+  passed.push("price gate uses effective simulateMint cost and supports single-market any-outcome mode");
 
   const staleManualMarket = mockEventMarket({
     startDate: new Date(Date.now() - (testCfg.eventOpenWindowSeconds * 1000 + 1000)).toISOString()
@@ -1481,6 +3101,23 @@ async function selfTest(cfg) {
     BigInt(bundleGasReserve.gasLimit) >= 11700000n,
     `15-outcome bundle fast gas limit too low: ${bundleGasReserve.gasLimit}`
   );
+  const staggeredGasReserve = calculateFundingGasReserve(
+    { ...testCfg, fastGasLimit: 8000000, bundleDueMarkets: false, gasPriceGwei: "3" },
+    fundingForMarketSummaries(testCfg, [
+      { question: "BNB/USDT Futures Daily Volume", outcomeCount: 2, availableOutcomeCount: 6, totalStakeUsdt: 20, gasPriceGwei: "0.15" },
+      { question: "OpenRouter Python", outcomeCount: 3, availableOutcomeCount: 10, totalStakeUsdt: 30, gasPriceGwei: "3" }
+    ])
+  );
+  const combinedSingleReserve = calculateFastGasReserve(
+    { ...testCfg, fastGasLimit: 8000000, bundleDueMarkets: false, gasPriceGwei: "3" },
+    { nextBatchOutcomeCount: 5, nextBatchGasPriceGwei: "3" }
+  );
+  assertSelfTest(
+    staggeredGasReserve.mode === "multi_single_fast" &&
+      Number(staggeredGasReserve.requiredBnb) < Number(combinedSingleReserve.requiredBnb),
+    `staggered gas reserve should sum per-market gas instead of overestimating as one 5-outcome tx, got ${JSON.stringify(staggeredGasReserve)} vs ${JSON.stringify(combinedSingleReserve)}`
+  );
+  passed.push("staggered non-bundle gas reserve sums per-market gas");
   const walletBudgetGasLimit = resolveWalletBudgetGasLimit(
     {
       ...testCfg,
@@ -1629,6 +3266,363 @@ async function selfTest(cfg) {
   assertSelfTest(dailyVolumeMarkets.length === 0, "Daily futures volume template should fail duration filter");
   passed.push("daily futures volume template is excluded by duration filter");
 
+  const dailyVolumeAllowlistCfg = {
+    ...testCfg,
+    minEventDurationHours: 0,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: ["Price"],
+    marketQuestionAllowlistRegex: /^(BTC|ETH|BNB)\/USDT Futures Daily Volume/i
+  };
+  const allowedDailyVolumeMarkets = filterEventMarkets([
+    mockEventMarket({
+      address: "0x0000000000000000000000000000000000001146",
+      question: "BNB/USDT Futures Daily Volume, May 27th?",
+      categories: ["Crypto"],
+      startDate: new Date(Date.now() + 60000).toISOString(),
+      endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+    })
+  ], dailyVolumeAllowlistCfg);
+  assertSelfTest(allowedDailyVolumeMarkets.length === 1, "question allowlist should allow BNB daily volume when duration filter is paused");
+  const blockedDailyVolumeDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001147",
+    question: "SOL/USDT Futures Daily Volume, May 27th?",
+    categories: ["Crypto"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), dailyVolumeAllowlistCfg);
+  assertSelfTest(
+    !blockedDailyVolumeDecision.eligible && blockedDailyVolumeDecision.reason === "question-allowlist",
+    `question allowlist should exclude SOL daily volume, got ${JSON.stringify(blockedDailyVolumeDecision)}`
+  );
+  const manualBlockedDailyVolumeDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001148",
+    question: "SOL/USDT Futures Daily Volume, May 27th?",
+    categories: ["Crypto"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), {
+    ...dailyVolumeAllowlistCfg,
+    marketFollowState: {
+      followed: {
+        "0x0000000000000000000000000000000000001148": {
+          market: "0x0000000000000000000000000000000000001148",
+          title: "SOL/USDT Futures Daily Volume"
+        }
+      },
+      blocked: {}
+    }
+  });
+  assertSelfTest(
+    !manualBlockedDailyVolumeDecision.eligible && manualBlockedDailyVolumeDecision.reason === "question-allowlist",
+    `manual follow must not bypass question allowlist, got ${JSON.stringify(manualBlockedDailyVolumeDecision)}`
+  );
+  passed.push("question allowlist can hard-limit Bot2 daily volume targets");
+
+  const allowlistBlockedExactScoreMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000001149",
+    question: "USA vs Bosnia and Herzegovina",
+    categories: ["Sports", "FIFA World Cup"],
+    tags: ["soccer_match", "world_cup"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 120 * 3600000).toISOString()
+  });
+  const hardQuestionAllowlistCfg = {
+    ...testCfg,
+    minEventDurationHours: 0,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: ["Price"],
+    marketQuestionAllowlistRegex: /a^/,
+    eventDisplayFilterRules: ["price", "daily_fixed_template", "sports_total_goals", "sports_goal_differential"]
+  };
+  const allowlistBlockedExactScoreDecision = getEventMarketDecision(allowlistBlockedExactScoreMarket, hardQuestionAllowlistCfg);
+  assertSelfTest(
+    !allowlistBlockedExactScoreDecision.eligible && allowlistBlockedExactScoreDecision.reason === "question-allowlist",
+    `hard question allowlist should still block auto-buy, got ${JSON.stringify(allowlistBlockedExactScoreDecision)}`
+  );
+  const allowlistBlockedExactScoreDisplay = getEventMarketDisplayDecision(
+    allowlistBlockedExactScoreMarket,
+    hardQuestionAllowlistCfg,
+    allowlistBlockedExactScoreDecision
+  );
+  assertSelfTest(
+    allowlistBlockedExactScoreDisplay.visible && allowlistBlockedExactScoreDisplay.reason === "display-sports-exact-score",
+    `hard question allowlist should not hide exact-score display, got ${JSON.stringify(allowlistBlockedExactScoreDisplay)}`
+  );
+  const allowlistBlockedTotalGoalsDisplay = getEventMarketDisplayDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001153",
+    question: "USA vs Bosnia and Herzegovina - Total Goals",
+    categories: ["Sports", "FIFA World Cup"],
+    tags: ["soccer_match_tg", "world_cup", "world_cup_prop"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 120 * 3600000).toISOString()
+  }), hardQuestionAllowlistCfg);
+  assertSelfTest(
+    !allowlistBlockedTotalGoalsDisplay.visible && allowlistBlockedTotalGoalsDisplay.reason === "display-sports-total-goals",
+    `display filters should still hide Total Goals side markets, got ${JSON.stringify(allowlistBlockedTotalGoalsDisplay)}`
+  );
+  passed.push("question allowlist blocks auto-buy without hiding exact-score dashboard display");
+
+  const bot4OpenRouterPythonCfg = {
+    ...testCfg,
+    minEventDurationHours: 0,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: ["Price"],
+    eventIntelBuyFilter: "off",
+    marketQuestionAllowlistRegex: null,
+    marketBuyQuestionAllowlistRegex: /highest.*Python.*usage.*OpenRouter|AI 模型.*OpenRouter.*Python.*使用量.*最高/i
+  };
+  const bot4OpenRouterDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001150",
+    question: "Which AI model will have the highest Python usage on OpenRouter on June 23rd?",
+    categories: ["AI"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), bot4OpenRouterPythonCfg);
+  assertSelfTest(
+    bot4OpenRouterDecision.eligible,
+    `Bot4 buy allowlist should allow OpenRouter Python usage, got ${JSON.stringify(bot4OpenRouterDecision)}`
+  );
+  const bot4BlockedDailyVolumeDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001151",
+    question: "BNB/USDT Futures Daily Volume, June 23rd?",
+    categories: ["Crypto"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), bot4OpenRouterPythonCfg);
+  assertSelfTest(
+    !bot4BlockedDailyVolumeDecision.eligible && bot4BlockedDailyVolumeDecision.reason === "buy-question-allowlist",
+    `Bot4 buy allowlist should exclude other daily templates, got ${JSON.stringify(bot4BlockedDailyVolumeDecision)}`
+  );
+  const bot4ManualBlockedDailyVolumeDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001152",
+    question: "BNB/USDT Futures Daily Volume, June 23rd?",
+    categories: ["Crypto"],
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), {
+    ...bot4OpenRouterPythonCfg,
+    marketFollowState: {
+      followed: {
+        "0x0000000000000000000000000000000000001152": {
+          market: "0x0000000000000000000000000000000000001152",
+          title: "BNB/USDT Futures Daily Volume"
+        }
+      },
+      blocked: {}
+    }
+  });
+  assertSelfTest(
+    !bot4ManualBlockedDailyVolumeDecision.eligible && bot4ManualBlockedDailyVolumeDecision.reason === "buy-question-allowlist",
+    `manual follow must not bypass Bot4 buy allowlist, got ${JSON.stringify(bot4ManualBlockedDailyVolumeDecision)}`
+  );
+  passed.push("Bot4 buy allowlist can hard-limit OpenRouter Python usage targets while display stays broad");
+
+  const intelStrongCfg = {
+    ...testCfg,
+    minEventDurationHours: 0,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: ["Price"],
+    eventIntelBuyFilter: "strong",
+    eventIntelBuyFile: path.join(os.tmpdir(), `42space-missing-intel-${Date.now()}.jsonl`)
+  };
+  const localStrongDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001246",
+    question: "HYPE vs BNB: Higher FDV on Dec 31st 2026?",
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), intelStrongCfg);
+  assertSelfTest(
+    localStrongDecision.eligible && localStrongDecision.tags.includes("Binance strong"),
+    `local Binance strong topic should pass Bot2 intel filter, got ${JSON.stringify(localStrongDecision)}`
+  );
+  const bnbDailyDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001247",
+    question: "BNB/USDT Futures Daily Volume, June 2nd?",
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+  }), intelStrongCfg);
+  assertSelfTest(
+    !bnbDailyDecision.eligible && bnbDailyDecision.reason === "event-intel-missing",
+    `BNB daily fixed template should not pass Bot2 strong filter by ticker alone, got ${JSON.stringify(bnbDailyDecision)}`
+  );
+  const fixedDailyWithBinanceSourceDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001251",
+    question: "BTC/USDT Futures Daily Volume, June 3rd?",
+    description: "Primary Resolution Source: https://www.binance.com/en/futures/funding-history/1",
+    createdAt: "2030-06-01T00:00:00Z",
+    startDate: "2030-06-03T00:00:00Z",
+    endDate: "2030-06-03T12:00:00Z"
+  }), intelStrongCfg);
+  assertSelfTest(
+    !fixedDailyWithBinanceSourceDecision.eligible && fixedDailyWithBinanceSourceDecision.reason === "event-intel-archive",
+    `Fixed daily template should stay archived before local Binance source matching, got ${JSON.stringify(fixedDailyWithBinanceSourceDecision)}`
+  );
+  const genericBinanceChartDecision = getEventMarketDecision(mockEventMarket({
+    address: "0x0000000000000000000000000000000000001252",
+    question: "How much will ETH appreciate following Vitalik's post?",
+    description: "Resolution Source: https://www.binance.com/en/trade/ETH_USDT?type=spot",
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 7 * 24 * 3600000).toISOString()
+  }), intelStrongCfg);
+  assertSelfTest(
+    !genericBinanceChartDecision.eligible && genericBinanceChartDecision.reason === "event-intel-missing",
+    `Generic Binance chart resolution source should not pass Bot2 strong filter, got ${JSON.stringify(genericBinanceChartDecision)}`
+  );
+
+  const followRuleLibraryCfg = {
+    ...testCfg,
+    ...FOLLOW_RULE_LIBRARY_CONFIG,
+    eventIntelBuyFile: path.join(os.tmpdir(), `42space-follow-rule-library-missing-${Date.now()}.jsonl`),
+    marketFollowState: { followed: {}, blocked: {} }
+  };
+  for (const entry of FOLLOW_RULE_EVENT_LIBRARY) {
+    const decision = getEventMarketDecision(entry.market, followRuleLibraryCfg);
+    const displayDecision = getEventMarketDisplayDecision(entry.market, followRuleLibraryCfg, decision);
+    assertSelfTest(
+      decision.eligible === entry.expected.eligible,
+      `${entry.id} expected eligible=${entry.expected.eligible}, got ${JSON.stringify(decision)}`
+    );
+    if (entry.expected.reason) {
+      assertSelfTest(
+        decision.reason === entry.expected.reason,
+        `${entry.id} expected reason=${entry.expected.reason}, got ${JSON.stringify(decision)}`
+      );
+    }
+    if (entry.expected.defaultFollowed !== undefined) {
+      assertSelfTest(
+        Boolean(decision.follow?.defaultFollowed) === entry.expected.defaultFollowed,
+        `${entry.id} expected defaultFollowed=${entry.expected.defaultFollowed}, got ${JSON.stringify(decision.follow)}`
+      );
+    }
+    for (const tag of entry.expected.tagsAny ?? []) {
+      assertSelfTest(
+        (decision.tags ?? []).includes(tag),
+        `${entry.id} expected tag ${tag}, got ${JSON.stringify(decision.tags)}`
+      );
+    }
+    if (entry.expected.displayVisible !== undefined) {
+      assertSelfTest(
+        Boolean(displayDecision.visible) === entry.expected.displayVisible,
+        `${entry.id} expected displayVisible=${entry.expected.displayVisible}, got ${JSON.stringify(displayDecision)}`
+      );
+    }
+    if (entry.expected.displayNotify !== undefined) {
+      assertSelfTest(
+        Boolean(displayDecision.notify) === entry.expected.displayNotify,
+        `${entry.id} expected displayNotify=${entry.expected.displayNotify}, got ${JSON.stringify(displayDecision)}`
+      );
+    }
+    if (entry.expected.displayReason) {
+      assertSelfTest(
+        displayDecision.reason === entry.expected.displayReason,
+        `${entry.id} expected displayReason=${entry.expected.displayReason}, got ${JSON.stringify(displayDecision)}`
+      );
+    }
+    for (const tag of entry.expected.displayTagsAny ?? []) {
+      assertSelfTest(
+        (displayDecision.tags ?? []).includes(tag),
+        `${entry.id} expected display tag ${tag}, got ${JSON.stringify(displayDecision.tags)}`
+      );
+    }
+  }
+  passed.push("follow-rule event library matches Bot2 display, notify, default-follow, and fixed-template exclusions");
+
+  const noDisplayFilterCfg = {
+    ...followRuleLibraryCfg,
+    eventDisplayFilterRules: []
+  };
+  for (const entry of FOLLOW_RULE_EVENT_LIBRARY.filter((item) => item.expected.displayVisible === false)) {
+    const displayDecision = getEventMarketDisplayDecision(entry.market, noDisplayFilterCfg);
+    assertSelfTest(
+      displayDecision.visible && displayDecision.notify,
+      `${entry.id} should display and notify when all display filters are disabled, got ${JSON.stringify(displayDecision)}`
+    );
+  }
+  passed.push("empty display-filter rule list shows every data-complete monitored library event");
+
+  const dailyTemplateOnlyDisplayCfg = {
+    ...followRuleLibraryCfg,
+    eventDisplayIncludeRules: ["daily_fixed_template"]
+  };
+  for (const entry of FOLLOW_RULE_EVENT_LIBRARY) {
+    const displayDecision = getEventMarketDisplayDecision(entry.market, dailyTemplateOnlyDisplayCfg);
+    const shouldDisplay = entry.expected.displayReason === "display-fixed-template";
+    assertSelfTest(
+      Boolean(displayDecision.visible) === shouldDisplay,
+      `${entry.id} daily-template include expected visible=${shouldDisplay}, got ${JSON.stringify(displayDecision)}`
+    );
+    assertSelfTest(
+      Boolean(displayDecision.notify) === shouldDisplay,
+      `${entry.id} daily-template include expected notify=${shouldDisplay}, got ${JSON.stringify(displayDecision)}`
+    );
+    assertSelfTest(
+      shouldDisplay
+        ? displayDecision.reason === "display-include-daily-fixed-template"
+        : displayDecision.reason === "display-include-miss",
+      `${entry.id} daily-template include reason mismatch, got ${JSON.stringify(displayDecision)}`
+    );
+  }
+  passed.push("display include rules can show only daily fixed templates for Bot4");
+
+  const intelReportDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-intel-buy-test-"));
+  try {
+    const intelReportFile = path.join(intelReportDir, "event-intel.jsonl");
+    const reportRows = [
+      {
+        market: "0x0000000000000000000000000000000000001248",
+        binanceRelation: "strong",
+        fixedTemplate: false,
+        eventKind: "non-template"
+      },
+      {
+        market: "0x0000000000000000000000000000000000001249",
+        binanceRelation: "medium",
+        fixedTemplate: false,
+        eventKind: "non-template"
+      },
+      {
+        market: "0x0000000000000000000000000000000000001250",
+        binanceRelation: "strong",
+        fixedTemplate: true,
+        eventKind: "fixed-template"
+      }
+    ];
+    fs.writeFileSync(intelReportFile, `${reportRows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+    const reportStrongDecision = getEventMarketDecision(mockEventMarket({
+      address: "0x0000000000000000000000000000000000001248",
+      question: "A report-only Binance strong event?",
+      startDate: new Date(Date.now() + 60000).toISOString(),
+      endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+    }), { ...intelStrongCfg, eventIntelBuyFile: intelReportFile });
+    assertSelfTest(
+      reportStrongDecision.eligible && reportStrongDecision.tags.includes("情报报告命中"),
+      `JSONL Binance strong report should pass Bot2 intel filter, got ${JSON.stringify(reportStrongDecision)}`
+    );
+    const reportMediumDecision = getEventMarketDecision(mockEventMarket({
+      address: "0x0000000000000000000000000000000000001249",
+      question: "A report-only Binance medium event?",
+      startDate: new Date(Date.now() + 60000).toISOString(),
+      endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+    }), { ...intelStrongCfg, eventIntelBuyFile: intelReportFile });
+    assertSelfTest(
+      !reportMediumDecision.eligible && reportMediumDecision.reason === "event-intel-relation",
+      `JSONL Binance medium report should not pass Bot2 intel filter, got ${JSON.stringify(reportMediumDecision)}`
+    );
+    const archivedStrongDecision = getEventMarketDecision(mockEventMarket({
+      address: "0x0000000000000000000000000000000000001250",
+      question: "A fixed-template Binance strong report?",
+      startDate: new Date(Date.now() + 60000).toISOString(),
+      endDate: new Date(Date.now() + 24 * 3600000).toISOString()
+    }), { ...intelStrongCfg, eventIntelBuyFile: intelReportFile });
+    assertSelfTest(
+      !archivedStrongDecision.eligible && archivedStrongDecision.reason === "event-intel-archive",
+      `Archived fixed-template strong report should not pass Bot2 intel filter, got ${JSON.stringify(archivedStrongDecision)}`
+    );
+  } finally {
+    fs.rmSync(intelReportDir, { recursive: true, force: true });
+  }
+  passed.push("Bot2 strong intelligence filter gates auto-buy without reviving fixed-template buys");
+
   const openRouterDailyMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000147",
     question: "Total Daily Token Usage by OpenClaw via OpenRouter on May 27th?",
@@ -1669,7 +3663,49 @@ async function selfTest(cfg) {
       !marketFilterDecision(restNewFilteredMarket, testCfg).eligible,
     "REST raw discovery should still notice newly filtered markets"
   );
-  passed.push("REST raw discovery tracks filtered markets after seed");
+  const restKnownEligibleState = createRestDiscoveryState();
+  const restKnownEligibleMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000000150",
+    question: "Known future long market",
+    status: "not_started",
+    createdAt: new Date(Date.now()).toISOString(),
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 72 * 3600000).toISOString()
+  });
+  rememberRestDiscoveryMarkets(restKnownEligibleState, [restKnownEligibleMarket]);
+  const knownRestCandidates = collectRestDiscoveryCandidates(
+    testCfg,
+    new Set(),
+    new Map(),
+    restKnownEligibleState,
+    [restKnownEligibleMarket]
+  );
+  assertSelfTest(
+    knownRestCandidates.candidates.length === 1 && knownRestCandidates.knownFutureEligible === 1,
+    `known future eligible REST market should become a candidate, got ${JSON.stringify(knownRestCandidates)}`
+  );
+  const restOldSeedState = createRestDiscoveryState();
+  const restOldSeedMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000000151",
+    question: "Old future long market",
+    status: "not_started",
+    createdAt: new Date(restOldSeedState.startedAtMs - 60000).toISOString(),
+    startDate: new Date(Date.now() + 60000).toISOString(),
+    endDate: new Date(Date.now() + 72 * 3600000).toISOString()
+  });
+  rememberRestDiscoveryMarkets(restOldSeedState, [restOldSeedMarket]);
+  const oldSeedCandidates = collectRestDiscoveryCandidates(
+    testCfg,
+    new Set(),
+    new Map(),
+    restOldSeedState,
+    [restOldSeedMarket]
+  );
+  assertSelfTest(
+    oldSeedCandidates.candidates.length === 1 && oldSeedCandidates.knownFutureEligible === 1,
+    "known future REST markets should be rechecked after seed when they are eligible and not pending"
+  );
+  passed.push("REST raw discovery tracks filtered markets and rechecks known future eligible markets after seed");
 
   assertSelfTest(
     routerApprovalRequiredUsdt(testCfg) === 100,
@@ -1782,6 +3818,10 @@ async function selfTest(cfg) {
   const nearFundingStatus = { funding: { nextBatchStartDate: new Date(Date.now() + 29 * 60 * 1000).toISOString() } };
   assertSelfTest(!shouldNotifyFundingWait(farFundingStatus), "far low-funds state should stay in logs/dashboard only");
   assertSelfTest(shouldNotifyFundingWait(nearFundingStatus), "near-opening low-funds state should notify Feishu");
+  assertSelfTest(
+    shouldNotifyFundingWait(farFundingStatus, { armFundingNotifyWindowMs: 18 * 60 * 60 * 1000 }),
+    "profile funding notify window can alert before the default near-opening window"
+  );
 
   const alertStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-alert-state-test-"));
   try {
@@ -1865,6 +3905,26 @@ function tokenOrderOutcomes() {
     { tokenId: "16", name: "E" },
     { tokenId: "32", name: "F" }
   ];
+}
+
+function mockFifaExactScoreOutcomes({ homePrice, awayPrice, drawPrice }) {
+  const rows = [
+    ["ECU 0-0 CUW", drawPrice],
+    ["ECU 1-1 CUW", drawPrice],
+    ["ECU 2-2 CUW", drawPrice],
+    ["ECU 1-0 CUW", homePrice],
+    ["ECU 2-0 CUW", homePrice],
+    ["ECU 2-1 CUW", homePrice],
+    ["ECU 0-1 CUW", awayPrice],
+    ["ECU 0-2 CUW", awayPrice],
+    ["ECU 1-2 CUW", awayPrice]
+  ];
+  return rows.map(([name, price], index) => ({
+    tokenId: (1n << BigInt(index)).toString(),
+    name,
+    price,
+    payout: price > 0 ? 1 / price : null
+  }));
 }
 
 function assertSelfTest(condition, message) {
@@ -1990,6 +4050,22 @@ async function minimal(cfg, args) {
   cfg.eligibilityAck = "YES";
 
   const approval = await approveRouterMax(cfg, { requiredUsdt: eventPlan.totalStakeUsdt });
+  await appendGasLedgerFromExecution(cfg, approval, {
+    action: "approval",
+    source: "minimal-buy-router-approval",
+    wallet: approval.address,
+    txHashKey: "approveHash",
+    fieldPrefix: "approve",
+    metadata: { router: approval.router, requiredAllowance: approval.requiredAllowance }
+  });
+  await appendGasLedgerFromExecution(cfg, approval, {
+    action: "approval",
+    source: "minimal-buy-router-approval-reset",
+    wallet: approval.address,
+    txHashKey: "resetHash",
+    fieldPrefix: "reset",
+    metadata: { router: approval.router, requiredAllowance: approval.requiredAllowance }
+  });
   console.log(JSON.stringify({ level: "minimal-approval", approval }, null, 2));
 
   const runtime = await createRuntime(cfg);
@@ -1998,6 +4074,11 @@ async function minimal(cfg, args) {
     "buy-single",
     () => buyOutcomesBatch(cfg, eventPlan, runtime)
   );
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "buy",
+    source: "minimal-buy-result",
+    allocations: gasAllocationsFromEventPlan(eventPlan)
+  });
   appendJsonl(cfg.fillsFile, {
     plan: described,
     result,
@@ -2028,6 +4109,8 @@ async function arm(cfg, args) {
     eventBuyMode: cfg.eventBuyMode,
     restDiscoveryEnabled: cfg.restDiscoveryEnabled,
     restDiscoveryPollMs: cfg.restDiscoveryPollMs,
+    eventDiscoveryFeedFile: cfg.eventDiscoveryFeedFile || null,
+    eventDiscoveryFeedPollMs: cfg.eventDiscoveryFeedPollMs,
     stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
     eventOutcomeSelection: cfg.eventOutcomeSelection,
     eventOutcomeCount: cfg.eventOutcomeCount,
@@ -2048,6 +4131,13 @@ async function arm(cfg, args) {
     allowPreopenBroadcast: cfg.allowPreopenBroadcast,
     prebroadcastMs: cfg.prebroadcastMs,
     openBroadcastDelayMs: cfg.openBroadcastDelayMs,
+    openBroadcastMode: cfg.openBroadcastMode,
+    openBroadcastBlockTargetOffsetMs: cfg.openBroadcastBlockTargetOffsetMs,
+    openBroadcastBlockAwareLeadMs: cfg.openBroadcastBlockAwareLeadMs,
+    openBroadcastBlockAwareMaxWaitMs: cfg.openBroadcastBlockAwareMaxWaitMs,
+    openBroadcastBlockAwarePreTargetCount: cfg.openBroadcastBlockAwarePreTargetCount,
+    openBroadcastBlockAwarePreTargetSendMs: cfg.openBroadcastBlockAwarePreTargetSendMs,
+    openBroadcastBlockAwareHeadMaxAgeMs: cfg.openBroadcastBlockAwareHeadMaxAgeMs,
     openBroadcastScheduleAheadMs: cfg.openBroadcastScheduleAheadMs,
     openBroadcastSpinMs: cfg.openBroadcastSpinMs,
     armWaitForFunding: cfg.armWaitForFunding,
@@ -2078,6 +4168,25 @@ async function arm(cfg, args) {
     note: "private key is held only in this process; it is not written to disk"
   }, null, 2));
 
+  let runtime = null;
+  let autoSellMonitor;
+  let autoSellStartedBeforeFunding = false;
+  if (shouldStartAutoSellBeforeFunding(cfg)) {
+    runtime = await createRuntime(cfg);
+    autoSellMonitor = startAutoSellMonitor(cfg, runtime);
+    autoSellStartedBeforeFunding = Boolean(autoSellMonitor);
+    console.log(JSON.stringify({
+      level: "event-arm-auto-sell-before-funding",
+      started: autoSellStartedBeforeFunding,
+      sharedRuntime: Boolean(runtime),
+      transactionLock: Boolean(runtime?.txLock),
+      waitForFunding: true,
+      autoSellStrategy: cfg.autoSellStrategy,
+      autoSellPollMs: cfg.autoSellPollMs,
+      at: new Date().toISOString()
+    }));
+  }
+
   let fundingRecovery = null;
   if (cfg.armWaitForFunding) {
     const waitingSince = Date.now();
@@ -2102,7 +4211,11 @@ async function arm(cfg, args) {
     cooldownMs: cfg.feishuAlertCooldownMs
   });
 
-  await watch(cfg, { fundingRecovery });
+  await watch(cfg, {
+    fundingRecovery,
+    ...(runtime !== null ? { runtime } : {}),
+    ...(autoSellMonitor !== undefined ? { autoSellMonitor, autoSellStartedBeforeFunding } : {})
+  });
 }
 
 async function preflight(cfg) {
@@ -2110,7 +4223,7 @@ async function preflight(cfg) {
   const status = await getWalletStatus(cfg);
   const chain = await loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks });
   const funding = computeFundingRequirement(cfg, chain.eventMarkets);
-  const gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
+  const gasReserve = await estimateFundingGasReserve(publicClient, cfg, funding);
   console.log(
     JSON.stringify(
       {
@@ -2132,6 +4245,22 @@ async function preflight(cfg) {
 
 async function approve(cfg) {
   const result = await approveRouterMax(cfg, { requiredUsdt: routerApprovalRequiredUsdt(cfg) });
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "approval",
+    source: "router-approval-cli",
+    wallet: result.address,
+    txHashKey: "approveHash",
+    fieldPrefix: "approve",
+    metadata: { router: result.router, requiredAllowance: result.requiredAllowance }
+  });
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "approval",
+    source: "router-approval-reset-cli",
+    wallet: result.address,
+    txHashKey: "resetHash",
+    fieldPrefix: "reset",
+    metadata: { router: result.router, requiredAllowance: result.requiredAllowance }
+  });
   console.log(JSON.stringify({ level: "router-approval", result }, null, 2));
 }
 
@@ -2163,12 +4292,14 @@ async function doctor(cfg, args = {}) {
     chainFundingError = errorMessage(error);
   }
   try {
-    gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
+    gasReserve = await estimateFundingGasReserve(publicClient, cfg, funding);
   } catch (error) {
     gasReserve = { ok: false, message: errorMessage(error) };
   }
   const checks = {
     config: {
+      botName: cfg.botName,
+      profileRole: cfg.profileRole || "",
       dryRun: cfg.dryRun,
       execute: cfg.execute,
       privateKeyPresent: Boolean(cfg.privateKey),
@@ -2354,6 +4485,7 @@ async function createRuntime(cfg) {
   const runtime = {
     receiverAddress: cfg.walletAddress || account.address,
     pendingBuyRecords: null,
+    openBroadcastBlockClock: null,
     autoSellOperatorReadyMarkets: new Set(),
     txLock: {
       owner: null,
@@ -2381,15 +4513,43 @@ function runtimeTransactionLockInfo(runtime) {
   };
 }
 
+function shouldStartAutoSellBeforeFunding(cfg) {
+  return Boolean(cfg?.armWaitForFunding && cfg?.autoSellEnabled);
+}
+
+async function waitForRuntimeTransactionIdle(runtime, reason, { timeoutMs = 60000, pollMs = 250 } = {}) {
+  if (!runtimeTransactionBusy(runtime)) return;
+  const deadline = Date.now() + timeoutMs;
+  while (runtimeTransactionBusy(runtime)) {
+    if (Date.now() >= deadline) {
+      const lock = runtimeTransactionLockInfo(runtime);
+      throw new Error(`Timed out waiting for transaction lock to clear before ${reason}: ${lock?.owner ?? "unknown"}`);
+    }
+    await sleep(pollMs);
+  }
+}
+
 function pauseRuntimeAutoSell(runtime, cfg, reason) {
   if (!runtime) return;
-  const holdMs = Math.max(
-    cfg.autoSellPollMs,
-    cfg.preSignWindowMs + eventOpenWindowMs(cfg) + 5000
-  );
+  const holdMs = autoSellPresignPauseHoldMs(cfg);
   const until = Date.now() + holdMs;
   runtime.autoSellPausedUntil = Math.max(runtime.autoSellPausedUntil ?? 0, until);
   runtime.autoSellPauseReason = reason;
+}
+
+function autoSellPresignPauseHoldMs(cfg) {
+  if (cfg.autoSellStrategy === "open_timed_exit") {
+    return Math.max(
+      cfg.autoSellPollMs,
+      Number(cfg.preSignWindowMs ?? 0) +
+        Number(cfg.openBroadcastDelayMs ?? eventOpenWindowMs(cfg)) +
+        Math.max(1000, Number(cfg.autoSellPollMs ?? 0))
+    );
+  }
+  return Math.max(
+    cfg.autoSellPollMs,
+    cfg.preSignWindowMs + eventOpenWindowMs(cfg) + 5000
+  );
 }
 
 function runtimeAutoSellPauseInfo(runtime) {
@@ -2477,10 +4637,23 @@ async function withRuntimeTransactionLock(runtime, owner, fn) {
 
 async function watch(cfg, options = {}) {
   const seen = loadSeen(cfg.stateFile);
-  await ensureStartupRouterApproval(cfg);
+  const runtime = Object.prototype.hasOwnProperty.call(options, "runtime")
+    ? options.runtime
+    : await createRuntime(cfg);
+  if (options.autoSellStartedBeforeFunding && runtime) {
+    pauseRuntimeAutoSell(runtime, cfg, "funding-ready-watch-start");
+    await waitForRuntimeTransactionIdle(runtime, "watch-start-after-funding");
+  }
+  const startupApproval = await withRuntimeTransactionLock(
+    runtime,
+    "startup-router-approval",
+    () => ensureStartupRouterApproval(cfg)
+  );
+  if (startupApproval?.approved || startupApproval?.approveHash || startupApproval?.resetHash) {
+    await syncRuntimeNonceAfterExternalTx(cfg, runtime, "startup-router-approval");
+  }
   const watchPreflight = await validateWatchFunding(cfg);
   const broadcastWarmup = await maybeWarmBroadcastRpcs(cfg);
-  const runtime = await createRuntime(cfg);
   const initialPending = new Map();
   attachRuntimePendingBuyRecords(runtime, initialPending);
   const startupWarnings = [];
@@ -2490,7 +4663,11 @@ async function watch(cfg, options = {}) {
     startupWarnings.push(...(await seedStartupMarkets(cfg, seen, initialPending, runtime, options)));
   }
 
-  const autoSellMonitor = startAutoSellMonitor(cfg, runtime);
+  const autoSellMonitorPrestarted = Object.prototype.hasOwnProperty.call(options, "autoSellMonitor");
+  const autoSellMonitor = autoSellMonitorPrestarted
+    ? options.autoSellMonitor
+    : startAutoSellMonitor(cfg, runtime);
+  const openBroadcastBlockClock = maybeStartOpenBroadcastBlockClock(cfg, runtime);
 
   console.log(
     JSON.stringify(
@@ -2501,12 +4678,15 @@ async function watch(cfg, options = {}) {
         maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
         maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
         eventDiscovery: cfg.eventDiscovery,
+        eventDiscoveryFeedFile: cfg.eventDiscoveryFeedFile || null,
+        eventDiscoveryFeedPollMs: cfg.eventDiscoveryFeedPollMs,
         wsProvider: wsProviderLabel(cfg.wsUrl),
         eventBuyMode: cfg.eventBuyMode,
         eventOutcomeSelection: cfg.eventOutcomeSelection,
         eventOutcomeCount: cfg.eventOutcomeCount,
         eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
         filterMode: cfg.filterMode ?? "production",
+        marketQuestionAllowlistRegex: cfg.marketQuestionAllowlistRegex?.source ?? null,
         minEventDurationHours: cfg.minEventDurationHours,
         marketCategoryBlocklist: cfg.marketCategoryBlocklist,
         marketTagBlocklist: cfg.marketTagBlocklist,
@@ -2548,6 +4728,14 @@ async function watch(cfg, options = {}) {
         preopenHotMs: cfg.preopenHotMs,
         prebroadcastMs: cfg.prebroadcastMs,
         openBroadcastDelayMs: cfg.openBroadcastDelayMs,
+        openBroadcastMode: cfg.openBroadcastMode,
+        openBroadcastBlockTargetOffsetMs: cfg.openBroadcastBlockTargetOffsetMs,
+        openBroadcastBlockAwareLeadMs: cfg.openBroadcastBlockAwareLeadMs,
+        openBroadcastBlockAwareMaxWaitMs: cfg.openBroadcastBlockAwareMaxWaitMs,
+        openBroadcastBlockAwarePreTargetCount: cfg.openBroadcastBlockAwarePreTargetCount,
+        openBroadcastBlockAwarePreTargetSendMs: cfg.openBroadcastBlockAwarePreTargetSendMs,
+        openBroadcastBlockAwareHeadMaxAgeMs: cfg.openBroadcastBlockAwareHeadMaxAgeMs,
+        openBroadcastBlockClockActive: Boolean(openBroadcastBlockClock?.unwatch),
         openBroadcastScheduleAheadMs: cfg.openBroadcastScheduleAheadMs,
         openBroadcastSpinMs: cfg.openBroadcastSpinMs,
         rpcKeepaliveMs: cfg.rpcKeepaliveMs,
@@ -2565,6 +4753,16 @@ async function watch(cfg, options = {}) {
               stopLossEnabled: cfg.autoSellStopLossEnabled,
               stopLossPercent: cfg.autoSellStopLossPercent,
               stopLossSellPercent: cfg.autoSellStopLossSellPercent,
+              ladderProfitPercent: cfg.autoSellLadderProfitPercent,
+              openExitDelaySeconds: cfg.autoSellOpenExitDelaySeconds,
+              openExitPercent: cfg.autoSellOpenExitPercent,
+              fastOpenExitEnabled: cfg.autoSellFastOpenExitEnabled,
+              fastOpenExitMinDelayMs: cfg.autoSellFastOpenExitMinDelayMs,
+              fastOpenExitMaxDelayMs: cfg.autoSellFastOpenExitMaxDelayMs,
+              takeProfitSteps: cfg.autoSellTakeProfitSteps,
+              beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+              marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+              gasPriceGwei: cfg.autoSellGasPriceGwei || cfg.gasPriceGwei || null,
               pollMs: cfg.autoSellPollMs,
               buyGuardBeforeMs: cfg.autoSellBuyGuardBeforeMs,
               buyGuardAfterMs: cfg.autoSellBuyGuardAfterMs,
@@ -2573,7 +4771,9 @@ async function watch(cfg, options = {}) {
               maxOutcomesPerTx: cfg.autoSellMaxOutcomesPerTx,
               maxMarketsPerTx: cfg.autoSellMaxMarketsPerTx,
               maxGasPerTx: cfg.autoSellMaxGasPerTx,
-              maxTxPerTick: cfg.autoSellMaxTxPerTick
+              maxTxPerTick: cfg.autoSellMaxTxPerTick,
+              monitorSource: autoSellMonitorPrestarted ? "pre-funding" : "watch",
+              startedBeforeFunding: Boolean(options.autoSellStartedBeforeFunding)
             }
           : { enabled: false }
       },
@@ -2593,6 +4793,10 @@ async function watch(cfg, options = {}) {
     await watchChain(cfg, seen, runtime, initialPending);
     return;
   }
+  if (cfg.eventDiscovery === "feed") {
+    await watchFeed(cfg, seen, runtime, initialPending);
+    return;
+  }
 
   await watchRest(cfg, seen, runtime, initialPending);
 }
@@ -2608,6 +4812,7 @@ function startAutoSellMonitor(cfg, runtime = null) {
   if (!cfg.autoSellEnabled) return null;
   const seen = loadSeen(cfg.autoSellStateFile);
   let running = false;
+  let consecutiveTransientPositionsErrors = 0;
 
   const tick = async () => {
     if (running) return;
@@ -2618,6 +4823,46 @@ function startAutoSellMonitor(cfg, runtime = null) {
         runtime,
         source: "monitor"
       });
+      if (result.transientPositionsError) {
+        consecutiveTransientPositionsErrors += 1;
+        console.warn(JSON.stringify({
+          level: "event-auto-sell-transient",
+          source: "monitor",
+          reason: result.skippedReason,
+          consecutive: consecutiveTransientPositionsErrors,
+          message: result.transientPositionsError.message,
+          at: new Date().toISOString()
+        }));
+        if (
+          consecutiveTransientPositionsErrors >= AUTO_SELL_TRANSIENT_POSITIONS_ALERT_AFTER &&
+          consecutiveTransientPositionsErrors % AUTO_SELL_TRANSIENT_POSITIONS_ALERT_AFTER === 0
+        ) {
+          notifyFeishu(cfg, {
+            title: "持仓接口连续异常",
+            level: "warn",
+            fields: {
+              status: "自动卖出等待持仓接口恢复",
+              message: result.transientPositionsError.message,
+              action: "接口恢复后自动继续",
+              retryMs: cfg.autoSellPollMs
+            },
+            dedupeKey: "auto-sell-positions-transient",
+            cooldownMs: cfg.autoSellAlertCooldownMs,
+            fingerprint: `positions-transient:${result.transientPositionsError.message}`,
+            repeatMs: 0
+          });
+        }
+        return;
+      }
+      if (consecutiveTransientPositionsErrors > 0) {
+        console.log(JSON.stringify({
+          level: "event-auto-sell-transient-recovered",
+          source: "monitor",
+          consecutive: consecutiveTransientPositionsErrors,
+          at: new Date().toISOString()
+        }));
+        consecutiveTransientPositionsErrors = 0;
+      }
       if (result.executed > 0 || result.errors.length > 0 || result.circuitBreaker?.opened) {
         const circuitOpened = result.circuitBreaker?.opened;
         console.log(JSON.stringify({
@@ -2689,6 +4934,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     triggered: 0,
     executed: 0,
     skipped: 0,
+    disabled: 0,
     cooldowns: 0,
     errors: [],
     actions: []
@@ -2711,10 +4957,22 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     return result;
   }
 
-  const openPositions = await fetchOpenPositions(cfg, {
-    user: walletAddress,
-    limit: cfg.autoSellPositionLimit
-  });
+  let openPositions;
+  try {
+    openPositions = await fetchOpenPositions(cfg, {
+      user: walletAddress,
+      limit: cfg.autoSellPositionLimit
+    });
+  } catch (error) {
+    const message = autoSellErrorMessage(cfg, error);
+    if (source === "monitor" && isTransientPositionsFetchErrorMessage(message)) {
+      result.skipped += 1;
+      result.skippedReason = "positions-fetch-transient-error";
+      result.transientPositionsError = { message };
+      return result;
+    }
+    throw error;
+  }
   const eligibleMarkets = loadAutoSellEligibleMarkets(cfg);
   const ladderState = loadAutoSellPositionState(cfg.autoSellPositionStateFile);
   const allItems = [];
@@ -2734,6 +4992,13 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 
     result.checked += 1;
     const key = autoSellPositionKey(walletAddress, position);
+    const autoSellCfg = autoSellConfigForPosition(cfg, position);
+    if (!isAutoSellEnabledForPosition(autoSellCfg)) {
+      result.skipped += 1;
+      result.disabled += 1;
+      continue;
+    }
+
     const cooldown = autoSellFailureCooldownInfo(circuitState, key, now);
     if (cooldown) {
       result.skipped += 1;
@@ -2748,11 +5013,11 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         continue;
       }
 
-      const action = await buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
+      const action = await buildAutoSellAction(autoSellCfg, publicClient, walletAddress, position, entry, now);
       if (!action) continue;
 
       result.triggered += 1;
-      allItems.push({ key, entry, position, ...action });
+      allItems.push({ key, entry, position, autoSellCfg, ...action });
     } catch (error) {
       const message = autoSellErrorMessage(cfg, error);
       const failure = recordAutoSellFailure(cfg, circuitState, {
@@ -2795,7 +5060,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     });
   }
 
-  const allActions = allItems.map(({ plan, entry, position, ...action }) => ({
+  const allActions = allItems.map(({ plan, entry, position, autoSellCfg, ...action }) => ({
     ...action,
     status: cfg.dryRun || !cfg.execute ? "dry-run" : "pending"
   }));
@@ -2809,15 +5074,37 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 
   const readyItems = [];
   const waitingForApproval = [];
+  const retainedNoSellItems = [];
   for (let index = 0; index < allItems.length; index += 1) {
     const item = allItems[index];
     const action = allActions[index];
+    if (item.noSell) {
+      action.status = "retained-to-settlement";
+      retainedNoSellItems.push({ item, action });
+      continue;
+    }
     if (cfg.autoSellRequirePreapprovedOperator && !item.plan.operatorApproved) {
       action.status = "skipped-operator-approval-needed";
       waitingForApproval.push(action);
       continue;
     }
     readyItems.push({ item, action });
+  }
+  if (retainedNoSellItems.length > 0) {
+    for (const { item } of retainedNoSellItems) {
+      markAutoSellActionApplied(item.autoSellCfg ?? cfg, item.entry, item);
+    }
+    saveAutoSellPositionState(cfg.autoSellPositionStateFile, ladderState);
+    const actions = retainedNoSellItems.map(({ action }) => action);
+    result.executed += actions.length;
+    result.actions.push(...actions);
+    appendAutoSellBatchLog(cfg, {
+      source,
+      walletAddress,
+      markets: marketsFromItems(retainedNoSellItems.map(({ item }) => item)),
+      actions,
+      execution: { status: "retained-to-settlement", txHash: null }
+    });
   }
   if (waitingForApproval.length > 0) {
     result.skipped += waitingForApproval.length;
@@ -2959,7 +5246,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 
       execution = await withRuntimeTransactionLock(runtime, "auto-sell-batch", () =>
         sellOutcomesBatch(
-          cfg,
+          autoSellExecutionConfigForItems(cfg, items),
           items.map((item) => item.plan),
           { requirePreapprovedOperator: cfg.autoSellRequirePreapprovedOperator }
         )
@@ -2973,7 +5260,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
       if (execution.status === "success") {
         recordAutoSellSuccess(circuitState, items.map((item) => item.key));
         saveAutoSellCircuitState(cfg.autoSellCircuitStateFile, circuitState);
-        for (const item of items) markAutoSellActionApplied(cfg, item.entry, item);
+        for (const item of items) markAutoSellActionApplied(item.autoSellCfg ?? cfg, item.entry, item);
         saveAutoSellPositionState(cfg.autoSellPositionStateFile, ladderState);
         result.executed += actions.length;
       } else {
@@ -3041,16 +5328,9 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets, runtime, result, source, walletAddress, circuitState }) {
   if (cfg.autoSellApprovalsPerTick <= 0) return 0;
   const { publicClient } = makeClients(cfg);
-  const markets = [];
-  const seenMarkets = new Set();
-  for (const position of openPositions) {
-    if (!isAutoSellablePosition(position)) continue;
-    const marketKey = String(position.marketAddress).toLowerCase();
-    if (!eligibleMarkets.has(marketKey) || seenMarkets.has(marketKey)) continue;
-    if (runtime?.autoSellOperatorReadyMarkets?.has(marketKey)) continue;
-    seenMarkets.add(marketKey);
-    markets.push(position.marketAddress);
-  }
+  const candidates = autoSellOperatorPreapprovalCandidates(cfg, { openPositions, eligibleMarkets, runtime });
+  const markets = candidates.markets;
+  if (candidates.disabled > 0) result.operatorApprovalDisabled = (result.operatorApprovalDisabled ?? 0) + candidates.disabled;
 
   let sent = 0;
   for (const market of markets) {
@@ -3081,6 +5361,11 @@ async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets
         at: new Date().toISOString()
       };
       appendJsonl(cfg.fillsFile, row);
+      await appendGasLedgerFromExecution(cfg, execution, {
+        action: "approval",
+        source: "operator-preapproval",
+        allocations: [{ market, action: "approval", weight: 1 }]
+      });
       if (!result.operatorApprovals) result.operatorApprovals = [];
       result.operatorApprovals.push({
         market,
@@ -3123,6 +5408,27 @@ async function preapproveAutoSellOperators(cfg, { openPositions, eligibleMarkets
   return sent;
 }
 
+function autoSellOperatorPreapprovalCandidates(cfg, { openPositions = [], eligibleMarkets = new Map(), runtime = null } = {}) {
+  const markets = [];
+  const seenMarkets = new Set();
+  let disabled = 0;
+  for (const position of openPositions) {
+    if (!isAutoSellablePosition(position)) continue;
+    const marketKey = String(position.marketAddress).toLowerCase();
+    if (!eligibleMarkets.has(marketKey) || seenMarkets.has(marketKey)) continue;
+    if (runtime?.autoSellOperatorReadyMarkets?.has(marketKey)) continue;
+    const autoSellCfg = autoSellConfigForPosition(cfg, position);
+    if (!isAutoSellEnabledForPosition(autoSellCfg)) {
+      seenMarkets.add(marketKey);
+      disabled += 1;
+      continue;
+    }
+    seenMarkets.add(marketKey);
+    markets.push(position.marketAddress);
+  }
+  return { markets, disabled };
+}
+
 function chunkAutoSellItems(cfg, entries) {
   const chunks = [];
   let current = [];
@@ -3160,36 +5466,73 @@ function marketsFromItems(items) {
   return [...new Set(items.map((item) => item.marketAddress ?? item.plan?.market).filter(Boolean))];
 }
 
-async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
-  const dueAt = autoSellStepDueAt(cfg, entry);
-  const due = now >= dueAt;
-  const costBasisUsdt = Number(position.costBasis ?? 0);
-  let quote = null;
-  let quoteError = null;
-  let fullExitValueUsdt = null;
-  let lossPercent = null;
+function autoSellConfigForPosition(cfg, position) {
+  const planned = plannedBuyForMarket(cfg, {
+    address: position?.marketAddress,
+    question: position?.question?.title
+  });
+  if (!planned?.autoSell) return cfg;
+  const merged = {
+    ...cfg,
+    ...planned.autoSell,
+    plannedAutoSellOverride: {
+      id: planned.id,
+      market: planned.market,
+      question: planned.question
+    }
+  };
+  const retainPosition = autoSellRetainPositionForPosition(merged, position);
+  if (retainPosition) merged.autoSellRetainPosition = retainPosition;
+  return merged;
+}
 
-  try {
-    quote = await quoteSellOutcome(publicClient, {
-      market: position.marketAddress,
-      tokenId: position.tokenId,
-      owner: walletAddress,
-      percent: 100,
-      slippageBps: cfg.slippageBps
-    });
-    fullExitValueUsdt = rawUsdt(quote.expectedCollateralToUser);
-    lossPercent = costBasisUsdt > 0
-      ? Math.max(0, (1 - fullExitValueUsdt / costBasisUsdt) * 100)
-      : 0;
-  } catch (error) {
-    quoteError = autoSellErrorMessage(cfg, error);
+function autoSellRetainPositionForPosition(cfg, position) {
+  const rows = Array.isArray(cfg?.autoSellRetainPositions) ? cfg.autoSellRetainPositions : [];
+  if (rows.length === 0) return null;
+  const outcomeKey = normalizePlannedBuyOutcomeName(position?.outcome?.name);
+  if (!outcomeKey) return null;
+  return rows.find((row) => normalizePlannedBuyOutcomeName(row?.outcome) === outcomeKey) ?? null;
+}
+
+function autoSellExecutionConfigForItems(cfg, items) {
+  const configs = items.map((item) => item.autoSellCfg).filter(Boolean);
+  if (configs.length === 0) return cfg;
+  const gasPriceGwei = configs.find((item) => item.autoSellGasPriceGwei)?.autoSellGasPriceGwei ?? cfg.autoSellGasPriceGwei;
+  return {
+    ...cfg,
+    autoSellGasPriceGwei: gasPriceGwei
+  };
+}
+
+function isAutoSellEnabledForPosition(cfg) {
+  if (cfg?.autoSellEnabled === false) return false;
+  const strategy = String(cfg?.autoSellStrategy ?? "").trim().toLowerCase();
+  return !["hold_to_settlement", "hold", "disabled", "off", "none"].includes(strategy);
+}
+
+async function buildAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+  if (cfg.autoSellStrategy === "open_timed_exit") {
+    return buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
   }
+  if (cfg.autoSellStrategy === "pre_start_exit") {
+    return buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
+  }
+  return buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
+}
+
+async function buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+  const dueAt = autoSellOpenExitDueAt(cfg, position);
+  if (dueAt === null) return null;
+  const due = now >= dueAt;
+  const quoteState = cfg.autoSellStopLossEnabled
+    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry)
+    : defaultAutoSellReturnState(position);
 
   if (
-    quote &&
+    quoteState.quote &&
     cfg.autoSellStopLossEnabled &&
-    lossPercent !== null &&
-    lossPercent >= cfg.autoSellStopLossPercent
+    quoteState.lossPercent !== null &&
+    quoteState.lossPercent >= cfg.autoSellStopLossPercent
   ) {
     const plan = await buildDirectSellPlan(publicClient, {
       market: position.marketAddress,
@@ -3209,18 +5552,466 @@ async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, posit
       tokenId: String(position.tokenId),
       question: position.question?.title ?? null,
       outcome: position.outcome?.name ?? null,
-      costBasisUsdt: roundUsd(costBasisUsdt),
-      fullExitValueUsdt: roundUsd(fullExitValueUsdt),
-      lossPercent: roundUsd(lossPercent),
+      costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+      remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+      fullExitValueUsdt: roundUsd(quoteState.fullExitValueUsdt),
+      profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+      lossPercent: roundUsd(quoteState.lossPercent),
       stopLossPercent: cfg.autoSellStopLossPercent,
       minCollateralOutUsdt: "0.000000000000000001",
       noPriceProtection: true,
-      quoteError,
+      quoteError: quoteState.quoteError,
       txHash: null
     };
   }
 
   if (!due) return null;
+
+  const percent = Number(cfg.autoSellOpenExitPercent ?? 100);
+  const plan = await buildDirectSellPlan(publicClient, {
+    market: position.marketAddress,
+    tokenId: position.tokenId,
+    owner: walletAddress,
+    percent
+  });
+  return {
+    plan,
+    trigger: "open_timed_exit",
+    triggerLabel: "开盘定时卖出",
+    percent,
+    step: entry.nextStep,
+    dueAt: new Date(dueAt).toISOString(),
+    marketOpenDate: autoSellMarketOpenDate(position),
+    delaySeconds: cfg.autoSellOpenExitDelaySeconds,
+    sellAmountOt: formatUnits(plan.amount, 18),
+    marketAddress: position.marketAddress,
+    tokenId: String(position.tokenId),
+    question: position.question?.title ?? null,
+    outcome: position.outcome?.name ?? null,
+    costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+    remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+    fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+    profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+    lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+    minCollateralOutUsdt: "0.000000000000000001",
+    noPriceProtection: true,
+    quoteError: quoteState.quoteError,
+    txHash: null
+  };
+}
+
+function retainedAutoSellFields(retained, plan = null) {
+  const sellAmountOt = plan ? formatUnits(plan.amount, 18) : "0";
+  return {
+    retainedToSettlement: true,
+    retainOutcome: retained.outcome,
+    retainPercent: retained.retainPercent,
+    retainedTargetOt: retained.retainedTargetOt,
+    currentSizeOt: retained.currentSizeOt,
+    remainingAfterSellOt: plan
+      ? autoSellRemainingAfterSellOt(retained.currentSizeOt, plan.amount)
+      : retained.remainingAfterSellOt,
+    sellAmountOt
+  };
+}
+
+async function buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+  const preStartDueAt = autoSellPreStartDueAt(cfg, position);
+  const preStartDue = preStartDueAt !== null && now >= preStartDueAt;
+  const retainedPosition = resolveAutoSellRetainedPosition(cfg, entry, position);
+  const quoteState = cfg.autoSellStopLossEnabled
+    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry)
+    : defaultAutoSellReturnState(position);
+  if (
+    quoteState.quote &&
+    cfg.autoSellStopLossEnabled &&
+    quoteState.lossPercent !== null &&
+    quoteState.lossPercent >= cfg.autoSellStopLossPercent
+  ) {
+    if (retainedPosition) {
+      if (!retainedPosition.shouldSell) {
+        if (!preStartDue) return null;
+        const marketStartDate = autoSellMarketStartDate(cfg, position);
+        return {
+          noSell: true,
+          trigger: "retained_to_settlement",
+          triggerLabel: "留仓到结算",
+          percent: 0,
+          step: entry.nextStep,
+          dueAt: new Date(preStartDueAt).toISOString(),
+          marketStartDate,
+          beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+          marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+          marketAddress: position.marketAddress,
+          tokenId: String(position.tokenId),
+          question: position.question?.title ?? null,
+          outcome: position.outcome?.name ?? null,
+          costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+          remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+          fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+          profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+          lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+          quoteError: quoteState.quoteError,
+          txHash: null,
+          ...retainedAutoSellFields(retainedPosition)
+        };
+      }
+      const plan = await buildDirectSellPlan(publicClient, {
+        market: position.marketAddress,
+        tokenId: position.tokenId,
+        owner: walletAddress,
+        amountOt: retainedPosition.sellAmountOt
+      });
+      return {
+        plan,
+        trigger: "stop_loss_retained_exit",
+        triggerLabel: "止损留仓卖出",
+        percent: null,
+        step: entry.nextStep,
+        dueAt: preStartDueAt === null ? null : new Date(preStartDueAt).toISOString(),
+        marketAddress: position.marketAddress,
+        tokenId: String(position.tokenId),
+        question: position.question?.title ?? null,
+        outcome: position.outcome?.name ?? null,
+        costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+        remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+        fullExitValueUsdt: roundUsd(quoteState.fullExitValueUsdt),
+        profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+        lossPercent: roundUsd(quoteState.lossPercent),
+        stopLossPercent: cfg.autoSellStopLossPercent,
+        minCollateralOutUsdt: "0.000000000000000001",
+        noPriceProtection: true,
+        quoteError: quoteState.quoteError,
+        txHash: null,
+        ...retainedAutoSellFields(retainedPosition, plan)
+      };
+    }
+    const plan = await buildDirectSellPlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      percent: cfg.autoSellStopLossSellPercent
+    });
+    return {
+      plan,
+      trigger: "stop_loss",
+      triggerLabel: "止损",
+      percent: cfg.autoSellStopLossSellPercent,
+      step: entry.nextStep,
+      dueAt: preStartDueAt === null ? null : new Date(preStartDueAt).toISOString(),
+      sellAmountOt: formatUnits(plan.amount, 18),
+      marketAddress: position.marketAddress,
+      tokenId: String(position.tokenId),
+      question: position.question?.title ?? null,
+      outcome: position.outcome?.name ?? null,
+      costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+      remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+      fullExitValueUsdt: roundUsd(quoteState.fullExitValueUsdt),
+      profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+      lossPercent: roundUsd(quoteState.lossPercent),
+      stopLossPercent: cfg.autoSellStopLossPercent,
+      minCollateralOutUsdt: "0.000000000000000001",
+      noPriceProtection: true,
+      quoteError: quoteState.quoteError,
+      txHash: null
+    };
+  }
+
+  if (!preStartDue) return null;
+
+  const marketStartDate = autoSellMarketStartDate(cfg, position);
+  if (retainedPosition) {
+    if (!retainedPosition.shouldSell) {
+      return {
+        noSell: true,
+        trigger: "retained_to_settlement",
+        triggerLabel: "留仓到结算",
+        percent: 0,
+        step: entry.nextStep,
+        dueAt: new Date(preStartDueAt).toISOString(),
+        marketStartDate,
+        beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+        marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+        marketAddress: position.marketAddress,
+        tokenId: String(position.tokenId),
+        question: position.question?.title ?? null,
+        outcome: position.outcome?.name ?? null,
+        costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+        remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+        fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+        profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+        lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+        quoteError: quoteState.quoteError,
+        txHash: null,
+        ...retainedAutoSellFields(retainedPosition)
+      };
+    }
+    const plan = await buildDirectSellPlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      amountOt: retainedPosition.sellAmountOt
+    });
+    return {
+      plan,
+      trigger: "pre_start_retained_exit",
+      triggerLabel: "赛前留仓卖出",
+      percent: null,
+      step: entry.nextStep,
+      dueAt: new Date(preStartDueAt).toISOString(),
+      marketStartDate,
+      beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+      marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+      marketAddress: position.marketAddress,
+      tokenId: String(position.tokenId),
+      question: position.question?.title ?? null,
+      outcome: position.outcome?.name ?? null,
+      costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+      remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+      fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+      profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+      lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+      minCollateralOutUsdt: "0.000000000000000001",
+      noPriceProtection: true,
+      quoteError: quoteState.quoteError,
+      txHash: null,
+      ...retainedAutoSellFields(retainedPosition, plan)
+    };
+  }
+  const plan = await buildDirectSellPlan(publicClient, {
+    market: position.marketAddress,
+    tokenId: position.tokenId,
+    owner: walletAddress,
+    percent: 100
+  });
+  return {
+    plan,
+    trigger: "pre_start_exit",
+    triggerLabel: "赛前清仓",
+    percent: 100,
+    step: entry.nextStep,
+    dueAt: new Date(preStartDueAt).toISOString(),
+    marketStartDate,
+    beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+    marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+    sellAmountOt: formatUnits(plan.amount, 18),
+    marketAddress: position.marketAddress,
+    tokenId: String(position.tokenId),
+    question: position.question?.title ?? null,
+    outcome: position.outcome?.name ?? null,
+    costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+    remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+    fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+    profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+    lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+    minCollateralOutUsdt: "0.000000000000000001",
+    noPriceProtection: true,
+    quoteError: quoteState.quoteError,
+    txHash: null
+  };
+}
+
+async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+  const dueAt = autoSellStepDueAt(cfg, entry);
+  const due = now >= dueAt;
+  const preStartDueAt = autoSellPreStartDueAt(cfg, position);
+  const preStartDue = preStartDueAt !== null && now >= preStartDueAt;
+  const retainedPosition = resolveAutoSellRetainedPosition(cfg, entry, position);
+  const profitGateNeedsQuote = !entry.takeProfitCompleted && due && autoSellLadderProfitGateEnabled(cfg);
+  const quoteState = cfg.autoSellStopLossEnabled || profitGateNeedsQuote
+    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry)
+    : defaultAutoSellReturnState(position);
+  if (
+    quoteState.quote &&
+    cfg.autoSellStopLossEnabled &&
+    quoteState.lossPercent !== null &&
+    quoteState.lossPercent >= cfg.autoSellStopLossPercent
+  ) {
+    if (retainedPosition) {
+      if (!retainedPosition.shouldSell) {
+        if (!preStartDue) return null;
+        const marketStartDate = autoSellMarketStartDate(cfg, position);
+        return {
+          noSell: true,
+          trigger: "retained_to_settlement",
+          triggerLabel: "留仓到结算",
+          percent: 0,
+          step: entry.nextStep,
+          dueAt: new Date(preStartDueAt).toISOString(),
+          marketStartDate,
+          beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+          marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+          marketAddress: position.marketAddress,
+          tokenId: String(position.tokenId),
+          question: position.question?.title ?? null,
+          outcome: position.outcome?.name ?? null,
+          costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+          remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+          fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+          profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+          lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+          quoteError: quoteState.quoteError,
+          txHash: null,
+          ...retainedAutoSellFields(retainedPosition)
+        };
+      }
+      const plan = await buildDirectSellPlan(publicClient, {
+        market: position.marketAddress,
+        tokenId: position.tokenId,
+        owner: walletAddress,
+        amountOt: retainedPosition.sellAmountOt
+      });
+      return {
+        plan,
+        trigger: "stop_loss_retained_exit",
+        triggerLabel: "止损留仓卖出",
+        percent: null,
+        step: entry.nextStep,
+        dueAt: new Date(dueAt).toISOString(),
+        marketAddress: position.marketAddress,
+        tokenId: String(position.tokenId),
+        question: position.question?.title ?? null,
+        outcome: position.outcome?.name ?? null,
+        costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+        remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+        fullExitValueUsdt: roundUsd(quoteState.fullExitValueUsdt),
+        profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+        lossPercent: roundUsd(quoteState.lossPercent),
+        stopLossPercent: cfg.autoSellStopLossPercent,
+        minCollateralOutUsdt: "0.000000000000000001",
+        noPriceProtection: true,
+        quoteError: quoteState.quoteError,
+        txHash: null,
+        ...retainedAutoSellFields(retainedPosition, plan)
+      };
+    }
+    const plan = await buildDirectSellPlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      percent: cfg.autoSellStopLossSellPercent
+    });
+    return {
+      plan,
+      trigger: "stop_loss",
+      triggerLabel: "止损",
+      percent: cfg.autoSellStopLossSellPercent,
+      step: entry.nextStep,
+      dueAt: new Date(dueAt).toISOString(),
+      sellAmountOt: formatUnits(plan.amount, 18),
+      marketAddress: position.marketAddress,
+      tokenId: String(position.tokenId),
+      question: position.question?.title ?? null,
+      outcome: position.outcome?.name ?? null,
+      costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+      remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+      fullExitValueUsdt: roundUsd(quoteState.fullExitValueUsdt),
+      profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+      lossPercent: roundUsd(quoteState.lossPercent),
+      stopLossPercent: cfg.autoSellStopLossPercent,
+      minCollateralOutUsdt: "0.000000000000000001",
+      noPriceProtection: true,
+      quoteError: quoteState.quoteError,
+      txHash: null
+    };
+  }
+
+  if (preStartDue) {
+    const marketStartDate = autoSellMarketStartDate(cfg, position);
+    if (retainedPosition) {
+      if (!retainedPosition.shouldSell) {
+        return {
+          noSell: true,
+          trigger: "retained_to_settlement",
+          triggerLabel: "留仓到结算",
+          percent: 0,
+          step: entry.nextStep,
+          dueAt: new Date(preStartDueAt).toISOString(),
+          marketStartDate,
+          beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+          marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+          marketAddress: position.marketAddress,
+          tokenId: String(position.tokenId),
+          question: position.question?.title ?? null,
+          outcome: position.outcome?.name ?? null,
+          costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+          remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+          fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+          profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+          lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+          quoteError: quoteState.quoteError,
+          txHash: null,
+          ...retainedAutoSellFields(retainedPosition)
+        };
+      }
+      const plan = await buildDirectSellPlan(publicClient, {
+        market: position.marketAddress,
+        tokenId: position.tokenId,
+        owner: walletAddress,
+        amountOt: retainedPosition.sellAmountOt
+      });
+      return {
+        plan,
+        trigger: "pre_start_retained_exit",
+        triggerLabel: "赛前留仓卖出",
+        percent: null,
+        step: entry.nextStep,
+        dueAt: new Date(preStartDueAt).toISOString(),
+        marketStartDate,
+        beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+        marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+        marketAddress: position.marketAddress,
+        tokenId: String(position.tokenId),
+        question: position.question?.title ?? null,
+        outcome: position.outcome?.name ?? null,
+        costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+        remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+        fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+        profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+        lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+        minCollateralOutUsdt: "0.000000000000000001",
+        noPriceProtection: true,
+        quoteError: quoteState.quoteError,
+        txHash: null,
+        ...retainedAutoSellFields(retainedPosition, plan)
+      };
+    }
+    const plan = await buildDirectSellPlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      percent: 100
+    });
+    return {
+      plan,
+      trigger: "pre_start_exit",
+      triggerLabel: "赛前清仓",
+      percent: 100,
+      step: entry.nextStep,
+      dueAt: new Date(preStartDueAt).toISOString(),
+      marketStartDate,
+      beforeMarketStartSeconds: cfg.autoSellBeforeMarketStartSeconds,
+      marketStartEndOffsetSeconds: cfg.autoSellMarketStartEndOffsetSeconds,
+      sellAmountOt: formatUnits(plan.amount, 18),
+      marketAddress: position.marketAddress,
+      tokenId: String(position.tokenId),
+      question: position.question?.title ?? null,
+      outcome: position.outcome?.name ?? null,
+      costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+      remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+      fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+      profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+      lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
+      minCollateralOutUsdt: "0.000000000000000001",
+      noPriceProtection: true,
+      quoteError: quoteState.quoteError,
+      txHash: null
+    };
+  }
+
+  if (entry.takeProfitCompleted) return null;
+  if (!due) return null;
+  if (!isAutoSellLadderProfitReady(cfg, quoteState.profitPercent)) return null;
 
   const amountOt = autoSellStepAmountOt(cfg, entry, position);
   if (!amountOt) return null;
@@ -3243,17 +6034,48 @@ async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, posit
     tokenId: String(position.tokenId),
     question: position.question?.title ?? null,
     outcome: position.outcome?.name ?? null,
-    costBasisUsdt: roundUsd(costBasisUsdt),
-    fullExitValueUsdt: fullExitValueUsdt === null ? null : roundUsd(fullExitValueUsdt),
-    lossPercent: lossPercent === null ? null : roundUsd(lossPercent),
+    costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+    remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+    fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+    profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+    ladderProfitPercent: cfg.autoSellLadderProfitPercent,
+    lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
     minCollateralOutUsdt: "0.000000000000000001",
     noPriceProtection: true,
-    quoteError,
+    quoteError: quoteState.quoteError,
     txHash: null
   };
 }
 
 function appendAutoSellBatchLog(cfg, { source, walletAddress, market = null, markets = null, actions, execution }) {
+  appendGasLedgerFromExecution(cfg, execution, {
+    action: "sell",
+    source: `auto-sell:${source}`,
+    wallet: walletAddress,
+    allocations: gasAllocationsFromAutoSellActions(actions)
+  });
+  if (execution?.approval) {
+    appendGasLedgerFromExecution(cfg, execution.approval, {
+      action: "approval",
+      source: `auto-sell-approval:${source}`,
+      wallet: walletAddress,
+      allocations: [{
+        market: execution.approval.market ?? market ?? markets?.[0],
+        action: "approval",
+        weight: 1
+      }]
+    });
+  }
+  for (const approval of execution?.approvals ?? []) {
+    appendGasLedgerFromExecution(cfg, approval, {
+      action: "approval",
+      source: `auto-sell-approval:${source}`,
+      wallet: walletAddress,
+      txHashKey: "operatorApprovalHash",
+      fieldPrefix: "operatorApproval",
+      allocations: [{ market: approval.market, action: "approval", weight: 1 }]
+    });
+  }
   appendJsonl(cfg.fillsFile, {
     level: "event-auto-sell",
     source,
@@ -3268,15 +6090,247 @@ function appendAutoSellBatchLog(cfg, { source, walletAddress, market = null, mar
   });
 }
 
+async function appendGasLedgerFromReceipt(cfg, publicClient, {
+  txHash,
+  receipt,
+  action,
+  source,
+  wallet = "",
+  allocations = [],
+  metadata = {}
+} = {}) {
+  try {
+    const blockNumber = receipt?.blockNumber !== undefined && receipt?.blockNumber !== null
+      ? BigInt(receipt.blockNumber)
+      : null;
+    const [transaction, block] = await Promise.all([
+      publicClient.getTransaction({ hash: txHash }).catch(() => null),
+      receipt?.blockHash
+        ? publicClient.getBlock({ blockHash: receipt.blockHash }).catch(() => (
+          blockNumber ? publicClient.getBlock({ blockNumber }).catch(() => null) : null
+        ))
+        : blockNumber
+          ? publicClient.getBlock({ blockNumber }).catch(() => null)
+          : Promise.resolve(null)
+    ]);
+    const priceInfo = await bnbUsdtPriceForBlock(block).catch((error) => ({
+      price: null,
+      source: null,
+      error: errorMessage(error)
+    }));
+    const entry = buildGasLedgerEntry({
+      txHash,
+      receipt,
+      transaction,
+      block,
+      profile: cfg.botName,
+      source,
+      action,
+      wallet,
+      allocations,
+      bnbUsdtPrice: priceInfo?.price ?? null,
+      bnbUsdtSource: priceInfo?.source ?? "",
+      metadata: {
+        ...metadata,
+        priceError: priceInfo?.error ?? null
+      }
+    });
+    appendGasLedgerEntries(cfg.gasLedgerFile, [entry]);
+  } catch (error) {
+    console.warn(JSON.stringify({
+      level: "gas-ledger-write-error",
+      source,
+      txHash,
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    }));
+  }
+}
+
+async function appendGasLedgerFromExecution(cfg, execution, {
+  action,
+  source,
+  wallet = "",
+  allocations = [],
+  txHashKey = "txHash",
+  fieldPrefix = "",
+  metadata = {}
+} = {}) {
+  const txHash = execution?.[txHashKey];
+  const gasUsedKey = fieldPrefix ? `${fieldPrefix}GasUsed` : "gasUsed";
+  const effectiveGasPriceKey = fieldPrefix ? `${fieldPrefix}EffectiveGasPrice` : "effectiveGasPrice";
+  const gasUsed = execution?.[gasUsedKey];
+  const effectiveGasPrice = execution?.[effectiveGasPriceKey];
+  if (!txHash || !gasUsed || !effectiveGasPrice) return;
+  try {
+    const { publicClient } = makeClients(cfg);
+    const receipt = await publicClient.getTransactionReceipt({ hash: txHash }).catch(() => null);
+    const transaction = await publicClient.getTransaction({ hash: txHash }).catch(() => null);
+    const blockHash = receipt?.blockHash;
+    const blockNumber = receipt?.blockNumber ?? execution?.blockNumber;
+    const block = blockHash
+      ? await publicClient.getBlock({ blockHash }).catch(() => null)
+      : blockNumber ? await publicClient.getBlock({ blockNumber: BigInt(blockNumber) }).catch(() => null) : null;
+    const priceInfo = await bnbUsdtPriceForBlock(block).catch((error) => ({
+      price: null,
+      source: null,
+      error: errorMessage(error)
+    }));
+    const entry = buildGasLedgerEntry({
+      txHash,
+      receipt: receipt ?? {
+        status: execution.status ?? null,
+        blockNumber: execution.blockNumber ?? null,
+        transactionIndex: execution.transactionIndex ?? null,
+        gasUsed,
+        effectiveGasPrice
+      },
+      transaction,
+      block,
+      profile: cfg.botName,
+      source,
+      action,
+      wallet,
+      allocations,
+      bnbUsdtPrice: priceInfo?.price ?? null,
+      bnbUsdtSource: priceInfo?.source ?? "",
+      metadata: {
+        ...metadata,
+        priceError: priceInfo?.error ?? null
+      }
+    });
+    appendGasLedgerEntries(cfg.gasLedgerFile, [entry]);
+  } catch (error) {
+    console.warn(JSON.stringify({
+      level: "gas-ledger-write-error",
+      source,
+      txHash,
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    }));
+  }
+}
+
+function gasAllocationsFromEventPlan(plan) {
+  const market = plan?.market ?? {};
+  const stake = Number(plan?.stakePerOutcomeUsdt ?? 0);
+  return (plan?.outcomes ?? []).map((outcome) => ({
+    market: market.address,
+    question: market.question,
+    tokenId: outcome.tokenId,
+    outcome: outcome.name,
+    action: "buy",
+    amountUsdt: Number.isFinite(stake) && stake > 0 ? stake : null,
+    weight: Number.isFinite(stake) && stake > 0 ? stake : 1
+  }));
+}
+
+function gasAllocationsFromBundle(bundle) {
+  return (bundle?.markets ?? []).map((market) => {
+    const amount = Number(market.totalStakeUsdt ?? market.stakeUsdt ?? market.totalStake ?? 0);
+    return {
+      market: market.address,
+      question: market.question,
+      action: "buy",
+      amountUsdt: Number.isFinite(amount) && amount > 0 ? amount : null,
+      weight: Number.isFinite(amount) && amount > 0 ? amount : 1
+    };
+  });
+}
+
+function gasAllocationsFromReceiptContext(context = {}) {
+  if (context.type === "bundle") {
+    return (context.marketDetails ?? []).map((market) => ({
+      market: market.address,
+      question: market.question,
+      action: "buy",
+      weight: 1
+    }));
+  }
+  return [{
+    market: context.market,
+    question: context.question,
+    action: "buy",
+    weight: 1
+  }];
+}
+
+function gasAllocationsFromAutoSellActions(actions = []) {
+  return (actions ?? []).map((action) => ({
+    market: action.marketAddress ?? action.market,
+    question: action.question,
+    tokenId: action.tokenId,
+    outcome: action.outcome,
+    action: "sell",
+    weight: Number(action.expectedCollateralToUserUsdt ?? action.fullExitValueUsdt ?? 0) || 1
+  }));
+}
+
+function gasAllocationsFromSellItem(item = {}) {
+  const position = item.position ?? {};
+  const plan = item.plan ?? {};
+  const expectedCollateral = plan.expectedCollateralToUser !== undefined && plan.expectedCollateralToUser !== null
+    ? Number(formatUnits(BigInt(plan.expectedCollateralToUser), 18))
+    : Number(position.currentValue ?? position.value ?? 0);
+  return [{
+    market: position.marketAddress ?? plan.market,
+    question: position.question?.title ?? position.question ?? null,
+    tokenId: position.tokenId ?? plan.tokenId,
+    outcome: position.outcome?.name ?? position.outcome ?? null,
+    action: "sell",
+    amountUsdt: Number.isFinite(expectedCollateral) && expectedCollateral > 0 ? expectedCollateral : null,
+    weight: Number.isFinite(expectedCollateral) && expectedCollateral > 0 ? expectedCollateral : 1
+  }];
+}
+
 function markAutoSellActionApplied(cfg, entry, item) {
-  entry.lastSoldAt = new Date().toISOString();
+  const appliedAt = new Date().toISOString();
   entry.lastTrigger = item.trigger;
-  if (item.trigger === "stop_loss") {
-    entry.stopLossSold = true;
+  if (
+    item.noSell ||
+    item.trigger === "retained_to_settlement" ||
+    item.trigger === "pre_start_retained_exit" ||
+    item.trigger === "stop_loss_retained_exit"
+  ) {
+    if (!item.noSell) entry.lastSoldAt = appliedAt;
+    entry.lastRetainedAt = appliedAt;
+    entry.retainedToSettlement = true;
+    entry.retainPercent = item.retainPercent ?? null;
+    entry.retainedTargetSize = item.retainedTargetOt ?? null;
+    entry.currentSizeBeforeRetain = item.currentSizeOt ?? null;
+    entry.retainedSellAmount = item.sellAmountOt ?? "0";
+    entry.retainedReason = item.trigger;
+    entry.remainingSize = String(item.remainingAfterSellOt ?? item.retainedTargetOt ?? entry.remainingSize ?? "0");
+    if (item.trigger === "pre_start_retained_exit" || item.trigger === "retained_to_settlement") {
+      entry.preStartExitHandled = true;
+      if (item.trigger === "pre_start_retained_exit") entry.preStartSold = true;
+    }
+    if (item.trigger === "stop_loss_retained_exit") entry.stopLossSold = true;
     entry.completed = true;
     return;
   }
+  entry.lastSoldAt = appliedAt;
+  if (
+    item.trigger === "stop_loss" ||
+    item.trigger === "pre_start_exit" ||
+    item.trigger === "open_timed_exit" ||
+    item.trigger === "fast_open_timed_exit"
+  ) {
+    if (item.trigger === "stop_loss") entry.stopLossSold = true;
+    if (item.trigger === "pre_start_exit") entry.preStartSold = true;
+    if (item.trigger === "open_timed_exit" || item.trigger === "fast_open_timed_exit") entry.openTimedExitSold = true;
+    entry.remainingSize = "0";
+    entry.completed = true;
+    return;
+  }
+  updateAutoSellRemainingSize(entry, item);
   entry.nextStep = Number(entry.nextStep ?? 1) + 1;
+  const takeProfitSteps = autoSellTakeProfitSteps(cfg);
+  if (takeProfitSteps > 0 && entry.nextStep > takeProfitSteps) {
+    entry.takeProfitCompleted = true;
+    if (!cfg.autoSellBeforeMarketStartSeconds) entry.completed = true;
+    return;
+  }
   if (entry.nextStep > autoSellTotalSteps(cfg)) {
     entry.completed = true;
   }
@@ -3293,12 +6347,102 @@ function ensureAutoSellPositionState(state, key, position, buyAt) {
       buyAt,
       detectedAt: new Date().toISOString(),
       initialSize: String(position.size ?? "0"),
+      initialCostBasisUsdt: String(position.costBasis ?? "0"),
+      remainingSize: String(position.size ?? "0"),
       nextStep: 1,
       completed: false,
-      stopLossSold: false
+      stopLossSold: false,
+      takeProfitCompleted: false,
+      preStartSold: false,
+      openTimedExitSold: false,
+      retainedToSettlement: false,
+      retainedTargetSize: null,
+      retainedSellAmount: null,
+      retainPercent: null,
+      preStartExitHandled: false
     };
   }
   return state.positions[key];
+}
+
+function updateAutoSellRemainingSize(entry, item) {
+  const current = autoSellNumber(entry?.remainingSize ?? entry?.initialSize);
+  const sold = autoSellNumber(item?.sellAmountOt);
+  if (!(current >= 0) || !(sold > 0)) return;
+  entry.remainingSize = String(Math.max(0, current - sold));
+}
+
+function autoSellAmountUnits(value) {
+  if (value === undefined || value === null || value === "") return 0n;
+  try {
+    return parseUnits(String(value), 18);
+  } catch {
+    return 0n;
+  }
+}
+
+function autoSellHasAmount(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+function autoSellCurrentSizeUnits(position, entry) {
+  const hasPositionSize = autoSellHasAmount(position?.size);
+  const hasRemainingSize = autoSellHasAmount(entry?.remainingSize);
+  const positionSize = autoSellAmountUnits(position?.size);
+  const remainingSize = autoSellAmountUnits(entry?.remainingSize);
+  if (hasPositionSize && hasRemainingSize) return positionSize < remainingSize ? positionSize : remainingSize;
+  if (hasRemainingSize) return remainingSize;
+  if (hasPositionSize) return positionSize;
+  return 0n;
+}
+
+function ceilDivBigInt(numerator, denominator) {
+  if (denominator <= 0n) return 0n;
+  if (numerator <= 0n) return 0n;
+  return (numerator + denominator - 1n) / denominator;
+}
+
+function autoSellRetainTargetUnits(entry, position, retainPercent, currentSize) {
+  let initial = autoSellAmountUnits(entry?.initialSize ?? position?.size);
+  if (initial <= 0n) initial = currentSize;
+  const scaledPercent = BigInt(Math.ceil(Number(retainPercent) * 1_000_000));
+  return ceilDivBigInt(initial * scaledPercent, 100_000_000n);
+}
+
+function resolveAutoSellRetainedPosition(cfg, entry, position) {
+  const retain = cfg?.autoSellRetainPosition;
+  if (!retain) return null;
+  const retainPercent = Number(retain.retainPercent);
+  if (!Number.isFinite(retainPercent) || retainPercent <= 0 || retainPercent > 100) return null;
+  const currentSize = autoSellCurrentSizeUnits(position, entry);
+  const retainedTarget = autoSellRetainTargetUnits(entry, position, retainPercent, currentSize);
+  const base = {
+    outcome: retain.outcome,
+    retainPercent,
+    currentSizeOt: formatUnits(currentSize, 18),
+    retainedTargetOt: formatUnits(retainedTarget, 18)
+  };
+  if (currentSize <= retainedTarget) {
+    return {
+      ...base,
+      shouldSell: false,
+      sellAmountOt: "0",
+      remainingAfterSellOt: formatUnits(currentSize, 18)
+    };
+  }
+  const sellAmount = currentSize - retainedTarget;
+  return {
+    ...base,
+    shouldSell: true,
+    sellAmountOt: formatUnits(sellAmount, 18),
+    remainingAfterSellOt: formatUnits(retainedTarget, 18)
+  };
+}
+
+function autoSellRemainingAfterSellOt(currentSizeOt, soldAmountUnits) {
+  const current = autoSellAmountUnits(currentSizeOt);
+  const remaining = current > soldAmountUnits ? current - soldAmountUnits : 0n;
+  return formatUnits(remaining, 18);
 }
 
 function autoSellPositionKey(walletAddress, position) {
@@ -3334,6 +6478,175 @@ function autoSellStepAmountOt(cfg, entry, position) {
 
 function autoSellTotalSteps(cfg) {
   return Math.ceil(100 / Number(cfg.autoSellChunkPercent));
+}
+
+function autoSellTakeProfitSteps(cfg) {
+  const steps = Number(cfg.autoSellTakeProfitSteps ?? 0);
+  return Number.isFinite(steps) && steps > 0 ? Math.floor(steps) : 0;
+}
+
+function autoSellMarketStartDate(cfg, position) {
+  const planned = plannedBuyForMarket(cfg, {
+    address: position?.marketAddress,
+    question: position?.question?.title
+  });
+  if (planned?.kickoffAt) return planned.kickoffAt;
+  const exactScoreMatchDate = autoSellExactScoreMatchDate(cfg, position);
+  if (exactScoreMatchDate) return exactScoreMatchDate;
+  const endOffsetSeconds = Number(cfg.autoSellMarketStartEndOffsetSeconds ?? 0);
+  if (endOffsetSeconds > 0) {
+    const endDate = position?.market?.endDate ?? position?.question?.endDate ?? null;
+    const endMs = Date.parse(endDate ?? "");
+    if (!Number.isFinite(endMs)) return null;
+    return new Date(endMs - endOffsetSeconds * 1000).toISOString();
+  }
+  return position?.market?.startDate ?? position?.question?.startDate ?? null;
+}
+
+function autoSellExactScoreMatchDate(cfg, position) {
+  const endDate = position?.market?.endDate ?? position?.question?.endDate ?? null;
+  const endMs = Date.parse(endDate ?? "");
+  if (!Number.isFinite(endMs)) return null;
+  if (!isAutoSellExactScorePosition(position)) return null;
+  const endOffsetSeconds = Number(cfg?.autoSellMarketStartEndOffsetSeconds ?? 0);
+  const matchMs = endOffsetSeconds > 0 ? endMs - endOffsetSeconds * 1000 : endMs;
+  return new Date(matchMs).toISOString();
+}
+
+function isAutoSellExactScorePosition(position) {
+  const question = autoSellPositionQuestion(position);
+  if (!question) return false;
+  const market = {
+    question,
+    categories: position?.market?.categories ?? position?.question?.categories ?? [],
+    subcategories: position?.market?.subcategories ?? position?.question?.subcategories ?? [],
+    topics: position?.market?.topics ?? position?.question?.topics ?? [],
+    tags: position?.market?.tags ?? position?.question?.tags ?? []
+  };
+  if (isSportsExactScoreMarket(market)) return true;
+  if (!/\bvs\.?\b/iu.test(question)) return false;
+  if (/\s[-–—]\s/u.test(question)) return false;
+  if (isSportsSideMarketQuestion(question)) return false;
+  return isExactScoreOutcomeName(position?.outcome?.name);
+}
+
+function autoSellPositionQuestion(position) {
+  return String(
+    position?.market?.question
+      ?? position?.market?.title
+      ?? position?.question?.title
+      ?? position?.question?.question
+      ?? position?.question
+      ?? ""
+  ).trim();
+}
+
+function isExactScoreOutcomeName(name) {
+  return /(?:^|[^\d])\d{1,2}\s*(?:-|:|[\u2010-\u2015\u2212])\s*\d{1,2}(?:[^\d]|$)/u.test(String(name ?? ""));
+}
+
+function autoSellPreStartDueAt(cfg, position) {
+  const beforeSeconds = Number(cfg.autoSellBeforeMarketStartSeconds ?? 0);
+  if (!(beforeSeconds > 0)) return null;
+  const startMs = Date.parse(autoSellMarketStartDate(cfg, position) ?? "");
+  if (!Number.isFinite(startMs)) return null;
+  return startMs - beforeSeconds * 1000;
+}
+
+function autoSellMarketOpenDate(position) {
+  return position?.market?.startDate ?? position?.question?.startDate ?? null;
+}
+
+function autoSellOpenExitDueAt(cfg, position) {
+  const openMs = Date.parse(autoSellMarketOpenDate(position) ?? "");
+  if (!Number.isFinite(openMs)) return null;
+  return openMs + Number(cfg.autoSellOpenExitDelaySeconds ?? 36) * 1000;
+}
+
+function autoSellProfitPercent(costBasisUsdt, fullExitValueUsdt) {
+  if (!(costBasisUsdt > 0) || fullExitValueUsdt === null || fullExitValueUsdt === undefined) return null;
+  return Math.max(0, (Number(fullExitValueUsdt) / Number(costBasisUsdt) - 1) * 100);
+}
+
+function defaultAutoSellReturnState(position) {
+  const costBasisUsdt = Number(position?.costBasis ?? 0);
+  return {
+    costBasisUsdt,
+    remainingCostBasisUsdt: costBasisUsdt,
+    quote: null,
+    quoteError: null,
+    fullExitValueUsdt: null,
+    lossPercent: null,
+    profitPercent: null
+  };
+}
+
+async function quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry) {
+  const state = defaultAutoSellReturnState(position);
+  try {
+    state.quote = await quoteSellOutcome(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      percent: 100,
+      slippageBps: cfg.slippageBps
+    });
+    state.fullExitValueUsdt = rawUsdt(state.quote.expectedCollateralToUser);
+    const metrics = autoSellReturnMetrics(position, entry, state.fullExitValueUsdt);
+    state.remainingCostBasisUsdt = metrics.remainingCostBasisUsdt;
+    state.lossPercent = metrics.lossPercent;
+    state.profitPercent = metrics.profitPercent;
+  } catch (error) {
+    state.quoteError = autoSellErrorMessage(cfg, error);
+  }
+  return state;
+}
+
+function autoSellReturnMetrics(position, entry, fullExitValueUsdt) {
+  const costBasisUsdt = Number(position?.costBasis ?? 0);
+  const remainingCostBasisUsdt = autoSellRemainingCostBasisUsdt(position, entry, costBasisUsdt);
+  const profitPercent = autoSellProfitPercent(remainingCostBasisUsdt, fullExitValueUsdt);
+  const lossPercent = remainingCostBasisUsdt > 0
+    ? Math.max(0, (1 - Number(fullExitValueUsdt) / remainingCostBasisUsdt) * 100)
+    : 0;
+  return {
+    costBasisUsdt,
+    remainingCostBasisUsdt,
+    profitPercent,
+    lossPercent
+  };
+}
+
+function autoSellRemainingCostBasisUsdt(position, entry, fallbackCostBasisUsdt = 0) {
+  const basis = autoSellNumber(entry?.initialCostBasisUsdt ?? fallbackCostBasisUsdt ?? position?.costBasis ?? 0);
+  if (!(basis > 0)) return 0;
+
+  const initialSize = autoSellNumber(entry?.initialSize ?? position?.size ?? 0);
+  const trackedRemainingSize = autoSellNumber(entry?.remainingSize);
+  const apiCurrentSize = autoSellNumber(position?.size ?? 0);
+  const currentSize = trackedRemainingSize >= 0
+    ? (apiCurrentSize > 0 ? Math.min(apiCurrentSize, trackedRemainingSize) : trackedRemainingSize)
+    : apiCurrentSize;
+  if (!(initialSize > 0)) return basis;
+  if (!(currentSize > 0)) return 0;
+
+  const remainingRatio = Math.min(1, currentSize / initialSize);
+  return basis * remainingRatio;
+}
+
+function autoSellNumber(value) {
+  if (value === undefined || value === null || value === "") return NaN;
+  return Number(String(value).replace(/,/gu, ""));
+}
+
+function isAutoSellLadderProfitReady(cfg, profitPercent) {
+  const threshold = Number(cfg.autoSellLadderProfitPercent ?? 0);
+  if (!(threshold > 0)) return true;
+  return profitPercent !== null && profitPercent >= threshold;
+}
+
+function autoSellLadderProfitGateEnabled(cfg) {
+  return Number(cfg.autoSellLadderProfitPercent ?? 0) > 0;
 }
 
 function loadAutoSellEligibleMarkets(cfg) {
@@ -3689,8 +7002,9 @@ function uniqueAutoSellKeys(keys) {
 async function ensureAutoSellGasBudget(cfg, publicClient, walletAddress, gasUnits) {
   if (cfg.dryRun || !cfg.execute) return null;
   const gasLimit = BigInt(Math.max(0, Number(gasUnits ?? 0)));
-  const gasPriceWei = cfg.gasPriceGwei
-    ? parseGwei(String(cfg.gasPriceGwei))
+  const gasPriceGwei = cfg.autoSellGasPriceGwei || cfg.gasPriceGwei;
+  const gasPriceWei = gasPriceGwei
+    ? parseGwei(String(gasPriceGwei))
     : await publicClient.getGasPrice();
   const estimatedTxCostWei = gasLimit * gasPriceWei;
   const minReserveWei = parseUnits(String(cfg.autoSellMinBnbReserve ?? 0), 18);
@@ -3759,13 +7073,27 @@ function sanitizeAutoSellLogValue(cfg, value, depth = 0) {
   }
   const result = {};
   for (const [key, item] of Object.entries(value)) {
+    if (isSensitiveLogKey(key)) {
+      result[key] = "[redacted]";
+      continue;
+    }
     result[key] = sanitizeAutoSellLogValue(cfg, item, depth + 1);
   }
   return result;
 }
 
+function isSensitiveLogKey(key) {
+  return /privateKey|feishuWebhook|webhook|rpcUrl|wsUrl|broadcastRpcUrls|apiKey|token|secret/i.test(String(key));
+}
+
 function isInsufficientFundsErrorMessage(message) {
   return /insufficient funds|gas \* price|exceeds the balance|not enough (?:bnb|native)|AUTO_SELL_INSUFFICIENT_BNB|AUTO_SELL gas guard|BNB balance .*below required/i.test(String(message));
+}
+
+function isTransientPositionsFetchErrorMessage(message) {
+  return /^42 positions (?:(?:408|425|429|5\d\d)\b|invalid JSON\b)|fetch failed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|socket hang up|network timeout|terminated/i.test(
+    String(message)
+  );
 }
 
 function isAutoSellablePosition(position) {
@@ -3807,8 +7135,36 @@ function autoSellKey(walletAddress, position, cfg, trigger = null) {
 
 function autoSellSummaryText(cfg) {
   if (!cfg.autoSellEnabled) return "off";
+  if (cfg.autoSellStrategy === "open_timed_exit") {
+    const stopLoss = cfg.autoSellStopLossEnabled
+      ? `; 亏${cfg.autoSellStopLossPercent}%全卖`
+      : "";
+    const fast = cfg.autoSellFastOpenExitEnabled
+      ? `; 快速随机T+${roundMs(cfg.autoSellFastOpenExitMinDelayMs / 1000)}-${roundMs(cfg.autoSellFastOpenExitMaxDelayMs / 1000)}s`
+      : "";
+    return `开盘T+${cfg.autoSellOpenExitDelaySeconds}s卖${cfg.autoSellOpenExitPercent}%${fast}${stopLoss}`;
+  }
+  if (cfg.autoSellStrategy === "pre_start_exit") {
+    const preStart = Number(cfg.autoSellBeforeMarketStartSeconds ?? 0) > 0
+      ? `赛前${Math.round(Number(cfg.autoSellBeforeMarketStartSeconds) / 60)}min清仓`
+      : "赛前清仓未配置";
+    const stopLoss = cfg.autoSellStopLossEnabled
+      ? `; 亏${cfg.autoSellStopLossPercent}%全卖`
+      : "";
+    return `持有不分批卖; ${preStart}${stopLoss}`;
+  }
   if (cfg.autoSellStrategy === "ladder") {
-    return `买后${cfg.autoSellStartDelaySeconds}s起每${cfg.autoSellIntervalSeconds}s卖${cfg.autoSellChunkPercent}%; 亏${cfg.autoSellStopLossPercent}%全卖`;
+    const profitGate = Number(cfg.autoSellLadderProfitPercent ?? 0) > 0
+      ? `且盈${cfg.autoSellLadderProfitPercent}%后`
+      : "";
+    const takeProfitSteps = Number(cfg.autoSellTakeProfitSteps ?? 0);
+    const takeProfit = takeProfitSteps > 0
+      ? `${profitGate}卖${cfg.autoSellChunkPercent}% ${takeProfitSteps}次`
+      : `${profitGate}每${cfg.autoSellIntervalSeconds}s卖${cfg.autoSellChunkPercent}%`;
+    const preStart = Number(cfg.autoSellBeforeMarketStartSeconds ?? 0) > 0
+      ? `; 赛前${Math.round(Number(cfg.autoSellBeforeMarketStartSeconds) / 60)}min清剩余`
+      : "";
+    return `买后${cfg.autoSellStartDelaySeconds}s起${takeProfit}${preStart}; 亏${cfg.autoSellStopLossPercent}%全卖`;
   }
   const takeProfit = `旧策略 ${cfg.autoSellProfitMultiplier}x 卖 ${cfg.autoSellPercent}%`;
   const stopLoss = cfg.autoSellStopLossEnabled
@@ -3885,14 +7241,14 @@ async function waitForWatchFunding(cfg) {
         msUntilNextStart: fundingMsUntilStart(fundingStatus),
         at: new Date().toISOString()
       }));
-      if (shouldNotifyFundingWait(fundingStatus)) {
+      if (shouldNotifyFundingWait(fundingStatus, cfg)) {
         notifyFeishu(cfg, {
           title: "开盘前资金不足",
           level: "warn",
           fields: waitAlertFields,
           dedupeKey: "waiting-for-funds",
           cooldownMs: cfg.feishuAlertCooldownMs,
-          fingerprint: fundingWaitingAlertFingerprint(fundingStatus),
+          fingerprint: fundingWaitingAlertFingerprint(fundingStatus, cfg),
           repeatMs: 0
         });
       }
@@ -3977,10 +7333,10 @@ function fundingReadyAlertFingerprint(fundingStatus) {
   ].join(":");
 }
 
-function fundingWaitingAlertFingerprint(fundingStatus) {
+function fundingWaitingAlertFingerprint(fundingStatus, cfg = {}) {
   return [
     "waiting",
-    fundingReminderStage(fundingStatus),
+    fundingReminderStage(fundingStatus, cfg),
     fundingShortfallFingerprint(fundingStatus),
     fundingStatus?.funding?.nextBatchStartDate ?? "no-start",
     fundingStatus?.executablePlan?.selected?.length ?? 0,
@@ -3988,16 +7344,20 @@ function fundingWaitingAlertFingerprint(fundingStatus) {
   ].join(":");
 }
 
-function fundingReminderStage(fundingStatus) {
+function fundingReminderStage(fundingStatus, cfg = {}) {
   const ms = fundingMsUntilStart(fundingStatus);
   if (ms === null || ms < 0) return "normal";
   if (ms <= 5 * 60 * 1000) return "t-5m";
   if (ms <= 30 * 60 * 1000) return "t-30m";
+  const notifyWindowMs = Number(cfg?.armFundingNotifyWindowMs ?? 30 * 60 * 1000);
+  if (Number.isFinite(notifyWindowMs) && notifyWindowMs > 30 * 60 * 1000 && ms <= notifyWindowMs) {
+    return `t-${Math.ceil(notifyWindowMs / 60000)}m`;
+  }
   return "normal";
 }
 
-function shouldNotifyFundingWait(fundingStatus) {
-  return fundingReminderStage(fundingStatus) !== "normal";
+function shouldNotifyFundingWait(fundingStatus, cfg = {}) {
+  return fundingReminderStage(fundingStatus, cfg) !== "normal";
 }
 
 function fundingShortfallFingerprint(fundingStatus) {
@@ -4081,7 +7441,7 @@ async function getWatchFundingStatus(cfg) {
   const executableFunding = executablePlan.selected.length > 0
     ? fundingForMarketSummaries(cfg, executablePlan.selected, funding)
     : funding;
-  const gasReserve = await estimateFastGasReserve(publicClient, cfg, executableFunding);
+  const gasReserve = await estimateFundingGasReserve(publicClient, cfg, executableFunding);
   const bnbReady = Number(walletStatus.bnbBalance) >= Number(gasReserve.requiredBnb);
   const ready = balanceReady && allowanceReady && bnbReady;
   const message = ready
@@ -4180,6 +7540,7 @@ async function seedExistingRestMarkets(cfg, seen, pending, runtime = null, optio
   let preparedFutureMarkets = 0;
   for (const market of currentMarkets) {
     if (msUntilStart(market) > 0) {
+      clearSeenForFutureEligibleBuy(cfg, seen, market, "startup-rest-future-buy");
       const record = await preparePendingRecord(cfg, market, runtime);
       if (record.preparedPlan) preparedFutureMarkets += 1;
       pending.set(eventSeenKey(market, cfg), record);
@@ -4224,7 +7585,8 @@ async function seedRecentChainMarkets(cfg, seen, pending, runtime = null, option
 
   for (const market of sortMarketsByChainDesc(chain.decoded)) {
     const key = eventSeenKey(market, cfg);
-    if (seen.has(key) || pending.has(key)) continue;
+    if (seen.has(key) && !clearSeenForFutureEligibleBuy(cfg, seen, market, "startup-chain-future-buy")) continue;
+    if (pending.has(key)) continue;
     const decision = marketFilterDecision(market, cfg);
     if (!decision.eligible) {
       recordMarketDecision(cfg, market, "filtered", {
@@ -4339,15 +7701,15 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
 
   while (true) {
     try {
-      await preSignHotPendingMarkets(cfg, pending, runtime);
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "ws-loop");
 
       while (queue.length > 0) addBufferedControllerLog(txBuffers, queue.shift());
       await drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pending, runtime);
-      await preSignHotPendingMarkets(cfg, pending, runtime);
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
-      maybeStartBroadcastRpcKeepalive(cfg, pending, rpcKeepalive);
+      maybeStartBroadcastRpcKeepalive(cfg, pending, rpcKeepalive, runtime);
       await drainRestDiscoveryCandidates(cfg, seen, pending, runtime, restDiscovery);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       maybeStartRestDiscoveryPoll(cfg, seen, pending, restDiscovery, wakeSignal);
@@ -4375,7 +7737,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
         return;
       }
     }
-    await wakeSignal.wait(nextWatchSleepMs(cfg, pending));
+    await wakeSignal.wait(nextWatchSleepMs(cfg, pending, runtime));
   }
 }
 
@@ -4392,6 +7754,105 @@ function createDueExecutionState() {
     running: false,
     rerun: false
   };
+}
+
+function shouldUseBlockAwareOpenBroadcast(cfg) {
+  return Boolean(
+    cfg.openBroadcastMode === "block_aware_20s" &&
+    effectivePrebroadcastMs(cfg) <= 0
+  );
+}
+
+function createOpenBroadcastBlockClockState() {
+  return {
+    heads: [],
+    startedAt: new Date().toISOString(),
+    lastHeadAt: null,
+    lastErrorAt: null,
+    lastError: null,
+    errors: 0,
+    unwatch: null
+  };
+}
+
+function maybeStartOpenBroadcastBlockClock(cfg, runtime) {
+  if (!shouldUseBlockAwareOpenBroadcast(cfg) || !runtime) return null;
+  if (runtime.openBroadcastBlockClock) return runtime.openBroadcastBlockClock;
+
+  const state = createOpenBroadcastBlockClockState();
+  runtime.openBroadcastBlockClock = state;
+
+  try {
+    const wsClient = makeWsClient(cfg);
+    state.unwatch = wsClient.watchBlocks({
+      includeTransactions: false,
+      emitMissed: true,
+      onBlock: (block) => rememberOpenBroadcastBlockHead(state, block),
+      onError: (error) => {
+        state.errors += 1;
+        state.lastErrorAt = new Date().toISOString();
+        state.lastError = errorMessage(error);
+        console.error(JSON.stringify({
+          level: "warn",
+          source: "open-broadcast-block-clock",
+          message: state.lastError,
+          errors: state.errors,
+          at: state.lastErrorAt
+        }));
+      }
+    });
+    console.log(JSON.stringify({
+      level: "open-broadcast-block-clock-started",
+      mode: cfg.openBroadcastMode,
+      wsProvider: wsProviderLabel(cfg.wsUrl),
+      targetOffsetMs: cfg.openBroadcastBlockTargetOffsetMs,
+      leadMs: cfg.openBroadcastBlockAwareLeadMs,
+      maxWaitMs: cfg.openBroadcastBlockAwareMaxWaitMs,
+      preTargetCount: cfg.openBroadcastBlockAwarePreTargetCount,
+      preTargetSendMs: cfg.openBroadcastBlockAwarePreTargetSendMs,
+      headMaxAgeMs: cfg.openBroadcastBlockAwareHeadMaxAgeMs,
+      at: state.startedAt
+    }));
+  } catch (error) {
+    state.errors += 1;
+    state.lastErrorAt = new Date().toISOString();
+    state.lastError = errorMessage(error);
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "open-broadcast-block-clock-startup",
+      message: state.lastError,
+      at: state.lastErrorAt
+    }));
+  }
+  return state;
+}
+
+function rememberOpenBroadcastBlockHead(state, block, receivedAt = Date.now()) {
+  if (!state) return;
+  const timestampMs = normalizeBlockTimestampMs(block?.timestamp);
+  if (!Number.isFinite(timestampMs)) return;
+  const head = {
+    number: block?.number === null || block?.number === undefined ? null : String(block.number),
+    timestampMs,
+    timestampIso: new Date(timestampMs).toISOString(),
+    receivedAt,
+    receivedAtIso: new Date(receivedAt).toISOString()
+  };
+  state.heads.push(head);
+  state.lastHeadAt = receivedAt;
+  const cutoff = receivedAt - 60_000;
+  if (state.heads.length > 128 || state.heads.some((item) => item.receivedAt < cutoff)) {
+    state.heads = state.heads
+      .filter((item) => item.receivedAt >= cutoff)
+      .slice(-128);
+  }
+}
+
+function normalizeBlockTimestampMs(value) {
+  if (value === null || value === undefined) return null;
+  const numeric = typeof value === "bigint" ? Number(value) : Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric > 10_000_000_000 ? numeric : numeric * 1000;
 }
 
 async function drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, state, source = "due-loop") {
@@ -4422,8 +7883,13 @@ function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = 
 
   for (const [key, record] of pending.entries()) {
     activeKeys.add(key);
-    if (seen.has(key)) continue;
-    const targetMs = marketActionTimeMs(pendingMarket(record), cfg);
+    if (seen.has(key)) {
+      const cleared = clearSeenForFutureEligibleBuy(cfg, seen, pendingMarket(record), `${source}-future-buy`);
+      if (cleared) saveSeen(cfg.stateFile, seen);
+      if (seen.has(key)) continue;
+    }
+    const timing = openBroadcastTimingForRecord(record, cfg, runtime, now);
+    const targetMs = timing.targetMs;
     if (!Number.isFinite(targetMs)) continue;
     const waitMs = targetMs - now;
     if (waitMs < -eventOpenWindowMs(cfg)) continue;
@@ -4465,7 +7931,8 @@ function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = 
       waitMs: Math.max(0, waitMs),
       delayMs,
       spinMs: cfg.openBroadcastSpinMs,
-      postOpenDelayMs: effectivePostOpenBroadcastDelayMs(cfg)
+      postOpenDelayMs: effectivePostOpenBroadcastDelayMs(actionConfigForRecord(record, cfg)),
+      blockAware: describeOpenBroadcastTiming(timing)
     }));
   }
 
@@ -4492,10 +7959,10 @@ async function waitUntilBroadcastTarget(targetMs, spinMs) {
   }
 }
 
-function maybeStartBroadcastRpcKeepalive(cfg, pending, state) {
+function maybeStartBroadcastRpcKeepalive(cfg, pending, state, runtime = null) {
   const intervalMs = Number(cfg.rpcKeepaliveMs ?? 0);
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
-  if (!hasHotPendingMarket(cfg, pending)) return;
+  if (!hasHotPendingMarket(cfg, pending, runtime)) return;
   const now = Date.now();
   if (state.running || now < state.nextRunAt) return;
 
@@ -4528,10 +7995,10 @@ function maybeStartBroadcastRpcKeepalive(cfg, pending, state) {
     });
 }
 
-function hasHotPendingMarket(cfg, pending) {
+function hasHotPendingMarket(cfg, pending, runtime = null) {
   if (!pending || pending.size === 0) return false;
   return [...pending.values()].some((record) => {
-    const waitMs = msUntilRecordAction(record, cfg);
+    const waitMs = msUntilRecordAction(record, cfg, runtime);
     return waitMs <= cfg.preopenHotMs && waitMs >= -eventOpenWindowMs(cfg);
   });
 }
@@ -4542,7 +8009,7 @@ async function watchRest(cfg, seen, runtime = null, initialPending = new Map()) 
   const dueExecution = createDueExecutionState();
   while (true) {
     try {
-      await preSignHotPendingMarkets(cfg, pending, runtime);
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "rest-loop");
 
@@ -4553,17 +8020,187 @@ async function watchRest(cfg, seen, runtime = null, initialPending = new Map()) 
           pending.set(eventSeenKey(market, cfg), await preparePendingRecord(cfg, market, runtime));
         }
       }
-      await preSignHotPendingMarkets(cfg, pending, runtime);
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
     } catch (error) {
       console.error(JSON.stringify({ level: "error", message: errorMessage(error), at: new Date().toISOString() }));
     }
-    await sleep(nextWatchSleepMs(cfg, pending));
+    await sleep(nextWatchSleepMs(cfg, pending, runtime));
   }
+}
+
+async function watchFeed(cfg, seen, runtime = null, initialPending = new Map()) {
+  const pending = new Map(initialPending);
+  attachRuntimePendingBuyRecords(runtime, pending);
+  const dueExecution = createDueExecutionState();
+  const feedState = createEventDiscoveryFeedState(cfg);
+
+  console.log(JSON.stringify({
+    level: "event-discovery-feed-watch",
+    file: cfg.eventDiscoveryFeedFile,
+    pollMs: cfg.eventDiscoveryFeedPollMs,
+    tailBytes: cfg.eventDiscoveryFeedTailBytes
+  }));
+
+  while (true) {
+    try {
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
+      await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "feed-loop");
+
+      const markets = readEventDiscoveryFeedMarkets(cfg, feedState);
+      if (markets.length > 0) {
+        console.log(JSON.stringify({
+          level: "event-discovery-feed-poll",
+          markets: markets.length,
+          latestCreatedAt: markets[0]?.createdAt ?? null,
+          latestQuestion: markets[0]?.question ?? null,
+          at: new Date().toISOString()
+        }));
+        await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(markets), runtime, {
+          source: "event-discovery-feed",
+          hydrateDueOdds: true,
+          hydrationSkipReason: "event_discovery_feed"
+        });
+      }
+
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
+      scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "event-discovery-feed",
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+      notifyFeishu(cfg, {
+        title: "共享发现读取异常",
+        level: "warn",
+        fields: { message: errorMessage(error) },
+        dedupeKey: "event-discovery-feed-error",
+        cooldownMs: cfg.feishuAlertCooldownMs
+      });
+    }
+    await sleep(Math.min(nextWatchSleepMs(cfg, pending, runtime), cfg.eventDiscoveryFeedPollMs));
+  }
+}
+
+function createEventDiscoveryFeedState(cfg) {
+  return {
+    file: cfg.eventDiscoveryFeedFile,
+    initialized: false,
+    offset: 0,
+    partial: "",
+    dropFirstPartial: false,
+    parseErrors: 0,
+    missingLoggedAt: 0
+  };
+}
+
+function readEventDiscoveryFeedMarkets(cfg, state) {
+  const file = cfg.eventDiscoveryFeedFile;
+  if (!file) return [];
+  if (!fs.existsSync(file)) {
+    const now = Date.now();
+    if (!state.missingLoggedAt || now - state.missingLoggedAt >= 60000) {
+      state.missingLoggedAt = now;
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "event-discovery-feed",
+        message: "feed file does not exist yet",
+        file,
+        at: new Date().toISOString()
+      }));
+    }
+    return [];
+  }
+
+  const stat = fs.statSync(file);
+  if (!state.initialized) {
+    const tailBytes = Number(cfg.eventDiscoveryFeedTailBytes ?? 0);
+    state.offset = tailBytes > 0 ? Math.max(0, stat.size - tailBytes) : stat.size;
+    state.dropFirstPartial = state.offset > 0;
+    state.initialized = true;
+  }
+  if (stat.size < state.offset) {
+    state.offset = 0;
+    state.partial = "";
+    state.dropFirstPartial = false;
+  }
+  if (stat.size === state.offset) return [];
+
+  const chunk = readUtf8FileChunk(file, state.offset, stat.size - state.offset);
+  state.offset = stat.size;
+  const text = state.partial + chunk;
+  const hasTrailingNewline = text.endsWith("\n") || text.endsWith("\r");
+  const lines = text.split(/\r?\n/);
+  state.partial = hasTrailingNewline ? "" : (lines.pop() ?? "");
+  if (state.dropFirstPartial) {
+    lines.shift();
+    state.dropFirstPartial = false;
+  }
+
+  const markets = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed);
+      const market = marketFromEventDiscoveryFeedRow(row);
+      if (market) markets.push(market);
+    } catch (error) {
+      state.parseErrors += 1;
+      if (state.parseErrors <= 5 || state.parseErrors % 100 === 0) {
+        console.error(JSON.stringify({
+          level: "warn",
+          source: "event-discovery-feed-parse",
+          parseErrors: state.parseErrors,
+          message: errorMessage(error),
+          at: new Date().toISOString()
+        }));
+      }
+    }
+  }
+  return mergeKnownEventMarkets(markets);
+}
+
+function readUtf8FileChunk(file, offset, length) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, offset);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function marketFromEventDiscoveryFeedRow(row) {
+  if (!row || row.level !== "event-discovery-feed") return null;
+  const rawMarket = row.market && typeof row.market === "object" ? row.market : row;
+  if (!rawMarket?.address) return null;
+  return {
+    ...rawMarket,
+    address: String(rawMarket.address),
+    question: rawMarket.question ?? rawMarket.title ?? row.question ?? null,
+    title: rawMarket.title ?? rawMarket.question ?? row.question ?? null,
+    status: rawMarket.status ?? row.status ?? null,
+    startDate: rawMarket.startDate ?? row.startDate ?? null,
+    outcomes: Array.isArray(rawMarket.outcomes) ? rawMarket.outcomes.map(normalizeFeedOutcome) : []
+  };
+}
+
+function normalizeFeedOutcome(outcome = {}) {
+  return {
+    ...outcome,
+    tokenId: outcome.tokenId === undefined || outcome.tokenId === null ? outcome.tokenId : String(outcome.tokenId),
+    name: outcome.name ?? outcome.title ?? null
+  };
 }
 
 function createRestDiscoveryState() {
   return {
+    startedAtMs: Date.now(),
     nextPollAt: 0,
     running: false,
     seeded: false,
@@ -4605,24 +8242,28 @@ function maybeStartRestDiscoveryPoll(cfg, seen, pending, state, wakeSignal = nul
 async function runRestDiscoveryPoll(cfg, seen, pending, state) {
   const markets = await loadRawRestMarkets(cfg, { status: "all", limit: cfg.watchScanLimit });
   if (!state.seeded) {
+    const seedCandidates = collectRestDiscoverySeedCandidates(cfg, seen, pending, state, markets);
     rememberRestDiscoveryMarkets(state, markets);
     state.seeded = true;
     console.log(JSON.stringify({
       level: "rest-discovery-seed",
       markets: markets.length,
+      seedFutureEligible: seedCandidates.length,
       latestCreatedAt: markets[0]?.createdAt ?? null,
       latestQuestion: markets[0]?.question ?? null,
       at: new Date().toISOString()
     }));
+    if (seedCandidates.length > 0) state.candidates.push(...seedCandidates);
     return;
   }
 
-  const candidates = markets.filter((market) => {
-    const rawKey = restDiscoveryMarketKey(market);
-    if (!rawKey || state.knownMarketKeys.has(rawKey)) return false;
-    const key = eventSeenKey(market, cfg);
-    return !seen.has(key) && !pending.has(key);
-  });
+  const { candidates, unknown, knownFutureEligible } = collectRestDiscoveryCandidates(
+    cfg,
+    seen,
+    pending,
+    state,
+    markets
+  );
   rememberRestDiscoveryMarkets(state, markets);
 
   if (candidates.length === 0) return;
@@ -4630,6 +8271,8 @@ async function runRestDiscoveryPoll(cfg, seen, pending, state) {
   console.log(JSON.stringify({
     level: "rest-discovery-poll",
     candidates: candidates.length,
+    unknown,
+    knownFutureEligible,
     eligible,
     filtered: candidates.length - eligible,
     at: new Date().toISOString()
@@ -4661,24 +8304,34 @@ async function maybePollRestDiscovery(cfg, seen, pending, runtime, state) {
   try {
     const markets = await loadRawRestMarkets(cfg, { status: "all", limit: cfg.watchScanLimit });
     if (!state.seeded) {
+      const seedCandidates = collectRestDiscoverySeedCandidates(cfg, seen, pending, state, markets);
       rememberRestDiscoveryMarkets(state, markets);
       state.seeded = true;
       console.log(JSON.stringify({
         level: "rest-discovery-seed",
         markets: markets.length,
+        seedFutureEligible: seedCandidates.length,
         latestCreatedAt: markets[0]?.createdAt ?? null,
         latestQuestion: markets[0]?.question ?? null,
         at: new Date().toISOString()
       }));
+      if (seedCandidates.length > 0) {
+        await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(seedCandidates), runtime, {
+          source: "rest-discovery-seed",
+          hydrateDueOdds: true,
+          hydrationSkipReason: "rest_discovery_seed"
+        });
+      }
       return;
     }
 
-    const candidates = markets.filter((market) => {
-      const rawKey = restDiscoveryMarketKey(market);
-      if (!rawKey || state.knownMarketKeys.has(rawKey)) return false;
-      const key = eventSeenKey(market, cfg);
-      return !seen.has(key) && !pending.has(key);
-    });
+    const { candidates, unknown, knownFutureEligible } = collectRestDiscoveryCandidates(
+      cfg,
+      seen,
+      pending,
+      state,
+      markets
+    );
     rememberRestDiscoveryMarkets(state, markets);
 
     if (candidates.length > 0) {
@@ -4686,6 +8339,8 @@ async function maybePollRestDiscovery(cfg, seen, pending, runtime, state) {
       console.log(JSON.stringify({
         level: "rest-discovery-poll",
         candidates: candidates.length,
+        unknown,
+        knownFutureEligible,
         eligible,
         filtered: candidates.length - eligible,
         at: new Date().toISOString()
@@ -4715,6 +8370,59 @@ async function maybePollRestDiscovery(cfg, seen, pending, runtime, state) {
     state.nextPollAt = Date.now() + cfg.restDiscoveryPollMs;
     state.running = false;
   }
+}
+
+function collectRestDiscoverySeedCandidates(cfg, seen, pending, state, markets) {
+  const now = Date.now();
+  return markets.filter((market) => {
+    const rawKey = restDiscoveryMarketKey(market);
+    if (!rawKey) return false;
+    const key = eventSeenKey(market, cfg);
+    if (seen.has(key) || pending.has(key)) return false;
+    if (!isRestDiscoverySessionMarket(state, market)) return false;
+    return isFutureEligibleRestDiscoveryMarket(cfg, market, now);
+  });
+}
+
+function collectRestDiscoveryCandidates(cfg, seen, pending, state, markets) {
+  const now = Date.now();
+  const candidates = [];
+  let unknown = 0;
+  let knownFutureEligible = 0;
+
+  for (const market of markets) {
+    const rawKey = restDiscoveryMarketKey(market);
+    if (!rawKey) continue;
+    const key = eventSeenKey(market, cfg);
+    if (seen.has(key) || pending.has(key)) continue;
+
+    if (!state.knownMarketKeys.has(rawKey)) {
+      candidates.push(market);
+      unknown += 1;
+      continue;
+    }
+
+    if (isFutureEligibleRestDiscoveryMarket(cfg, market, now)) {
+      candidates.push(market);
+      knownFutureEligible += 1;
+    }
+  }
+
+  return { candidates, unknown, knownFutureEligible };
+}
+
+function isFutureEligibleRestDiscoveryMarket(cfg, market, now = Date.now()) {
+  const startMs = new Date(market?.startDate).getTime();
+  if (!Number.isFinite(startMs)) return false;
+  const actionMs = marketActionTimeMs(market, cfg);
+  return Number.isFinite(actionMs) && actionMs > now && marketFilterDecision(market, cfg).eligible;
+}
+
+function isRestDiscoverySessionMarket(state, market) {
+  const createdAt = new Date(market?.createdAt).getTime();
+  const startedAt = Number(state?.startedAtMs ?? 0);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(startedAt) || startedAt <= 0) return false;
+  return createdAt >= startedAt - 1000;
 }
 
 function rememberRestDiscoveryMarkets(state, markets) {
@@ -4749,7 +8457,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
 
   while (true) {
     try {
-      await preSignHotPendingMarkets(cfg, pending, runtime);
+      await preSignHotPendingMarkets(cfg, seen, pending, runtime);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       await drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, dueExecution, "chain-loop");
       await drainRestDiscoveryCandidates(cfg, seen, pending, runtime, restDiscovery);
@@ -4769,7 +8477,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
         for (const error of decodeErrors) {
           console.error(JSON.stringify({ level: "warn", source: "chain-decode", ...error }));
         }
-        await preSignHotPendingMarkets(cfg, pending, runtime);
+        await preSignHotPendingMarkets(cfg, seen, pending, runtime);
         scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
         fromBlock = toBlock + 1n;
         consecutiveErrors = 0;
@@ -4794,7 +8502,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
         return;
       }
     }
-    await sleep(nextWatchSleepMs(cfg, pending));
+    await sleep(nextWatchSleepMs(cfg, pending, runtime));
   }
 }
 
@@ -4856,9 +8564,12 @@ async function drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pen
 async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
   skipExpiredPendingMarkets(cfg, seen, pending, "pending-open-window");
   await dropFollowBlockedPendingRecords(cfg, seen, pending, runtime, "pending-follow-blocked");
-  const dueRecords = [...pending.values()].filter((record) => {
-    return msUntilRecordAction(record, cfg) <= 0;
+  const dueRecordsRaw = [...pending.values()].filter((record) => {
+    return msUntilRecordAction(record, cfg, runtime) <= 0;
   });
+  const dueLimit = splitRecordsByOpenLimit(cfg, dueRecordsRaw);
+  await markOpenLimitSkippedRecords(cfg, seen, pending, runtime, dueLimit.skipped, "pending-open-market-limit");
+  const dueRecords = dueLimit.selected;
   if (dueRecords.length === 0) return false;
 
   let didWork = false;
@@ -4875,10 +8586,10 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
     }
     for (const key of handled) pending.delete(key);
 
-    const grouped = groupRecordsByStartDate(dueRecords.filter((record) => {
+    const grouped = groupRecordsByActionTime(dueRecords.filter((record) => {
       const key = eventSeenKey(pendingMarket(record), cfg);
       return !handled.has(key) && !hasPreSignedBundle(record);
-    }));
+    }), cfg, runtime);
     for (const records of grouped.values()) {
       if (!records.every((record) => record.preparedPlan)) continue;
       const affordable = await selectAffordableDueRecords(cfg, records, "due-bundle");
@@ -4899,7 +8610,7 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
   for (const record of [...pending.values()]) {
     const market = pendingMarket(record);
     if (fundingBlockedKeys.has(eventSeenKey(market, cfg))) continue;
-    if (msUntilRecordAction(record, cfg) > 0) continue;
+    if (msUntilRecordAction(record, cfg, runtime) > 0) continue;
     if (hasPreSignedBundle(record)) continue;
     if (!hasPreSignedSingle(record)) {
       const affordable = await selectAffordableDueRecords(cfg, [record], "due-single");
@@ -4965,7 +8676,11 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
         runtime?.receiverAddress || cfg.walletAddress || "0x0000000000000000000000000000000000000001"
       );
     }
-    const result = await executeOrPrintBundle(bundle, cfg, runtime);
+    const openBroadcastTiming = describeOpenBroadcastTiming(
+      openBroadcastTimingForRecord(records[0], cfg, runtime)
+    );
+    let result = await executeOrPrintBundle(bundle, cfg, runtime);
+    if (openBroadcastTiming) result = { ...result, openBroadcastTiming };
     appendJsonl(cfg.fillsFile, {
       bundle: describeFastBundlePlan(bundle),
       result,
@@ -5053,21 +8768,32 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
   }
 }
 
-async function preSignHotPendingMarkets(cfg, pending, runtime) {
+async function preSignHotPendingMarkets(cfg, seen, pending, runtime) {
   if (!shouldPreSignFastTransactions(cfg, runtime)) return;
   const now = Date.now();
   const fundingBlockedKeys = new Set();
+  const openLimitKeys = recordKeysWithinOpenLimit(cfg, [...pending.values()]);
+  const recordAvailableForPreSign = (record, source) => {
+    const market = pendingMarket(record);
+    const key = eventSeenKey(market, cfg);
+    if (!seen?.has?.(key)) return true;
+    const cleared = clearSeenForFutureEligibleBuy(cfg, seen, market, source);
+    if (cleared) saveSeen(cfg.stateFile, seen);
+    return !seen.has(key);
+  };
   if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
-    const grouped = groupRecordsByStartDate([...pending.values()].filter((record) => {
+    const grouped = groupRecordsByActionTime([...pending.values()].filter((record) => {
+      if (!recordAvailableForPreSign(record, "pre-sign-bundle-future-buy")) return false;
+      if (openLimitKeys && !openLimitKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
       if (isMarketFollowBlocked(pendingMarket(record), cfg)) return false;
       if (
         !record.preparedPlan ||
         record.preSignedFastBundleTransaction ||
         !canRetryPreSign(record.bundlePreSignError, record.bundlePreSignRetryAfterMs, now, cfg)
       ) return false;
-      const actionWaitMs = msUntilAction(pendingMarket(record), cfg);
+      const actionWaitMs = msUntilRecordAction(record, cfg, runtime);
       return actionWaitMs > 0 && actionWaitMs <= cfg.preSignWindowMs;
-    }));
+    }), cfg, runtime);
 
     for (const records of grouped.values()) {
       const affordable = await selectAffordableDueRecords(cfg, records, "pre-sign-bundle");
@@ -5083,6 +8809,8 @@ async function preSignHotPendingMarkets(cfg, pending, runtime) {
 
   const records = [...pending.values()]
     .filter((record) => {
+      if (!recordAvailableForPreSign(record, "pre-sign-single-future-buy")) return false;
+      if (openLimitKeys && !openLimitKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
       if (fundingBlockedKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
       if (isMarketFollowBlocked(pendingMarket(record), cfg)) return false;
       if (
@@ -5091,7 +8819,7 @@ async function preSignHotPendingMarkets(cfg, pending, runtime) {
         record.preSignedFastBundleTransaction ||
         !canRetryPreSign(record.preSignError, record.preSignRetryAfterMs, now, cfg)
       ) return false;
-      const actionWaitMs = msUntilAction(pendingMarket(record), cfg);
+      const actionWaitMs = msUntilRecordAction(record, cfg, runtime);
       return actionWaitMs > 0 && actionWaitMs <= cfg.preSignWindowMs;
     })
     .sort((a, b) => compareStartAsc(pendingMarket(a), pendingMarket(b)));
@@ -5178,7 +8906,7 @@ async function attachPreSignedFastBundleTransaction(cfg, records, runtime) {
       outcomeCount: signed.outcomeCount,
       markets: bundle.markets.map((market) => market.address),
       startDate: pendingMarket(records[0]).startDate,
-      msUntilAction: msUntilAction(pendingMarket(records[0]), cfg)
+      msUntilAction: msUntilRecordAction(records[0], cfg, runtime)
     }));
   } catch (error) {
     const retryAfterMs = Date.now() + cfg.preSignRetryMs;
@@ -5293,7 +9021,12 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
   const source = options.source ?? "discovery";
   for (const market of markets) {
     const key = eventSeenKey(market, cfg);
-    if (seen.has(key) || pending.has(key)) continue;
+    if (seen.has(key)) {
+      const cleared = clearSeenForFutureEligibleBuy(cfg, seen, market, `${source}-future-buy`);
+      if (cleared) saveSeen(cfg.stateFile, seen);
+      if (seen.has(key)) continue;
+    }
+    if (pending.has(key)) continue;
     const decision = marketFilterDecision(market, cfg);
     if (!decision.eligible) {
       recordMarketDecision(cfg, market, "filtered", { source, decision });
@@ -5307,7 +9040,7 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
       continue;
     }
 
-    const dueNow = msUntilAction(market, cfg) <= 0;
+    const dueNow = msUntilRecordAction({ market }, cfg, runtime) <= 0;
     const shouldHydrateDueOdds = Boolean(options.hydrateDueOdds);
     const record = await preparePendingRecord(cfg, market, runtime, {
       hydrateOdds: !(dueNow && cfg.fastSkipDueRestHydration && !shouldHydrateDueOdds),
@@ -5320,7 +9053,8 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
         message: record.prepareError
       });
     }
-    if (dueNow) {
+    const recordDueNow = msUntilRecordAction(record, cfg, runtime) <= 0;
+    if (recordDueNow) {
       recordMarketDecision(cfg, pendingMarket(record), "due", {
         source,
         decision,
@@ -5335,13 +9069,6 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
       continue;
     }
 
-    await maybeExecuteMarket(cfg, seen, market, {
-      allowFuturePending: true,
-      runtime,
-      preparedPlan: record.preparedPlan,
-      preSignedFastTransaction: record.preSignedFastTransaction,
-      retryRecord: record
-    });
     if (!seen.has(key)) {
       pending.set(key, record);
       recordMarketDecision(cfg, pendingMarket(record), "pending", {
@@ -5358,9 +9085,13 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
   }
 
   if (immediateRecords.length === 0) return;
+  const immediateLimit = splitRecordsByOpenLimit(cfg, immediateRecords);
+  await markOpenLimitSkippedRecords(cfg, seen, pending, runtime, immediateLimit.skipped, "immediate-open-market-limit");
+  const executableImmediateRecords = immediateLimit.selected;
+  if (executableImmediateRecords.length === 0) return;
   const fundingBlockedKeys = new Set();
   if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
-    const grouped = groupRecordsByStartDate(immediateRecords);
+    const grouped = groupRecordsByActionTime(executableImmediateRecords, cfg, runtime);
     const bundled = new Set();
     for (const records of grouped.values()) {
       if (records.length <= 1 || !records.every((record) => record.preparedPlan)) continue;
@@ -5384,7 +9115,7 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
     }
   }
 
-  for (const record of immediateRecords) {
+  for (const record of executableImmediateRecords) {
     const market = pendingMarket(record);
     const key = eventSeenKey(market, cfg);
     if (seen.has(key)) continue;
@@ -5566,8 +9297,413 @@ function formatDuration(market) {
   return `${hours}小时`;
 }
 
+function plannedBuyForMarket(cfg, market) {
+  if (!cfg?.eventPlannedBuysFile || !market) return null;
+  const plans = readPlannedBuys(cfg);
+  if (plans.length === 0) return null;
+  const marketAddress = normalizePlannedBuyAddress(market.address);
+  const marketQuestion = normalizePlannedBuyQuestion(market.question);
+  const marketQuestionText = String(market.question ?? "").trim().replace(/\s+/gu, " ");
+  return plans.find((plan) => {
+    if (!plan.enabled) return false;
+    if (plan.market && marketAddress && plan.market === marketAddress) return true;
+    if (plan.question && marketQuestion && plan.question === marketQuestion) return true;
+    if (plan.questionRegex && marketQuestionText && plannedBuyQuestionRegexMatches(plan.questionRegex, marketQuestionText)) return true;
+    return false;
+  }) ?? null;
+}
+
+function readPlannedBuys(cfg) {
+  const file = cfg?.eventPlannedBuysFile;
+  if (!file) return [];
+  try {
+    const stat = fs.statSync(file);
+    const cacheKey = `${stat.mtimeMs}:${stat.size}`;
+    const cached = plannedBuysFileCache.get(file);
+    if (cached?.cacheKey === cacheKey) return cached.plans;
+    const json = JSON.parse(fs.readFileSync(file, "utf8"));
+    const rows = Array.isArray(json) ? json : (Array.isArray(json?.plans) ? json.plans : []);
+    const plans = rows.map(normalizePlannedBuy).filter(Boolean);
+    plannedBuysFileCache.set(file, { cacheKey, plans });
+    return plans;
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    const cached = plannedBuysFileCache.get(file);
+    if (!cached?.lastErrorAt || Date.now() - cached.lastErrorAt > 60000) {
+      plannedBuysFileCache.set(file, { ...cached, lastErrorAt: Date.now() });
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "planned-buys-load",
+        file,
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+    }
+    return cached?.plans ?? [];
+  }
+}
+
+function normalizePlannedBuy(row) {
+  if (!row || typeof row !== "object") return null;
+  const outcomes = plannedBuyOutcomeNames(row);
+  if (outcomes.length === 0) return null;
+  const market = normalizePlannedBuyAddress(row.market ?? row.address);
+  const question = normalizePlannedBuyQuestion(row.question ?? row.title);
+  const questionRegex = normalizePlannedBuyQuestionRegex(row.questionRegex ?? row.titleRegex);
+  if (!market && !question && !questionRegex) return null;
+  const stakePerOutcomeUsdt = Number(row.stakePerOutcomeUsdt ?? row.stake ?? row.stakeUsdt);
+  const kickoffAt = normalizePlannedBuyDate(row.kickoffAt ?? row.marketStartAt ?? row.matchStartAt);
+  const autoSell = normalizePlannedBuyAutoSell(row.autoSell, outcomes);
+  const openBroadcastDelayMs = normalizePlannedBuyOpenBroadcastDelayMs(row);
+  const gasPriceGwei = normalizePlannedBuyGasPriceGwei(row);
+  const broadcastRpcUrls = normalizePlannedBuyBroadcastRpcUrls(row);
+  return {
+    id: String(row.id ?? market ?? question ?? questionRegex),
+    enabled: row.enabled !== false && row.disabled !== true,
+    market,
+    question,
+    questionRegex,
+    outcomes,
+    stakePerOutcomeUsdt: Number.isFinite(stakePerOutcomeUsdt) && stakePerOutcomeUsdt > 0
+      ? stakePerOutcomeUsdt
+      : null,
+    kickoffAt,
+    openBroadcastDelayMs,
+    gasPriceGwei,
+    broadcastRpcUrls,
+    autoSell,
+    note: String(row.note ?? "").trim() || null
+  };
+}
+
+function normalizePlannedBuyAutoSell(row, selectedOutcomes = []) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const result = {};
+  takeOptionalBoolean(row, result, "autoSellEnabled", ["enabled"]);
+  const strategy = normalizePlannedBuyAutoSellStrategy(firstDefinedValue(row, ["autoSellStrategy", "strategy"]));
+  if (strategy) {
+    result.autoSellStrategy = strategy;
+    if (strategy === "hold_to_settlement") result.autoSellEnabled = false;
+  }
+  takeOptionalNumber(row, result, "autoSellLadderProfitPercent", ["ladderProfitPercent", "profitPercent"]);
+  takeOptionalNumber(row, result, "autoSellChunkPercent", ["chunkPercent"]);
+  takeOptionalInteger(row, result, "autoSellTakeProfitSteps", ["takeProfitSteps"]);
+  takeOptionalInteger(row, result, "autoSellBeforeMarketStartSeconds", ["beforeMarketStartSeconds", "preStartSeconds"]);
+  takeOptionalBoolean(row, result, "autoSellStopLossEnabled", ["stopLossEnabled"]);
+  takeOptionalNumber(row, result, "autoSellStopLossPercent", ["stopLossPercent"]);
+  takeOptionalNumber(row, result, "autoSellStopLossSellPercent", ["stopLossSellPercent"]);
+  const retainPositions = normalizePlannedBuyRetainPositions(
+    firstDefinedValue(row, ["retainPositions", "retainedPositions"]),
+    selectedOutcomes
+  );
+  if (retainPositions.length > 0) result.autoSellRetainPositions = retainPositions;
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function normalizePlannedBuyRetainPositions(rows, selectedOutcomes = []) {
+  if (rows === undefined || rows === null || rows === "") return [];
+  if (!Array.isArray(rows)) throw new Error("autoSell.retainPositions must be an array");
+  const selectedByKey = new Map();
+  for (const selected of selectedOutcomes) {
+    const outcome = String(selected ?? "").trim();
+    const key = normalizePlannedBuyOutcomeName(outcome);
+    if (!key) continue;
+    if (selectedByKey.has(key)) {
+      throw new Error(`duplicate planned outcome after normalization: ${outcome}`);
+    }
+    selectedByKey.set(key, outcome);
+  }
+  const seen = new Set();
+  return rows.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`autoSell.retainPositions[${index}] must be an object`);
+    }
+    const outcome = String(firstDefinedValue(entry, ["outcome", "name", "outcomeName"]) ?? "").trim();
+    const key = normalizePlannedBuyOutcomeName(outcome);
+    if (!key) throw new Error(`autoSell.retainPositions[${index}].outcome is required`);
+    if (seen.has(key)) throw new Error(`duplicate retained outcome after normalization: ${outcome}`);
+    const selectedOutcome = selectedByKey.get(key);
+    if (!selectedOutcome) {
+      throw new Error(`retained outcome is not in the planned selected outcomes: ${outcome}`);
+    }
+    const retainPercent = Number(firstDefinedValue(entry, ["retainPercent", "percent", "retainChipPercent", "chipPercent"]));
+    if (!Number.isFinite(retainPercent) || retainPercent <= 0 || retainPercent > 100) {
+      throw new Error(`invalid retainPercent for retained outcome ${outcome}`);
+    }
+    seen.add(key);
+    return {
+      outcome: selectedOutcome,
+      retainPercent
+    };
+  });
+}
+
+function normalizePlannedBuyAutoSellStrategy(value) {
+  if (value === undefined || value === null || value === "") return "";
+  const strategy = String(value).trim().toLowerCase();
+  if (["hold_to_settlement", "hold", "disabled", "off", "none"].includes(strategy)) return "hold_to_settlement";
+  if (["pre_start", "prestart", "pre_start_only", "prestart_only", "hold_until_pre_start"].includes(strategy)) {
+    return "pre_start_exit";
+  }
+  if (["ladder", "open_timed_exit", "pre_start_exit", "legacy"].includes(strategy)) return strategy;
+  return "";
+}
+
+function normalizePlannedBuyOpenBroadcastDelayMs(row) {
+  const rawMs = firstDefinedValue(row, ["openBroadcastDelayMs", "buyDelayMs", "broadcastDelayMs", "openDelayMs"]);
+  if (rawMs !== undefined && rawMs !== null && rawMs !== "") {
+    const value = Number(rawMs);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+  }
+  const rawSeconds = firstDefinedValue(row, ["openBroadcastDelaySeconds", "buyDelaySeconds", "broadcastDelaySeconds", "openDelaySeconds"]);
+  if (rawSeconds !== undefined && rawSeconds !== null && rawSeconds !== "") {
+    const value = Number(rawSeconds);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value * 1000) : null;
+  }
+  return null;
+}
+
+function normalizePlannedBuyGasPriceGwei(row) {
+  const raw = firstDefinedValue(row, ["gasPriceGwei", "buyGasPriceGwei", "gasGwei", "buyGasGwei"]);
+  if (raw === undefined || raw === null || raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0.01 || value > 50) return null;
+  return String(raw).trim();
+}
+
+function normalizePlannedBuyBroadcastRpcUrls(row) {
+  const raw = firstDefinedValue(row, ["broadcastRpcUrls", "buyBroadcastRpcUrls", "broadcastRpcUrl", "buyBroadcastRpcUrl"]);
+  if (raw === undefined || raw === null || raw === "") return [];
+  const items = Array.isArray(raw) ? raw : String(raw).split(",");
+  const seen = new Set();
+  const urls = [];
+  for (const item of items) {
+    const url = String(item ?? "").trim();
+    if (!/^https?:\/\//iu.test(url)) continue;
+    try {
+      new URL(url);
+    } catch {
+      continue;
+    }
+    if (seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+  }
+  return urls;
+}
+
+function takeOptionalNumber(source, target, key, aliases = []) {
+  const raw = firstDefinedValue(source, [key, ...aliases]);
+  if (raw === undefined || raw === null || raw === "") return;
+  const value = Number(raw);
+  if (Number.isFinite(value)) target[key] = value;
+}
+
+function takeOptionalInteger(source, target, key, aliases = []) {
+  const raw = firstDefinedValue(source, [key, ...aliases]);
+  if (raw === undefined || raw === null || raw === "") return;
+  const value = Number(raw);
+  if (Number.isFinite(value)) target[key] = Math.floor(value);
+}
+
+function takeOptionalBoolean(source, target, key, aliases = []) {
+  const raw = firstDefinedValue(source, [key, ...aliases]);
+  if (raw === undefined || raw === null || raw === "") return;
+  target[key] = parseLooseBoolean(raw);
+}
+
+function firstDefinedValue(source, keys) {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) return source[key];
+  }
+  return undefined;
+}
+
+function parseLooseBoolean(value) {
+  if (typeof value === "boolean") return value;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+}
+
+function plannedBuyOutcomeNames(row) {
+  const raw = row.outcomes ?? row.outcomeNames ?? row.names;
+  if (Array.isArray(raw)) return raw.map((item) => String(item).trim()).filter(Boolean);
+  return String(raw ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizePlannedBuyAddress(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/u.test(text) ? text : "";
+}
+
+function normalizePlannedBuyQuestion(value) {
+  return String(value ?? "").trim().replace(/\s+/gu, " ").toLowerCase();
+}
+
+function normalizePlannedBuyQuestionRegex(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  new RegExp(text, "iu");
+  return text;
+}
+
+function plannedBuyQuestionRegexMatches(pattern, question) {
+  try {
+    return new RegExp(pattern, "iu").test(question);
+  } catch {
+    return false;
+  }
+}
+
+function normalizePlannedBuyOutcomeName(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/[\u2010-\u2015\u2212]/gu, "-")
+    .replace(/\u2265/gu, ">=")
+    .replace(/\u2264/gu, "<=")
+    .replace(/\s+/gu, " ")
+    .replace(/([<>]=?)\s+(?=[\d.])/gu, "$1")
+    .toLowerCase();
+}
+
+function normalizePlannedBuyDate(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+function plannedBuyConfigForMarket(cfg, market) {
+  const plan = plannedBuyForMarket(cfg, market);
+  if (!plan) return cfg;
+  const stakePerOutcomeUsdt = Number(plan.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
+  const totalStakeUsdt = roundUsd(stakePerOutcomeUsdt * plan.outcomes.length);
+  return {
+    ...cfg,
+    eventOutcomeSelection: "names",
+    eventOutcomeNames: plan.outcomes.join(","),
+    eventOutcomeCount: plan.outcomes.length,
+    stakePerOutcomeUsdt,
+    maxStakeUsdt: Math.max(Number(cfg.maxStakeUsdt ?? 0), stakePerOutcomeUsdt),
+    maxOutcomesPerMarket: Math.max(Number(cfg.maxOutcomesPerMarket ?? 0), plan.outcomes.length),
+    maxMarketStakeUsdt: Math.max(Number(cfg.maxMarketStakeUsdt ?? 0), totalStakeUsdt),
+    maxBatchStakeUsdt: Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), totalStakeUsdt),
+    gasPriceGwei: plan.gasPriceGwei ?? cfg.gasPriceGwei,
+    broadcastRpcUrls: plan.broadcastRpcUrls?.length ? plan.broadcastRpcUrls : cfg.broadcastRpcUrls,
+    plannedBuy: {
+      id: plan.id,
+      market: plan.market,
+      question: plan.question,
+      outcomes: plan.outcomes,
+      stakePerOutcomeUsdt,
+      totalStakeUsdt,
+      kickoffAt: plan.kickoffAt,
+      openBroadcastDelayMs: plan.openBroadcastDelayMs,
+      gasPriceGwei: plan.gasPriceGwei,
+      broadcastRpcUrls: plan.broadcastRpcUrls,
+      autoSell: plan.autoSell,
+      note: plan.note
+    }
+  };
+}
+
+function eventBuyConfigForMarket(cfg, market) {
+  if (plannedBuyForMarket(cfg, market)) return plannedBuyConfigForMarket(cfg, market);
+  return bot3FifaExactScoreConfigForMarket(cfg, market) ?? cfg;
+}
+
+function clearSeenForFuturePlannedBuy(cfg, seen, market, source) {
+  return clearSeenForFutureEligibleBuy(cfg, seen, market, source, { requirePlannedBuy: true });
+}
+
+function clearSeenForFutureEligibleBuy(cfg, seen, market, source, { requirePlannedBuy = false } = {}) {
+  if (!seen || !market) return false;
+  const key = eventSeenKey(market, cfg);
+  if (!seen.has(key)) return false;
+  const planned = plannedBuyForMarket(cfg, market);
+  if (requirePlannedBuy && !planned) return false;
+  if (msUntilStart(market) <= 0) return false;
+  if (msUntilRecordAction({ market, openBroadcastDelayMs: planned?.openBroadcastDelayMs ?? null }, cfg) <= 0) return false;
+  if (isMarketFollowBlocked(market, cfg)) return false;
+  const decision = marketFilterDecision(market, cfg);
+  if (!decision.eligible) return false;
+  seen.delete(key);
+  recordMarketDecision(cfg, market, "seen-override", {
+    source,
+    message: planned ? "planned buy overrides prior seen record" : "future eligible buy overrides prior seen record",
+    decision,
+    once: false
+  });
+  return true;
+}
+
+function annotatePlannedBuyPlan(plan, buyCfg) {
+  if (!buyCfg?.plannedBuy) return plan;
+  return {
+    ...plan,
+    plannedBuy: buyCfg.plannedBuy,
+    selection: {
+      ...(plan.selection ?? {}),
+      plannedBuy: true,
+      plannedBuyId: buyCfg.plannedBuy.id
+    }
+  };
+}
+
+function annotateBuyConfigPlan(plan, buyCfg) {
+  return annotateBot3FifaExactScorePlan(annotatePlannedBuyPlan(plan, buyCfg), buyCfg);
+}
+
+function executionConfigForPlan(cfg, plan) {
+  if (!plan?.selection?.plannedBuy) return cfg;
+  const totalStakeUsdt = Number(plan.totalStakeUsdt ?? 0);
+  const stakePerOutcomeUsdt = Number(plan.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
+  return {
+    ...cfg,
+    eventOutcomeSelection: "names",
+    eventOutcomeNames: plan.plannedBuy?.outcomes?.join(",") ?? cfg.eventOutcomeNames,
+    eventOutcomeCount: plan.outcomes?.length ?? cfg.eventOutcomeCount,
+    stakePerOutcomeUsdt,
+    maxStakeUsdt: Math.max(Number(cfg.maxStakeUsdt ?? 0), stakePerOutcomeUsdt),
+    maxMarketStakeUsdt: Math.max(Number(cfg.maxMarketStakeUsdt ?? 0), totalStakeUsdt),
+    maxBatchStakeUsdt: Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), totalStakeUsdt),
+    gasPriceGwei: plan.plannedBuy?.gasPriceGwei ?? cfg.gasPriceGwei,
+    broadcastRpcUrls: plan.plannedBuy?.broadcastRpcUrls?.length
+      ? plan.plannedBuy.broadcastRpcUrls
+      : cfg.broadcastRpcUrls
+  };
+}
+
 function marketFilterDecision(market, cfg) {
   const decision = getEventMarketDecision(market, cfg);
+  const planned = plannedBuyForMarket(cfg, market);
+  if (planned && !["missing-market", "status", "no-outcomes", "price-market"].includes(decision.reason)) {
+    return {
+      ...decision,
+      eligible: true,
+      reason: "planned-buy",
+      reasonText: "手动计划买入",
+      tags: [...(decision.tags ?? []), "计划买入"]
+    };
+  }
+  const bot3Fifa = bot3FifaExactScoreConfigForMarket(cfg, market)?.bot3FifaExactScoreAutoBuy?.preview ?? null;
+  if (bot3Fifa && !["missing-market", "status", "no-outcomes", "price-market"].includes(decision.reason)) {
+    return {
+      ...decision,
+      eligible: true,
+      reason: "bot3-fifa-exact-score-auto-buy",
+      reasonText: "Bot3 FIFA 精确比分最低价格档自动买入",
+      tags: [
+        ...(decision.tags ?? []),
+        "Bot3",
+        "FIFA 精确比分",
+        "最低价格档",
+        bot3Fifa.selectedSide === "home_win" ? "主队胜档" : "客队胜档"
+      ]
+    };
+  }
   if (!decision.eligible) return decision;
   if (filterEventMarkets([market], cfg).length > 0) return decision;
   return {
@@ -5633,12 +9769,90 @@ function groupRecordsByStartDate(records) {
   return groups;
 }
 
+function groupRecordsByActionTime(records, cfg, runtime = null) {
+  const groups = new Map();
+  for (const record of records) {
+    const key = stableRecordActionGroupTimeMs(record, cfg, runtime);
+    if (!Number.isFinite(key)) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(record);
+  }
+  return groups;
+}
+
+function stableRecordActionGroupTimeMs(record, cfg, runtime = null) {
+  const timing = openBroadcastTimingForRecord(record, cfg, runtime);
+  if (timing.mode === "block_aware_20s") return timing.fixedTargetMs;
+  return timing.targetMs;
+}
+
+function recordKeysWithinOpenLimit(cfg, records) {
+  const limit = Number(cfg.eventMaxDueMarketsPerOpen ?? 0);
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  const selected = new Set();
+  for (const group of groupRecordsByStartDate(records).values()) {
+    const sorted = sortRecordsByBuyPriority(group);
+    const planned = sorted.filter((record) => isPlannedBuyItem(record, cfg));
+    const picked = planned.length > 0 ? planned : sorted.slice(0, limit);
+    for (const record of picked) {
+      selected.add(eventSeenKey(pendingMarket(record), cfg));
+    }
+  }
+  return selected;
+}
+
+function splitRecordsByOpenLimit(cfg, records) {
+  const allowedKeys = recordKeysWithinOpenLimit(cfg, records);
+  if (!allowedKeys) return { selected: records, skipped: [] };
+  const selected = [];
+  const skipped = [];
+  for (const record of records) {
+    if (allowedKeys.has(eventSeenKey(pendingMarket(record), cfg))) selected.push(record);
+    else skipped.push(record);
+  }
+  return { selected, skipped };
+}
+
+async function markOpenLimitSkippedRecords(cfg, seen, pending, runtime, records, source) {
+  if (!records.length) return;
+  let resetNonce = false;
+  for (const record of records) {
+    const market = pendingMarket(record);
+    const key = eventSeenKey(market, cfg);
+    if (hasPreSignedSingle(record) || hasPreSignedBundle(record)) resetNonce = true;
+    clearPreSignedSingleRecord(record, "open-market-limit");
+    clearPreSignedBundleRecords([record], "open-market-limit");
+    pending?.delete?.(key);
+    seen.add(key);
+    const row = {
+      level: "event-skip-open-market-limit",
+      source,
+      market: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      maxDueMarketsPerOpen: cfg.eventMaxDueMarketsPerOpen,
+      reason: `only first ${cfg.eventMaxDueMarketsPerOpen} market(s) per open are enabled`,
+      at: new Date().toISOString()
+    };
+    appendJsonl(cfg.fillsFile, row);
+    recordMarketDecision(cfg, market, "skipped", {
+      source,
+      message: row.reason,
+      dedupeKey: `${String(market.address).toLowerCase()}:skipped-open-market-limit`
+    });
+    console.error(JSON.stringify(row));
+  }
+  if (resetNonce) await resetRuntimeNonceToPending(cfg, runtime, "open_market_limit");
+  saveSeen(cfg.stateFile, seen);
+}
+
 function selectedOutcomeCount(market, cfg) {
-  return estimateSelectedOutcomeCount(market, cfg);
+  return estimateSelectedOutcomeCount(market, eventBuyConfigForMarket(cfg, market));
 }
 
 function selectedStakeUsdt(market, cfg) {
-  return cfg.stakePerOutcomeUsdt * selectedOutcomeCount(market, cfg);
+  const buyCfg = eventBuyConfigForMarket(cfg, market);
+  return buyCfg.stakePerOutcomeUsdt * selectedOutcomeCount(market, cfg);
 }
 
 function batchSelectedOutcomeCount(markets, cfg) {
@@ -5671,7 +9885,7 @@ async function selectAffordableDueRecords(cfg, records, source) {
 }
 
 function selectAffordableRecords(cfg, records, walletStatus) {
-  const budget = walletBudgetUsdt(cfg, walletStatus);
+  const budget = walletBudgetUsdt(cfg, walletStatus, records);
   let remaining = budget;
   const selected = [];
   const skipped = [];
@@ -5695,7 +9909,7 @@ function selectAffordableRecords(cfg, records, walletStatus) {
 }
 
 function selectAffordableMarketSummaries(cfg, markets, walletStatus) {
-  const budget = walletBudgetUsdt(cfg, walletStatus);
+  const budget = walletBudgetUsdt(cfg, walletStatus, markets);
   let remaining = budget;
   const selected = [];
   const skipped = [];
@@ -5719,26 +9933,64 @@ function selectAffordableMarketSummaries(cfg, markets, walletStatus) {
 }
 
 function walletHasBnbForRecords(cfg, records, walletStatus) {
-  return walletHasBnbForMarkets(cfg, records.map((record) => pendingMarket(record)), walletStatus);
+  return walletHasBnbForMarkets(cfg, records.map((record) => recordFundingSummary(record, cfg)), walletStatus);
 }
 
 function walletHasBnbForMarkets(cfg, markets, walletStatus) {
   if (!walletStatus?.bnbBalance) return true;
   try {
-    const reserve = calculateFastGasReserve(cfg, fundingForMarketSummaries(cfg, markets));
+    const reserve = calculateFundingGasReserve(cfg, fundingForMarketSummaries(cfg, markets));
     return Number(walletStatus.bnbBalance) >= Number(reserve.requiredBnb);
   } catch {
     return true;
   }
 }
 
-function walletBudgetUsdt(cfg, walletStatus) {
+function walletBudgetUsdt(cfg, walletStatus, items = []) {
   if (!walletStatus) return 0;
+  const plannedCap = plannedBatchStakeCap(cfg, items);
+  const batchCap = Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), plannedCap);
   return roundUsd(Math.max(0, Math.min(
     Number(walletStatus.busdtBalance ?? 0),
     Number(walletStatus.busdtAllowanceToRouter ?? 0),
-    Number(cfg.maxBatchStakeUsdt ?? Infinity)
+    batchCap || Infinity
   )));
+}
+
+function plannedBatchStakeCap(cfg, items = []) {
+  return roundUsd((items ?? []).reduce((sum, item) => {
+    if (!isPlannedBuyItem(item, cfg)) return sum;
+    return sum + itemStakeUsdt(item, cfg);
+  }, 0));
+}
+
+function isPlannedBuyItem(item, cfg) {
+  if (item?.preparedPlan?.selection?.plannedBuy) return true;
+  return Boolean(plannedBuyForMarket(cfg, pendingMarket(item)));
+}
+
+function itemStakeUsdt(item, cfg) {
+  return Number(item?.preparedPlan?.totalStakeUsdt ?? item?.totalStakeUsdt ?? selectedStakeUsdt(pendingMarket(item), cfg));
+}
+
+function recordFundingSummary(record, cfg) {
+  const market = pendingMarket(record);
+  return marketFundingSummary(market, cfg, {
+    totalStakeUsdt: recordStakeUsdt(record, cfg),
+    outcomeCount: record?.preparedPlan?.outcomes?.length ?? selectedOutcomeCount(market, cfg),
+    gasPriceGwei: record?.preparedPlan?.plannedBuy?.gasPriceGwei ?? null
+  });
+}
+
+function marketFundingSummary(market, cfg, overrides = {}) {
+  const gasPriceGwei = overrides.gasPriceGwei ?? plannedBuyForMarket(cfg, market)?.gasPriceGwei ?? null;
+  return {
+    ...market,
+    totalStakeUsdt: overrides.totalStakeUsdt ?? roundUsd(selectedStakeUsdt(market, cfg)),
+    outcomeCount: overrides.outcomeCount ?? selectedOutcomeCount(market, cfg),
+    availableOutcomeCount: market?.outcomes?.length ?? 0,
+    gasPriceGwei
+  };
 }
 
 function fundingForMarketSummaries(cfg, markets, baseFunding = {}) {
@@ -5746,6 +9998,10 @@ function fundingForMarketSummaries(cfg, markets, baseFunding = {}) {
   const requiredBusdt = roundUsd(sorted.reduce((sum, market) => {
     return sum + Number(market.totalStakeUsdt ?? selectedStakeUsdt(market, cfg));
   }, 0));
+  const gasPrices = sorted
+    .map((market) => Number(market.gasPriceGwei))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const nextBatchGasPriceGwei = gasPrices.length > 0 ? String(Math.max(...gasPrices)) : baseFunding.nextBatchGasPriceGwei;
   return {
     ...baseFunding,
     reason: sorted.length > 0 ? "affordable_opening_subset" : (baseFunding.reason ?? "single_market_upper_bound"),
@@ -5755,7 +10011,52 @@ function fundingForMarketSummaries(cfg, markets, baseFunding = {}) {
     nextBatchOutcomeCount: sorted.reduce((sum, market) => sum + Number(market.outcomeCount ?? selectedOutcomeCount(market, cfg)), 0),
     nextBatchAvailableOutcomeCount: sorted.reduce((sum, market) => sum + Number(market.availableOutcomeCount ?? market.outcomes?.length ?? 0), 0),
     nextBatchStartDate: sorted[0]?.startDate ?? baseFunding.nextBatchStartDate ?? null,
+    nextBatchGasPriceGwei,
     nextBatchMarkets: sorted
+  };
+}
+
+async function estimateFundingGasReserve(publicClient, cfg, funding = {}) {
+  const direct = calculateFundingGasReserve(cfg, funding);
+  if (direct) return direct;
+  return estimateFastGasReserve(publicClient, cfg, funding);
+}
+
+function calculateFundingGasReserve(cfg, funding = {}) {
+  const markets = Array.isArray(funding.nextBatchMarkets) ? funding.nextBatchMarkets : [];
+  if (cfg.bundleDueMarkets || markets.length <= 1) {
+    return calculateFastGasReserve(cfg, funding);
+  }
+
+  let requiredWei = 0n;
+  let gasLimit = 0n;
+  let maxGasPriceWei = 0n;
+  const perMarket = [];
+  for (const market of markets) {
+    const marketFunding = fundingForMarketSummaries(cfg, [market], funding);
+    const reserve = calculateFastGasReserve(cfg, marketFunding);
+    const required = parseUnits(String(reserve.requiredBnb), 18);
+    const limit = BigInt(reserve.gasLimit ?? 0);
+    const price = BigInt(reserve.gasPriceWei ?? 0);
+    requiredWei += required;
+    gasLimit += limit;
+    if (price > maxGasPriceWei) maxGasPriceWei = price;
+    perMarket.push({
+      question: market.question ?? null,
+      outcomeCount: Number(market.outcomeCount ?? 0),
+      gasPriceGwei: reserve.gasPriceGwei,
+      gasLimit: reserve.gasLimit,
+      requiredBnb: reserve.requiredBnb
+    });
+  }
+
+  return {
+    mode: "multi_single_fast",
+    gasLimit: gasLimit.toString(),
+    gasPriceWei: maxGasPriceWei.toString(),
+    gasPriceGwei: maxGasPriceWei > 0n ? formatUnits(maxGasPriceWei, 9) : null,
+    requiredBnb: formatUnits(requiredWei, 18),
+    perMarket
   };
 }
 
@@ -5809,7 +10110,7 @@ function fundingBlockDetails(cfg, record, walletStatus) {
     };
   }
   try {
-    const reserve = calculateFastGasReserve(cfg, fundingForMarketSummaries(cfg, [pendingMarket(record)]));
+    const reserve = calculateFastGasReserve(cfg, fundingForMarketSummaries(cfg, [recordFundingSummary(record, cfg)]));
     const bnbBalance = Number(walletStatus?.bnbBalance ?? 0);
     if (bnbBalance < Number(reserve.requiredBnb)) {
       return {
@@ -5851,6 +10152,22 @@ async function ensureStartupRouterApproval(cfg) {
 
   const requiredUsdt = routerApprovalRequiredUsdt(cfg);
   const result = await approveRouterMax(cfg, { requiredUsdt });
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "approval",
+    source: "router-approval-startup",
+    wallet: result.address,
+    txHashKey: "approveHash",
+    fieldPrefix: "approve",
+    metadata: { router: result.router, requiredAllowance: result.requiredAllowance }
+  });
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "approval",
+    source: "router-approval-reset-startup",
+    wallet: result.address,
+    txHashKey: "resetHash",
+    fieldPrefix: "reset",
+    metadata: { router: result.router, requiredAllowance: result.requiredAllowance }
+  });
   const summary = {
     level: "event-router-approval-startup",
     requiredUsdt,
@@ -5876,8 +10193,30 @@ async function ensureStartupRouterApproval(cfg) {
   return result;
 }
 
+function genericUpperBoundRequiredBusdt(cfg) {
+  return roundUsd(cfg.stakePerOutcomeUsdt * estimateMaxSelectedOutcomeCount(cfg));
+}
+
+function bot3FifaExactScoreAutoFallbackBusdt(cfg) {
+  if (!bot3FifaExactScoreAutoBuyActive(cfg)) return null;
+  const stake = Number(cfg.bot3FifaExactScoreAutoStakeUsdt ?? 0);
+  if (!Number.isFinite(stake) || stake <= 0) return null;
+  return roundUsd(stake * 3);
+}
+
+function fundingUpperBoundRequiredBusdt(cfg) {
+  const genericRequired = genericUpperBoundRequiredBusdt(cfg);
+  const bot3FifaAutoRequired = bot3FifaExactScoreAutoFallbackBusdt(cfg);
+  if (cfg.watchFundingMode === "next_batch" && bot3FifaAutoRequired !== null) {
+    return Math.min(genericRequired, bot3FifaAutoRequired);
+  }
+  return genericRequired;
+}
+
 function computeFundingRequirement(cfg, eventMarkets = []) {
-  const upperBoundRequiredBusdt = roundUsd(cfg.stakePerOutcomeUsdt * estimateMaxSelectedOutcomeCount(cfg));
+  const genericUpperBoundBusdt = genericUpperBoundRequiredBusdt(cfg);
+  const bot3FifaExactScoreAutoFallbackRequiredBusdt = bot3FifaExactScoreAutoFallbackBusdt(cfg);
+  const upperBoundRequiredBusdt = fundingUpperBoundRequiredBusdt(cfg);
   const futureMarkets = eventMarkets
     .filter((market) => msUntilStart(market) > 0)
     .sort(compareMarketBuyPriority);
@@ -5899,24 +10238,24 @@ function computeFundingRequirement(cfg, eventMarkets = []) {
 
   return {
     mode: cfg.watchFundingMode,
-    reason: useNextBatch ? "known_next_opening_batch" : "single_market_upper_bound",
+    reason: useNextBatch
+      ? "known_next_opening_batch"
+      : (upperBoundRequiredBusdt < genericUpperBoundBusdt
+        ? "bot3_fifa_exact_score_auto_single_market_fallback"
+        : "single_market_upper_bound"),
     requiredBusdt,
     minimumExecutableBusdt,
     upperBoundRequiredBusdt,
+    genericUpperBoundRequiredBusdt: genericUpperBoundBusdt,
+    bot3FifaExactScoreAutoFallbackRequiredBusdt,
     nextBatchRequiredBusdt,
     nextBatchMarketCount: nextBatch.length,
     nextBatchOutcomeCount: batchSelectedOutcomeCount(nextBatch, cfg),
     nextBatchAvailableOutcomeCount: nextBatch.reduce((sum, market) => sum + (market.outcomes?.length ?? 0), 0),
     nextBatchStartDate: nextBatch[0]?.startDate ?? null,
-    nextBatchMarkets: nextBatch.map((market) => ({
-      question: market.question,
-      address: market.address,
-      startDate: market.startDate,
-      endDate: market.endDate,
-      durationHours: marketDurationHours(market),
-      outcomeCount: selectedOutcomeCount(market, cfg),
-      availableOutcomeCount: market.outcomes?.length ?? 0,
-      totalStakeUsdt: roundUsd(selectedStakeUsdt(market, cfg))
+    nextBatchMarkets: nextBatch.map((market) => marketFundingSummary(market, cfg, {
+      totalStakeUsdt: roundUsd(selectedStakeUsdt(market, cfg)),
+      outcomeCount: selectedOutcomeCount(market, cfg)
     }))
   };
 }
@@ -5971,7 +10310,8 @@ async function preparePendingRecord(cfg, market, runtime = null, options = {}) {
     bundlePreSignRetryAfterMs: null,
     executionError: null,
     executionAttempts: 0,
-    executionRetryAfterMs: null
+    executionRetryAfterMs: null,
+    openBroadcastDelayMs: null
   };
   if (cfg.eventBuyMode !== "fast") return record;
 
@@ -5984,11 +10324,14 @@ async function preparePendingRecord(cfg, market, runtime = null, options = {}) {
           oddsHydrationSkipped: options.hydrationSkipReason ?? "disabled"
         };
     record.market = preparedMarket;
-    let plan = buildDirectBuyAllOutcomesPlan(preparedMarket, cfg);
+    const buyCfg = eventBuyConfigForMarket(cfg, preparedMarket);
+    let plan = annotateBuyConfigPlan(buildDirectBuyAllOutcomesPlan(preparedMarket, buyCfg), buyCfg);
+    record.openBroadcastDelayMs = buyCfg.plannedBuy?.openBroadcastDelayMs ?? null;
     const receiver = runtime?.receiverAddress || cfg.walletAddress;
     if (receiver) {
       plan = withPrebuiltFastExecution(plan, receiver);
     }
+    validatePreparedPlanForExecution(cfg, plan);
     record.preparedPlan = plan;
     record.preparedAt = new Date().toISOString();
     record.prebuiltCalldata = Boolean(plan.prebuiltFastExecution);
@@ -5996,6 +10339,11 @@ async function preparePendingRecord(cfg, market, runtime = null, options = {}) {
     record.prepareError = errorMessage(error);
   }
   return record;
+}
+
+function validatePreparedPlanForExecution(cfg, plan) {
+  if (cfg.dryRun || !cfg.execute) return;
+  assertExecutionAllowed(executionConfigForPlan(cfg, plan), plan);
 }
 
 async function maybeHydrateMarketOdds(cfg, market) {
@@ -6062,10 +10410,11 @@ async function attachPreSignedFastTransaction(cfg, record, runtime) {
   }
   pauseRuntimeAutoSell(runtime, cfg, "single-presign-start");
   try {
+    const executionCfg = executionConfigForPlan(cfg, record.preparedPlan);
     record.preSignedFastTransaction = await withRuntimeTransactionLock(
       runtime,
       "pre-sign-single",
-      () => preSignFastBuyTransaction(cfg, record.preparedPlan, runtime)
+      () => preSignFastBuyTransaction(executionCfg, record.preparedPlan, runtime)
     );
     pauseRuntimeAutoSell(runtime, cfg, "single-presigned-buy");
     record.preSignedAt = new Date().toISOString();
@@ -6078,7 +10427,7 @@ async function attachPreSignedFastTransaction(cfg, record, runtime) {
       startDate: record.market.startDate,
       txHash: record.preSignedFastTransaction.txHash,
       nonce: record.preSignedFastTransaction.nonce,
-      msUntilAction: msUntilAction(record.market, cfg)
+      msUntilAction: msUntilRecordAction(record, cfg, runtime)
     }));
   } catch (error) {
     record.preSignError = errorMessage(error);
@@ -6235,6 +10584,144 @@ function buyDecisionAction(result) {
   return "bought";
 }
 
+function isPriceGateActive(cfg) {
+  return Boolean(cfg.eventPriceGateEnabled && !cfg.dryRun && cfg.execute);
+}
+
+function isPriceGateQuotePassing(cfg, quote) {
+  return Number(quote?.effectivePrice ?? Infinity) < Number(cfg.eventPriceGateMaxEffectivePrice);
+}
+
+function priceGatePasses(cfg, quotes) {
+  const rows = Array.isArray(quotes) ? quotes : [];
+  if (cfg.eventPriceGateRequire === "all") {
+    return rows.length > 0 && rows.every((quote) => isPriceGateQuotePassing(cfg, quote));
+  }
+  return rows.some((quote) => isPriceGateQuotePassing(cfg, quote));
+}
+
+async function checkEventPriceGate(cfg, eventPlan) {
+  if (!isPriceGateActive(cfg)) return { enabled: false, allowed: true };
+
+  const outcomes = Array.isArray(eventPlan?.outcomes) ? eventPlan.outcomes : [];
+  if (outcomes.length === 0) {
+    return {
+      enabled: true,
+      allowed: false,
+      reason: "no-outcomes",
+      quotes: [],
+      errors: [],
+      elapsedMs: 0
+    };
+  }
+
+  const startedAt = Date.now();
+  const timeoutMs = Number(cfg.eventPriceGateTimeoutMs ?? 1000);
+  const quotes = [];
+  const errors = [];
+  const { publicClient } = makeClients(cfg);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let remaining = outcomes.length;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        enabled: true,
+        allowed: Boolean(result.allowed),
+        reason: result.reason,
+        passingQuote: result.passingQuote ?? null,
+        quotes: [...quotes],
+        errors: [...errors],
+        elapsedMs: Date.now() - startedAt
+      });
+    };
+    const finishIfComplete = () => {
+      if (remaining > 0) return;
+      finish({
+        allowed: priceGatePasses(cfg, quotes),
+        reason: priceGatePasses(cfg, quotes) ? "all-complete-pass" : "all-complete-no-pass",
+        passingQuote: quotes.find((quote) => isPriceGateQuotePassing(cfg, quote)) ?? null
+      });
+    };
+    const timer = setTimeout(() => {
+      const allowed = cfg.eventPriceGateRequire === "all"
+        ? quotes.length === outcomes.length && priceGatePasses(cfg, quotes)
+        : priceGatePasses(cfg, quotes);
+      finish({
+        allowed,
+        reason: allowed ? "timeout-after-pass" : "timeout-no-pass",
+        passingQuote: quotes.find((quote) => isPriceGateQuotePassing(cfg, quote)) ?? null
+      });
+    }, timeoutMs);
+    timer.unref?.();
+
+    for (const outcome of outcomes) {
+      quoteEventPriceGateOutcome(publicClient, cfg, eventPlan, outcome)
+        .then((quote) => {
+          if (settled) return;
+          quotes.push(quote);
+          remaining -= 1;
+          if (cfg.eventPriceGateRequire === "any" && isPriceGateQuotePassing(cfg, quote)) {
+            finish({ allowed: true, reason: "any-outcome-pass", passingQuote: quote });
+            return;
+          }
+          if (cfg.eventPriceGateRequire === "all" && !isPriceGateQuotePassing(cfg, quote)) {
+            finish({ allowed: false, reason: "all-outcomes-required", passingQuote: null });
+            return;
+          }
+          finishIfComplete();
+        })
+        .catch((error) => {
+          if (settled) return;
+          errors.push({
+            tokenId: String(outcome.tokenId),
+            outcome: outcome.name ?? outcome.outcome ?? outcome.symbol ?? null,
+            message: errorMessage(error)
+          });
+          remaining -= 1;
+          if (cfg.eventPriceGateRequire === "all") {
+            finish({ allowed: false, reason: "quote-error", passingQuote: null });
+            return;
+          }
+          finishIfComplete();
+        });
+    }
+  });
+}
+
+async function quoteEventPriceGateOutcome(publicClient, cfg, eventPlan, outcome) {
+  const amount = outcome.amount ?? parseUnits(String(outcome.stakeUsdt ?? eventPlan.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt), 18);
+  const simulated = await simulateMintAmount(publicClient, {
+    market: eventPlan.market.address,
+    tokenId: outcome.tokenId,
+    amount,
+    stakeUsdt: outcome.stakeUsdt ?? eventPlan.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt
+  });
+  return summarizeEventPriceGateQuote(outcome, simulated);
+}
+
+function summarizeEventPriceGateQuote(outcome, simulated) {
+  const collateralFromUserUsdt = Number(formatUnits(simulated.collateralFromUser, 18));
+  const otToUser = Number(formatUnits(simulated.otToUser, 18));
+  const effectivePrice = otToUser > 0 ? collateralFromUserUsdt / otToUser : Infinity;
+  return {
+    tokenId: String(outcome.tokenId),
+    outcome: outcome.name ?? outcome.outcome ?? outcome.symbol ?? null,
+    stakeUsdt: Number(simulated.stakeUsdt ?? outcome.stakeUsdt ?? 0),
+    collateralFromUserUsdt: roundUsd(collateralFromUserUsdt),
+    otToUser: roundToken(otToUser, 4),
+    effectivePrice: roundPrice(effectivePrice)
+  };
+}
+
+function roundPrice(value) {
+  if (!Number.isFinite(Number(value))) return null;
+  return Math.round(Number(value) * 1e12) / 1e12;
+}
+
 function pendingMarket(record) {
   return record?.market ?? record;
 }
@@ -6287,15 +10774,24 @@ function summarizeSellPlans(plans) {
   };
 }
 
-function summarizePosition(position) {
+function summarizePosition(position, cfg = null) {
   const costBasisUsdt = Number(position.costBasis ?? 0);
   const cashPnlUsdt = Number(position.cashPnl ?? 0);
   const realizedPnlUsdt = Number(position.realizedPnl ?? 0);
+  const planned = cfg ? plannedBuyForMarket(cfg, {
+    address: position.marketAddress,
+    question: position.question?.title
+  }) : null;
   return {
     marketAddress: position.marketAddress,
     question: position.question?.title ?? null,
     outcome: position.outcome?.name ?? null,
     tokenId: position.tokenId,
+    startDate: position.market?.startDate ?? position.question?.startDate ?? null,
+    endDate: position.market?.endDate ?? position.question?.endDate ?? null,
+    categories: position.market?.categories ?? position.question?.categories ?? [],
+    tags: position.market?.tags ?? position.question?.tags ?? [],
+    kickoffAt: planned?.kickoffAt ?? null,
     size: Number(position.size ?? 0),
     avgPrice: Number(position.avgPrice ?? 0),
     curPrice: Number(position.curPrice ?? 0),
@@ -6385,7 +10881,9 @@ async function maybeExecuteMarket(
   }
 
   const waitMs = msUntilStart(market);
-  const actionWaitMs = msUntilAction(market, cfg);
+  const actionWaitMs = retryRecord
+    ? msUntilRecordAction(retryRecord, cfg, runtime)
+    : msUntilRecordAction({ market }, cfg, runtime);
   if (actionWaitMs > 0) {
     if (allowFuturePending) {
       console.log(JSON.stringify({
@@ -6423,9 +10921,55 @@ async function maybeExecuteMarket(
   if (preSignedFastTransaction) {
     eventPlan = { ...eventPlan, preSignedFastTransaction };
   }
+  const priceGate = await checkEventPriceGate(cfg, eventPlan);
+  if (priceGate.enabled) {
+    const gateRow = {
+      level: priceGate.allowed ? "event-price-gate-pass" : "event-price-gate-skip",
+      market: market.address,
+      question: market.question,
+      threshold: cfg.eventPriceGateMaxEffectivePrice,
+      require: cfg.eventPriceGateRequire,
+      reason: priceGate.reason,
+      elapsedMs: priceGate.elapsedMs,
+      passingQuote: priceGate.passingQuote,
+      quotes: priceGate.quotes,
+      errors: priceGate.errors,
+      at: new Date().toISOString()
+    };
+    if (priceGate.allowed) {
+      console.log(JSON.stringify(gateRow));
+      recordMarketDecision(cfg, market, "price-gate-pass", {
+        source: "single-price-gate",
+        rankSource: eventPlan.selection?.rankSource ?? null,
+        fallbackReason: eventPlan.selection?.fallbackReason ?? null,
+        message: `${priceGate.reason}: ${priceGate.passingQuote?.effectivePrice ?? ""} < ${cfg.eventPriceGateMaxEffectivePrice}`,
+        once: false
+      });
+    } else {
+      clearPreSignedSingleRecord(retryRecord, "price-gate-skip");
+      await resetRuntimeNonceToPending(cfg, runtime, "price_gate_skip");
+      clearExecutionRetry(retryRecord);
+      seen.add(key);
+      saveSeen(cfg.stateFile, seen);
+      appendJsonl(cfg.fillsFile, gateRow);
+      recordMarketDecision(cfg, market, "price-gate-skip", {
+        source: "single-price-gate",
+        rankSource: eventPlan.selection?.rankSource ?? null,
+        fallbackReason: eventPlan.selection?.fallbackReason ?? null,
+        message: `${priceGate.reason}: no selected outcome below ${cfg.eventPriceGateMaxEffectivePrice}`,
+        once: false
+      });
+      console.error(JSON.stringify(gateRow));
+      return false;
+    }
+  }
   let result;
+  const openBroadcastTiming = describeOpenBroadcastTiming(
+    openBroadcastTimingForRecord(retryRecord ?? { market }, cfg, runtime)
+  );
   try {
     result = await executeOrPrint(eventPlan, cfg, runtime);
+    if (openBroadcastTiming) result = { ...result, openBroadcastTiming };
   } catch (error) {
     markExecutionRetry(retryRecord, cfg, error);
     const row = {
@@ -6543,14 +11087,29 @@ async function buildEventPlanForMarket(cfg, market, args = {}) {
         ...market,
         oddsHydrationSkipped: args.hydrationSkipReason ?? "disabled"
       };
+  const buyCfg = eventBuyConfigForMarket(cfg, planMarket);
   if (args.forceQuoted || args.quoted || cfg.eventBuyMode === "quoted") {
-    return quoteBuyAllOutcomes(publicClient, planMarket, cfg, {
-      stakePerOutcomeUsdt: args.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt
+    const plan = await quoteBuyAllOutcomes(publicClient, planMarket, buyCfg, {
+      stakePerOutcomeUsdt: args.stakePerOutcomeUsdt ?? buyCfg.stakePerOutcomeUsdt
     });
+    return annotateBuyConfigPlan(plan, buyCfg);
   }
-  return buildDirectBuyAllOutcomesPlan(planMarket, cfg, {
-    stakePerOutcomeUsdt: args.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt
-  });
+  return annotateBuyConfigPlan(buildDirectBuyAllOutcomesPlan(planMarket, buyCfg, {
+    stakePerOutcomeUsdt: args.stakePerOutcomeUsdt ?? buyCfg.stakePerOutcomeUsdt
+  }), buyCfg);
+}
+
+function filterEventMarketsForBot(markets, cfg) {
+  const byAddress = new Map();
+  for (const market of filterEventMarkets(markets, cfg)) {
+    byAddress.set(String(market.address ?? "").toLowerCase(), market);
+  }
+  for (const market of markets ?? []) {
+    const decision = marketFilterDecision(market, cfg);
+    if (!decision.eligible) continue;
+    byAddress.set(String(market.address ?? "").toLowerCase(), market);
+  }
+  return sortMarketsByStartAsc([...byAddress.values()]);
 }
 
 async function loadEventMarkets(cfg, { status = "live", limit = 500 } = {}) {
@@ -6561,7 +11120,7 @@ async function loadEventMarkets(cfg, { status = "live", limit = 500 } = {}) {
     ascending: false,
     limit
   });
-  return filterEventMarkets(markets, cfg);
+  return filterEventMarketsForBot(markets, cfg);
 }
 
 async function loadRestEventMarkets(cfg, { status = "all", limit = 500 } = {}) {
@@ -6617,24 +11176,31 @@ function outcomeDataScore(outcomes = []) {
 
 async function executeOrPrint(eventPlan, cfg, runtime = null) {
   const described = describeEventPlan(eventPlan);
-  if (cfg.dryRun || !cfg.execute) {
+  const executionCfg = executionConfigForPlan(cfg, eventPlan);
+  if (executionCfg.dryRun || !executionCfg.execute) {
     console.log(JSON.stringify({ level: "event-plan", plan: described }, null, 2));
     return { dryRun: true };
   }
-  assertPlanWithinOpenWindow(cfg, eventPlan.market, "single-buy");
+  assertPlanWithinOpenWindow(executionCfg, eventPlan.market, "single-buy");
 
   const result = await withRuntimeTransactionLock(
     runtime,
     "buy-single",
-    () => buyOutcomesBatch(broadcastOnlyExecutionCfg(cfg), eventPlan, runtime)
+    () => buyOutcomesBatch(broadcastOnlyExecutionCfg(executionCfg), eventPlan, runtime)
   );
   console.log(JSON.stringify({ level: "executed", plan: described, result }, null, 2));
-  maybeTrackReceipt(cfg, result, {
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "buy",
+    source: "single-buy-result",
+    allocations: gasAllocationsFromEventPlan(eventPlan)
+  });
+  maybeTrackReceipt(executionCfg, result, {
     type: "single",
     market: eventPlan.market.address,
     question: eventPlan.market.question,
+    plannedBuy: eventPlan.plannedBuy ?? null,
     marketDetails: [eventPlan.market]
-  });
+  }, runtime);
   return result;
 }
 
@@ -6654,13 +11220,18 @@ async function executeOrPrintBundle(bundle, cfg, runtime = null) {
     () => executeFastBuyBundle(broadcastOnlyExecutionCfg(cfg), bundle, runtime)
   );
   console.log(JSON.stringify({ level: "bundle-executed", bundle: described, result }, null, 2));
+  await appendGasLedgerFromExecution(cfg, result, {
+    action: "buy",
+    source: "bundle-buy-result",
+    allocations: gasAllocationsFromBundle(bundle)
+  });
   maybeTrackReceipt(cfg, result, {
     type: "bundle",
     markets: bundle.markets.map((market) => market.address),
     marketCount: bundle.marketCount,
     outcomeCount: bundle.outcomeCount,
     marketDetails: bundle.markets
-  });
+  }, runtime);
   return result;
 }
 
@@ -6672,7 +11243,7 @@ function broadcastOnlyExecutionCfg(cfg) {
   };
 }
 
-function maybeTrackReceipt(cfg, result, context = {}) {
+function maybeTrackReceipt(cfg, result, context = {}, runtime = null) {
   if (
     !cfg.asyncReceiptWatch ||
     cfg.dryRun ||
@@ -6682,22 +11253,71 @@ function maybeTrackReceipt(cfg, result, context = {}) {
     result.blockNumber
   ) return;
 
-  void trackReceipt(cfg, result.txHash, context).catch((error) => {
+  void trackReceipt(cfg, result, context, runtime).catch(async (error) => {
+    const receiptWatch = await classifyReceiptWatchError(cfg, result.txHash).catch((classifyError) => ({
+      status: "error",
+      txFound: null,
+      receiptFound: null,
+      message: errorMessage(classifyError)
+    }));
+    const status = receiptWatch.receiptFound && receiptWatch.receiptStatus
+      ? receiptWatch.receiptStatus
+      : receiptWatch.status === "dropped" ? "dropped" : "error";
+    const message = errorMessage(error);
     const row = {
       level: "event-receipt",
-      status: "error",
+      status,
       txHash: result.txHash,
-      message: errorMessage(error),
+      message,
+      receiptWatchStatus: receiptWatch.status,
+      txFound: receiptWatch.txFound,
+      receiptFound: receiptWatch.receiptFound,
+      classifyMessage: receiptWatch.message ?? null,
       context: receiptLogContext(context),
       at: new Date().toISOString()
     };
     appendJsonl(cfg.fillsFile, row);
     console.error(JSON.stringify(row));
+    if (receiptWatch.receiptFound && receiptWatch.receiptStatus) {
+      if (receiptWatch.receipt) {
+        const { publicClient } = makeClients(cfg);
+        await appendGasLedgerFromReceipt(cfg, publicClient, {
+          txHash: result.txHash,
+          receipt: receiptWatch.receipt,
+          action: "buy",
+          source: "event-receipt-classify",
+          allocations: gasAllocationsFromReceiptContext(context),
+          metadata: {
+            receiptWatchStatus: receiptWatch.status,
+            receiptWatchError: message
+          }
+        });
+      }
+      recordReceiptMarketDecisions(cfg, context, { status: receiptWatch.receiptStatus }, result.txHash);
+      if (receiptWatch.receiptStatus === "success") return;
+    } else {
+      recordReceiptWatchErrorMarketDecisions(cfg, context, result.txHash, message, receiptWatch);
+    }
+    notifyFeishu(cfg, {
+      title: receiptWatch.status === "dropped" ? "交易广播后链上未找到" : "交易 receipt 监控异常",
+      level: "warn",
+      fields: {
+        tx: result.txHash,
+        status: receiptWatch.status,
+        txFound: String(receiptWatch.txFound ?? ""),
+        receiptFound: String(receiptWatch.receiptFound ?? ""),
+        context: context.type ?? "",
+        message
+      },
+      dedupeKey: `receipt-watch:${result.txHash}:${receiptWatch.status}`,
+      cooldownMs: cfg.feishuAlertCooldownMs
+    });
   });
 }
 
-async function trackReceipt(cfg, txHash, context) {
+async function trackReceipt(cfg, result, context, runtime = null) {
   const { publicClient } = makeClients(cfg);
+  const txHash = result.txHash;
   const receipt = await publicClient.waitForTransactionReceipt({
     hash: txHash,
     timeout: cfg.receiptWatchTimeoutMs,
@@ -6714,8 +11334,18 @@ async function trackReceipt(cfg, txHash, context) {
     at: new Date().toISOString()
   };
   appendJsonl(cfg.fillsFile, row);
+  await appendGasLedgerFromReceipt(cfg, publicClient, {
+    txHash,
+    receipt,
+    action: "buy",
+    source: "event-receipt",
+    allocations: gasAllocationsFromReceiptContext(context)
+  });
   console.log(JSON.stringify(row));
   recordReceiptMarketDecisions(cfg, context, receipt, txHash);
+  if (receipt.status === "success") {
+    maybeScheduleFastOpenExitAfterBuyReceipt(cfg, result, context, runtime, receipt);
+  }
   if (receipt.status !== "success") {
     notifyFeishu(cfg, {
       title: "交易 receipt 非成功",
@@ -6731,6 +11361,416 @@ async function trackReceipt(cfg, txHash, context) {
   }
 }
 
+async function classifyReceiptWatchError(cfg, txHash) {
+  const { publicClient } = makeClients(cfg);
+  const timeoutMs = Math.max(1000, Math.min(5000, Number(cfg.receiptWatchPollingMs ?? 1000) * 2));
+  const [tx, receipt] = await Promise.all([
+    withTimeout(publicClient.getTransaction({ hash: txHash }).catch(() => null), timeoutMs, "getTransaction timeout"),
+    withTimeout(publicClient.getTransactionReceipt({ hash: txHash }).catch(() => null), timeoutMs, "getTransactionReceipt timeout")
+  ]);
+
+  if (receipt) {
+    return {
+      status: receipt.status === "success" ? "receipt-success" : "receipt-failed",
+      txFound: true,
+      receiptFound: true,
+      receiptStatus: receipt.status,
+      blockNumber: receipt.blockNumber?.toString() ?? null,
+      receipt
+    };
+  }
+  if (tx) {
+    return {
+      status: "timeout",
+      txFound: true,
+      receiptFound: false
+    };
+  }
+  return {
+    status: "dropped",
+    txFound: false,
+    receiptFound: false
+  };
+}
+
+function maybeScheduleFastOpenExitAfterBuyReceipt(cfg, result, context = {}, runtime = null, receipt = null) {
+  if (!shouldScheduleFastOpenExitAfterBuy(cfg, result, context, runtime, receipt)) return;
+  const market = context.marketDetails[0];
+  const schedule = fastOpenExitSchedule(cfg, market, result.txHash);
+  if (!schedule) return;
+  if (Date.now() > schedule.targetMs + 5000) {
+    console.error(JSON.stringify({
+      level: "event-auto-sell-fast-open-exit-skip",
+      reason: "target-already-expired",
+      market: market.address,
+      question: market.question,
+      txHash: result.txHash,
+      targetAt: schedule.targetAt,
+      at: new Date().toISOString()
+    }));
+    return;
+  }
+
+  const key = `${String(market.address).toLowerCase()}:${String(result.txHash).toLowerCase()}`;
+  if (!runtime.fastOpenExitScheduled) runtime.fastOpenExitScheduled = new Set();
+  if (runtime.fastOpenExitScheduled.has(key)) return;
+  runtime.fastOpenExitScheduled.add(key);
+  pauseRuntimeAutoSellUntil(runtime, schedule.targetMs + Number(cfg.autoSellFastOpenExitMonitorPauseMs ?? 0), "fast-open-exit-scheduled");
+
+  console.log(JSON.stringify({
+    level: "event-auto-sell-fast-open-exit-scheduled",
+    market: market.address,
+    question: market.question,
+    buyTxHash: result.txHash,
+    targetAt: schedule.targetAt,
+    delayMs: schedule.delayMs,
+    percent: cfg.autoSellOpenExitPercent,
+    selectedOutcomes: result.outcomes?.map((outcome) => ({
+      tokenId: String(outcome.tokenId),
+      name: outcome.name ?? null
+    })) ?? [],
+    monitorPausedUntil: new Date(runtime.autoSellPausedUntil).toISOString(),
+    at: new Date().toISOString()
+  }));
+
+  void prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, schedule)
+    .catch(async (error) => {
+      console.error(JSON.stringify({
+        level: "event-auto-sell-fast-open-exit-error",
+        market: market.address,
+        question: market.question,
+        buyTxHash: result.txHash,
+        message: autoSellErrorMessage(cfg, error),
+        at: new Date().toISOString()
+      }));
+      notifyFeishu(cfg, {
+        title: "快速定时卖出失败",
+        level: "warn",
+        fields: {
+          market: market.address,
+          question: market.question,
+          target: schedule.targetAt,
+          message: autoSellErrorMessage(cfg, error)
+        },
+        dedupeKey: `fast-open-exit-error:${String(market.address).toLowerCase()}:${String(result.txHash).toLowerCase()}`,
+        cooldownMs: cfg.autoSellAlertCooldownMs
+      });
+    });
+}
+
+function shouldScheduleFastOpenExitAfterBuy(cfg, result, context = {}, runtime = null, receipt = null) {
+  const baseEligible = Boolean(
+    cfg.autoSellFastOpenExitEnabled &&
+    cfg.autoSellEnabled &&
+    cfg.autoSellStrategy === "open_timed_exit" &&
+    !cfg.dryRun &&
+    cfg.execute &&
+    runtime?.txLock &&
+    receipt?.status === "success" &&
+    context?.type === "single" &&
+    Array.isArray(context.marketDetails) &&
+    context.marketDetails.length === 1 &&
+    Array.isArray(result?.outcomes) &&
+    result.outcomes.length > 0
+  );
+  if (!baseEligible) return false;
+  return plannedBuyAllowsFastOpenExit(cfg, context);
+}
+
+function plannedBuyAllowsFastOpenExit(cfg, context = {}) {
+  const planned = plannedBuyForFastOpenExitContext(cfg, context);
+  if (!planned?.autoSell) return true;
+  const plannedAutoSellCfg = {
+    ...cfg,
+    ...planned.autoSell
+  };
+  if (!isAutoSellEnabledForPosition(plannedAutoSellCfg)) return false;
+  return String(plannedAutoSellCfg.autoSellStrategy ?? "").trim().toLowerCase() === "open_timed_exit";
+}
+
+function plannedBuyForFastOpenExitContext(cfg, context = {}) {
+  if (context?.plannedBuy) return context.plannedBuy;
+  if (!Array.isArray(context.marketDetails) || context.marketDetails.length !== 1) return null;
+  return plannedBuyForMarket(cfg, context.marketDetails[0]);
+}
+
+function fastOpenExitSchedule(cfg, market, seed = "") {
+  const openMs = Date.parse(market?.startDate ?? "");
+  if (!Number.isFinite(openMs)) return null;
+  const delayMs = fastOpenExitRandomDelayMs(cfg);
+  const targetMs = openMs + delayMs;
+  return {
+    delayMs,
+    targetMs,
+    targetAt: new Date(targetMs).toISOString(),
+    seed: String(seed ?? "")
+  };
+}
+
+function fastOpenExitRandomDelayMs(cfg, randomFn = randomInt) {
+  const min = Math.floor(Number(cfg.autoSellFastOpenExitMinDelayMs ?? 24500));
+  const max = Math.floor(Number(cfg.autoSellFastOpenExitMaxDelayMs ?? min));
+  if (max <= min) return min;
+  return randomFn(min, max + 1);
+}
+
+function pauseRuntimeAutoSellUntil(runtime, untilMs, reason) {
+  if (!runtime) return;
+  const until = Number(untilMs ?? 0);
+  if (!Number.isFinite(until) || until <= Date.now()) return;
+  runtime.autoSellPausedUntil = Math.max(runtime.autoSellPausedUntil ?? 0, until);
+  runtime.autoSellPauseReason = reason;
+}
+
+async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, schedule) {
+  const { publicClient, account } = makeClients(cfg);
+  if (!account) throw new Error("PRIVATE_KEY is required for fast open exit");
+  const walletAddress = cfg.walletAddress || account.address;
+  const market = context.marketDetails[0];
+  const marketAddress = market.address;
+  const percent = Number(cfg.autoSellOpenExitPercent ?? 100);
+  let signed = null;
+  let broadcast = null;
+  let actions = [];
+
+  try {
+    let plans = await buildFastOpenExitSellPlans(cfg, publicClient, market, result, walletAddress, schedule.targetMs);
+    const approval = await ensureFastOpenExitOperatorApproval(cfg, runtime, marketAddress, plans);
+    if (approval) {
+      await syncRuntimeNonceAfterExternalTx(cfg, runtime, "fast-open-exit-operator-approval");
+      plans = await buildFastOpenExitSellPlans(cfg, publicClient, market, result, walletAddress, schedule.targetMs);
+    }
+    const missingApproval = plans.find((plan) => !plan.operatorApproved);
+    if (missingApproval) throw new Error(`Operator approval missing for market ${missingApproval.market}`);
+    actions = plans.map((plan) => fastOpenExitActionFromPlan(cfg, plan, market, result, schedule, "prepared"));
+
+    await ensureAutoSellGasBudget(cfg, publicClient, walletAddress, estimateAutoSellBatchGas(plans.length));
+    signed = await withRuntimeTransactionLock(runtime, "fast-open-exit-presign", () =>
+      preSignSellOutcomesBatch(
+        autoSellExecutionConfigForItems(cfg, [{ autoSellCfg: cfg }]),
+        plans,
+        runtime,
+        { requirePreapprovedOperator: true }
+      )
+    );
+    for (const action of actions) {
+      action.status = "scheduled";
+      action.txHash = signed.txHash;
+      action.nonce = signed.nonce;
+      action.gas = signed.gas;
+      action.gasPriceGwei = signed.gasPriceGwei;
+    }
+    appendAutoSellBatchLog(cfg, {
+      source: "fast-open-exit",
+      walletAddress,
+      markets: [marketAddress],
+      actions,
+      execution: {
+        status: "scheduled",
+        txHash: signed.txHash,
+        nonce: signed.nonce,
+        targetAt: schedule.targetAt,
+        delayMs: schedule.delayMs,
+        approval: approval ?? null
+      }
+    });
+
+    await waitUntilBroadcastTarget(schedule.targetMs, Number(cfg.openBroadcastSpinMs ?? 0));
+    broadcast = await withRuntimeTransactionLock(runtime, "fast-open-exit-broadcast", () =>
+      broadcastSignedTransaction(cfg, signed)
+    );
+    await syncRuntimeNonceAfterExternalTx(cfg, runtime, "fast-open-exit-broadcast");
+    for (const action of actions) {
+      action.status = "broadcast";
+      action.txHash = broadcast.txHash;
+      action.broadcastMode = broadcast.mode;
+      action.firstAcceptedAt = broadcast.firstAcceptedAt ?? null;
+      action.firstAcceptedLatencyMs = broadcast.firstAcceptedLatencyMs ?? null;
+    }
+    appendAutoSellBatchLog(cfg, {
+      source: "fast-open-exit",
+      walletAddress,
+      markets: [marketAddress],
+      actions,
+      execution: {
+        ...broadcast,
+        status: "broadcast",
+        targetAt: schedule.targetAt,
+        delayMs: schedule.delayMs
+      }
+    });
+
+    const receipt = await publicClient.waitForTransactionReceipt({
+      hash: broadcast.txHash,
+      timeout: cfg.receiptWatchTimeoutMs,
+      pollingInterval: cfg.receiptWatchPollingMs
+    });
+    const receiptRow = {
+      level: "event-auto-sell-fast-open-exit-receipt",
+      status: receipt.status,
+      txHash: broadcast.txHash,
+      blockNumber: receipt.blockNumber?.toString() ?? null,
+      gasUsed: receipt.gasUsed?.toString() ?? null,
+      effectiveGasPrice: receipt.effectiveGasPrice?.toString() ?? null,
+      market: marketAddress,
+      question: market.question,
+      targetAt: schedule.targetAt,
+      delayMs: schedule.delayMs,
+      at: new Date().toISOString()
+    };
+    appendJsonl(cfg.fillsFile, receiptRow);
+    await appendGasLedgerFromReceipt(cfg, publicClient, {
+      txHash: broadcast.txHash,
+      receipt,
+      action: "sell",
+      source: "fast-open-exit-receipt",
+      allocations: gasAllocationsFromAutoSellActions(actions.length ? actions : [{
+        marketAddress,
+        question: market.question
+      }])
+    });
+    console.log(JSON.stringify(receiptRow));
+
+    for (const action of actions) action.status = receipt.status;
+    if (receipt.status === "success") {
+      markFastOpenExitAutoSellState(cfg, walletAddress, actions);
+    } else {
+      notifyFeishu(cfg, {
+        title: "快速定时卖出 receipt 非成功",
+        level: "warn",
+        fields: {
+          market: marketAddress,
+          question: market.question,
+          tx: broadcast.txHash,
+          status: receipt.status
+        },
+        dedupeKey: `fast-open-exit-receipt:${broadcast.txHash}`,
+        cooldownMs: cfg.autoSellAlertCooldownMs
+      });
+    }
+    appendAutoSellBatchLog(cfg, {
+      source: "fast-open-exit",
+      walletAddress,
+      markets: [marketAddress],
+      actions,
+      execution: {
+        status: receipt.status,
+        txHash: broadcast.txHash,
+        blockNumber: receipt.blockNumber?.toString() ?? null
+      }
+    });
+  } catch (error) {
+    if (signed && !broadcast) await resetRuntimeNonceToPending(cfg, runtime, "fast_open_exit_unbroadcast_signed_tx");
+    for (const action of actions) {
+      action.status = "error";
+      action.message = autoSellErrorMessage(cfg, error);
+    }
+    if (actions.length > 0) {
+      appendAutoSellBatchLog(cfg, {
+        source: "fast-open-exit",
+        walletAddress,
+        markets: [marketAddress],
+        actions,
+        execution: {
+          status: "error",
+          txHash: signed?.txHash ?? null,
+          message: autoSellErrorMessage(cfg, error),
+          targetAt: schedule.targetAt
+        }
+      });
+    }
+    throw error;
+  }
+}
+
+async function buildFastOpenExitSellPlans(cfg, publicClient, market, result, walletAddress, targetMs) {
+  const outcomes = result.outcomes ?? [];
+  let lastError = null;
+  const deadlineMs = Math.max(Date.now(), Number(targetMs ?? Date.now()) - 500);
+  do {
+    try {
+      const plans = await Promise.all(outcomes.map((outcome) =>
+        buildDirectSellPlan(publicClient, {
+          market: market.address,
+          tokenId: outcome.tokenId,
+          owner: walletAddress,
+          percent: cfg.autoSellOpenExitPercent
+        })
+      ));
+      return plans;
+    } catch (error) {
+      lastError = error;
+      if (Date.now() >= deadlineMs) break;
+      await sleep(Math.min(250, Math.max(1, deadlineMs - Date.now())));
+    }
+  } while (Date.now() < deadlineMs);
+  throw lastError ?? new Error("Failed to build fast open exit sell plans");
+}
+
+async function ensureFastOpenExitOperatorApproval(cfg, runtime, marketAddress, plans) {
+  if (plans.every((plan) => plan.operatorApproved)) return null;
+  return withRuntimeTransactionLock(runtime, "fast-open-exit-operator-approval", () =>
+    ensureMarketOperatorApproval(cfg, marketAddress)
+  );
+}
+
+function fastOpenExitActionFromPlan(cfg, plan, market, result, schedule, status) {
+  const outcome = (result.outcomes ?? []).find((item) => String(item.tokenId) === String(plan.tokenId));
+  return {
+    trigger: "fast_open_timed_exit",
+    triggerLabel: "快速开盘定时卖出",
+    percent: Number(cfg.autoSellOpenExitPercent ?? 100),
+    dueAt: schedule.targetAt,
+    targetAt: schedule.targetAt,
+    marketOpenDate: market.startDate ?? null,
+    delayMs: schedule.delayMs,
+    sellAmountOt: formatUnits(plan.amount, 18),
+    balanceOt: formatUnits(plan.balance, 18),
+    marketAddress: market.address,
+    tokenId: String(plan.tokenId),
+    question: market.question ?? null,
+    outcome: outcome?.name ?? null,
+    minCollateralOutUsdt: "0.000000000000000001",
+    noPriceProtection: true,
+    status,
+    txHash: null
+  };
+}
+
+function markFastOpenExitAutoSellState(cfg, walletAddress, actions) {
+  const state = loadAutoSellPositionState(cfg.autoSellPositionStateFile);
+  if (!state.positions) state.positions = {};
+  for (const action of actions) {
+    const key = autoSellActionPositionKey(walletAddress, action);
+    if (!state.positions[key]) {
+      state.positions[key] = {
+        marketAddress: action.marketAddress,
+        tokenId: String(action.tokenId),
+        question: action.question ?? null,
+        outcome: action.outcome ?? null,
+        buyAt: null,
+        detectedAt: new Date().toISOString(),
+        initialSize: String(action.balanceOt ?? action.sellAmountOt ?? "0"),
+        initialCostBasisUsdt: "0",
+        remainingSize: String(action.balanceOt ?? action.sellAmountOt ?? "0"),
+        nextStep: 1,
+        completed: false,
+        stopLossSold: false,
+        takeProfitCompleted: false,
+        preStartSold: false,
+        openTimedExitSold: false,
+        retainedToSettlement: false,
+        retainedTargetSize: null,
+        retainedSellAmount: null,
+        retainPercent: null,
+        preStartExitHandled: false
+      };
+    }
+    markAutoSellActionApplied(cfg, state.positions[key], action);
+  }
+  saveAutoSellPositionState(cfg.autoSellPositionStateFile, state);
+}
+
 function receiptLogContext(context = {}) {
   const { marketDetails, ...logContext } = context;
   return logContext;
@@ -6744,6 +11784,21 @@ function recordReceiptMarketDecisions(cfg, context = {}, receipt, txHash) {
       source: "receipt-watch",
       txHash,
       message: receipt.status === "success" ? null : `receipt status ${receipt.status}`,
+      once: false
+    });
+  }
+}
+
+function recordReceiptWatchErrorMarketDecisions(cfg, context = {}, txHash, message, receiptWatch = {}) {
+  const markets = Array.isArray(context.marketDetails) ? context.marketDetails : [];
+  const action = receiptWatch.status === "dropped"
+    ? "receipt-dropped"
+    : receiptWatch.status === "timeout" ? "receipt-timeout" : "receipt-error";
+  for (const market of markets) {
+    recordMarketDecision(cfg, market, action, {
+      source: "receipt-watch",
+      txHash,
+      message: message || receiptWatch.message || receiptWatch.status || "receipt watch error",
       once: false
     });
   }
@@ -7431,6 +12486,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sleepUntil(targetMs) {
+  const waitMs = Number(targetMs) - Date.now();
+  if (waitMs <= 0) return Promise.resolve();
+  return sleep(waitMs);
+}
+
 function createWakeSignal() {
   let wakeCurrent = null;
   return {
@@ -7563,13 +12624,13 @@ function withTimeout(promise, ms, message) {
   });
 }
 
-function nextWatchSleepMs(cfg, pending) {
+function nextWatchSleepMs(cfg, pending, runtime = null) {
   const defaultMs = cfg.pollMs;
   if (!pending || pending.size === 0) return defaultMs;
 
   let minActionWaitMs = Infinity;
   for (const record of pending.values()) {
-    minActionWaitMs = Math.min(minActionWaitMs, msUntilRecordAction(record, cfg));
+    minActionWaitMs = Math.min(minActionWaitMs, msUntilRecordAction(record, cfg, runtime));
   }
   if (!Number.isFinite(minActionWaitMs)) return defaultMs;
   if (minActionWaitMs <= cfg.preopenHotMs) {
@@ -7588,10 +12649,14 @@ function msUntilAction(market, cfg) {
   return Math.max(0, marketActionTimeMs(market, cfg) - Date.now());
 }
 
-function msUntilRecordAction(record, cfg) {
-  const actionWaitMs = msUntilAction(pendingMarket(record), cfg);
-  const retryWaitMs = Math.max(0, Number(record?.executionRetryAfterMs ?? 0) - Date.now());
+function msUntilRecordAction(record, cfg, runtime = null, now = Date.now()) {
+  const actionWaitMs = Math.max(0, marketActionTimeMsForRecord(record, cfg, runtime, now) - now);
+  const retryWaitMs = Math.max(0, Number(record?.executionRetryAfterMs ?? 0) - now);
   return Math.max(actionWaitMs, retryWaitMs);
+}
+
+function marketActionTimeMsForRecord(record, cfg, runtime = null, now = Date.now()) {
+  return openBroadcastTimingForRecord(record, cfg, runtime, now).targetMs;
 }
 
 function marketActionTimeMs(market, cfg) {
@@ -7608,6 +12673,132 @@ function effectivePrebroadcastMs(cfg) {
 
 function effectivePostOpenBroadcastDelayMs(cfg) {
   return effectivePrebroadcastMs(cfg) > 0 ? 0 : Number(cfg.openBroadcastDelayMs ?? 0);
+}
+
+function actionConfigForRecord(record, cfg) {
+  const rawDelay = record?.openBroadcastDelayMs ?? record?.preparedPlan?.plannedBuy?.openBroadcastDelayMs;
+  if (rawDelay === undefined || rawDelay === null || rawDelay === "") return cfg;
+  const delay = Number(rawDelay);
+  if (!Number.isFinite(delay) || delay < 0) return cfg;
+  if (effectivePrebroadcastMs(cfg) > 0) return cfg;
+  return {
+    ...cfg,
+    openBroadcastDelayMs: delay
+  };
+}
+
+function openBroadcastTimingForRecord(record, cfg, runtime = null, now = Date.now()) {
+  const market = pendingMarket(record);
+  const actionCfg = actionConfigForRecord(record, cfg);
+  const fixedTargetMs = marketActionTimeMs(market, actionCfg);
+  const fixed = {
+    mode: "fixed",
+    reason: "fixed",
+    targetMs: fixedTargetMs,
+    fixedTargetMs
+  };
+
+  if (!shouldUseBlockAwareOpenBroadcast(actionCfg)) return fixed;
+
+  const startMs = new Date(market?.startDate).getTime();
+  if (!Number.isFinite(startMs)) return fixed;
+
+  const armMs = startMs + effectivePostOpenBroadcastDelayMs(actionCfg);
+  const targetBoundaryMs = startMs + Number(actionCfg.openBroadcastBlockTargetOffsetMs ?? 20000);
+  const nominalTargetMs = targetBoundaryMs - Number(actionCfg.openBroadcastBlockAwareLeadMs ?? 0);
+  const maxWaitTargetMs = targetBoundaryMs + Number(actionCfg.openBroadcastBlockAwareMaxWaitMs ?? 0);
+  let targetMs = Math.max(armMs, nominalTargetMs);
+  let reason = "nominal-lead";
+  const blockClock = summarizeOpenBroadcastBlockClock(runtime?.openBroadcastBlockClock, market, actionCfg, now);
+
+  if (armMs >= targetBoundaryMs) {
+    targetMs = armMs;
+    reason = "arm-after-target-boundary";
+  } else if (now < armMs) {
+    targetMs = armMs;
+    reason = "arm-wait";
+  } else if (blockClock.targetHeadSeen) {
+    targetMs = now;
+    reason = "target-head-seen";
+  } else if (now >= maxWaitTargetMs) {
+    targetMs = now;
+    reason = "max-wait-expired";
+  } else if (
+    blockClock.preTargetHeadCount >= Number(actionCfg.openBroadcastBlockAwarePreTargetCount ?? 0) &&
+    now >= targetBoundaryMs - Number(actionCfg.openBroadcastBlockAwarePreTargetSendMs ?? 0)
+  ) {
+    targetMs = now;
+    reason = "pre-target-heads";
+  } else if (now >= targetMs) {
+    targetMs = now;
+    reason = "nominal-reached";
+  }
+
+  return {
+    mode: "block_aware_20s",
+    reason,
+    targetMs,
+    fixedTargetMs,
+    armMs,
+    targetBoundaryMs,
+    nominalTargetMs,
+    maxWaitTargetMs,
+    blockClock
+  };
+}
+
+function summarizeOpenBroadcastBlockClock(state, market, cfg, now = Date.now()) {
+  const startMs = new Date(market?.startDate).getTime();
+  const targetBoundaryMs = startMs + Number(cfg.openBroadcastBlockTargetOffsetMs ?? 20000);
+  const preTargetTimestampMs = Math.floor((targetBoundaryMs - 1) / 1000) * 1000;
+  const headMaxAgeMs = Number(cfg.openBroadcastBlockAwareHeadMaxAgeMs ?? 0);
+  const heads = Array.isArray(state?.heads) ? state.heads : [];
+  const recentHeads = heads.filter((head) => {
+    if (!Number.isFinite(head?.timestampMs) || !Number.isFinite(head?.receivedAt)) return false;
+    if (headMaxAgeMs <= 0) return true;
+    return now - head.receivedAt <= headMaxAgeMs;
+  });
+  const latestHead = recentHeads.at(-1) ?? null;
+  const preTargetHeads = recentHeads.filter((head) => head.timestampMs === preTargetTimestampMs);
+  const targetHead = recentHeads.find((head) => head.timestampMs >= targetBoundaryMs) ?? null;
+  return {
+    active: Boolean(state),
+    startedAt: state?.startedAt ?? null,
+    lastHeadAt: state?.lastHeadAt ? new Date(state.lastHeadAt).toISOString() : null,
+    lastHeadAgeMs: state?.lastHeadAt ? now - state.lastHeadAt : null,
+    latestBlockNumber: latestHead?.number ?? null,
+    latestTimestampIso: latestHead?.timestampIso ?? null,
+    latestReceivedAt: latestHead?.receivedAtIso ?? null,
+    latestOffsetMs: latestHead ? latestHead.timestampMs - startMs : null,
+    preTargetTimestampIso: Number.isFinite(preTargetTimestampMs) ? new Date(preTargetTimestampMs).toISOString() : null,
+    preTargetHeadCount: preTargetHeads.length,
+    targetHeadSeen: Boolean(targetHead),
+    targetHeadBlockNumber: targetHead?.number ?? null,
+    targetHeadReceivedAt: targetHead?.receivedAtIso ?? null,
+    errors: state?.errors ?? 0,
+    lastError: state?.lastError ?? null
+  };
+}
+
+function describeOpenBroadcastTiming(timing) {
+  if (!timing || timing.mode !== "block_aware_20s") return null;
+  return {
+    mode: timing.mode,
+    reason: timing.reason,
+    targetAt: new Date(timing.targetMs).toISOString(),
+    armAt: new Date(timing.armMs).toISOString(),
+    targetBoundaryAt: new Date(timing.targetBoundaryMs).toISOString(),
+    nominalTargetAt: new Date(timing.nominalTargetMs).toISOString(),
+    maxWaitTargetAt: new Date(timing.maxWaitTargetMs).toISOString(),
+    fixedTargetAt: new Date(timing.fixedTargetMs).toISOString(),
+    preTargetHeadCount: timing.blockClock?.preTargetHeadCount ?? 0,
+    targetHeadSeen: Boolean(timing.blockClock?.targetHeadSeen),
+    latestBlockNumber: timing.blockClock?.latestBlockNumber ?? null,
+    latestTimestampIso: timing.blockClock?.latestTimestampIso ?? null,
+    latestOffsetMs: timing.blockClock?.latestOffsetMs ?? null,
+    lastHeadAgeMs: timing.blockClock?.lastHeadAgeMs ?? null,
+    lastError: timing.blockClock?.lastError ?? null
+  };
 }
 
 function isTerminalMinedFailure(result) {

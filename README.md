@@ -45,10 +45,10 @@ npm run event:scan
 npm run event:positions -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
 ```
 
-查看下一批同期开盘 Event Markets 的实盘资金门槛、当前钱包缺多少 BUSDT/BNB、是否已经能直接 `event:arm`。Event Market 默认每场只买赔率最低的 5 个 outcome，每个 outcome 买 `20U`，实盘前仍建议显式带上 `STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5`：
+查看下一批同期开盘 Event Markets 的实盘资金门槛、当前钱包缺多少 BUSDT/BNB、是否已经能直接 `event:arm`。当前 Bot2 Event Market 策略默认每场买中间 3 个 outcome，每个 outcome 买 `10U`，实盘前仍建议显式带上 `STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30`：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 npm run event:funding -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:funding -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
 ```
 
 查看某个 outcome 的卖出报价。默认 dry-run，只读链上余额并用 market 的 `redeemExactOtToCollateral` 报价；真实卖出会先给当前 market 设置 Router operator，再通过 `FTRouterProxy.swap(isMint=false)` 带滑点保护卖出：
@@ -82,34 +82,38 @@ DRY_RUN=0 EXECUTE=1 I_UNDERSTAND_42_PRICE_MARKET_RISK=YES I_AM_NOT_IN_RESTRICTED
 security add-generic-password -a 42space -s 42space-event-bot-private-key -w '0x...' -U
 ```
 
-模拟最近一个 Event Market，按当前 `EVENT_OUTCOME_SELECTION` 选择 outcome。默认是 `lowest_odds`，即优先按 `payout` 从小到大选 5 个；如果 REST/链上数据没有完整 payout 但有 price，则按 price 从大到小选；如果刚开场链上日志还没有赔率字段，默认按 token 顺序兜底并在 plan 里标记 `rankSource: token_order`。这个命令会逐 outcome 调 `FTLensV2.simulateMint`，用于分析，不是最快路径：
+模拟最近一个 Event Market，按当前 `EVENT_OUTCOME_SELECTION` 选择 outcome。当前 Bot2 生产策略是 `middle`，按 outcome 显示/token 顺序买入居中的 3 个选项；FDV/市值区间题材因此买入中间三个市值档，每档 `10U`。旧的 `lowest_odds` 策略仍可用：优先按 `payout` 从小到大选；如果 REST/链上数据没有完整 payout 但有 price，则按 price 从大到小选；如果刚开场链上日志还没有赔率字段，默认按 token 顺序兜底并在 plan 里标记 `rankSource: token_order`。这个命令会逐 outcome 调 `FTLensV2.simulateMint`，用于分析，不是最快路径：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=100 npm run event:plan
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:plan
 ```
 
 指定市场模拟：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 npm run event:plan -- --market 0x73CbB55E357fA4Ceb2d808FF7A908A7a045F6ca5
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 npm run event:plan -- --market 0x73CbB55E357fA4Ceb2d808FF7A908A7a045F6ca5
 ```
 
 监听新 Event Market。默认启动时会把现有 live Event Markets 标记为已见，只等新场；如果要启动后连现有场也买，设置 `WATCH_BUY_EXISTING=1`。
 
 ```bash
-POLL_MS=500 STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 npm run event:watch
+POLL_MS=500 STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:watch
 ```
 
 实盘长期在线入口使用隐藏输入私钥，不把私钥写进 `.env`：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=100 npm run event:arm
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:arm
 ```
 
 速度模式：
 
 - `npm run verify`：本地确定性检查，包含语法检查和无需下一场真实市场的 Event Market 自检。
 - `npm run event:bench -- --samples 5`：离线 benchmark 下一批同期开盘 bundle 的 plan 构建、bundle 编码、预签耗时；使用公开测试私钥，不广播。
+- `npm run event:premium-probe`：旧的手动只读观察 anti-sniping premium 命令。默认等待下一批同一 `startDate` 的 upcoming Event Markets，每个 market 只模拟赔率最低的 1 个 outcome；适合临时复查，不适合长期捕捉开盘中创建的新市场。
+- `npm run event:premium-watch`：新的长期只读 premium watcher。持续用 WSS controller 日志和 REST `status=all` 发现新市场；只要是当前/未来开盘且仍在探针尾窗内，都会先建探针 timer，Price 标签、非 V2、缺 outcomes 只能变成报告里的 quote 错误，不能阻止启动探针。开盘后 `22s` 内每 `500ms` 对所有 outcomes 做 `FTLensV2.simulateMint`，默认同时测 `1U` 和 `STAKE_PER_OUTCOME_USDT`。不签名、不广播、不写 seen/fills/runtime 状态；发现审计写 `output/premium-watch-discovery.jsonl`，设置 `EVENT_DISCOVERY_FEED_FILE` 时还会写结构化共享发现 feed，原始样本写 `output/premium-watch-*.jsonl`，完成后写 `.csv` 和 `.md`。报告里的“估算 premium”来自同一 market/outcome/stake 在链上 `>=20s` 后的正常 markup 基线扣除，不是猜官方线性公式。
+- `EVENT_INTEL_NOTIFY_NON_TEMPLATE=1`：`event:premium-watch` 第一次观察到非固定模板且 `createdAt/startDate` 接近的新事件后会异步生成情报报告并发飞书；固定每天/周/月北京时间 08:00 模板只归档不通知。情报层仍会识别 Price/price range/point-in-time price 事件并默认跳过重分析；展示/飞书的 `价格` 过滤只静默 BTC Price 类事件，非 BTC Meme price-range 事件（例如 `$PUMP price range...`）会走 Bot2/Bot3/Bot5 的非过滤通知路径。通知按 market address 写入 `EVENT_INTEL_NOTIFY_SEEN_FILE` 去重，默认 `createdAt` 与 `startDate` 相差不超过 `EVENT_INTEL_CREATED_AT_OPEN_THRESHOLD_MINUTES=31` 时才发送；Bot2/Bot3/Bot5 过滤通知路径可通知所有未被 display filters 隐藏的事件。飞书通知使用卡片格式，开盘/创建时间显示为北京时间，并提供 42 市场、BscScan、REST 数据按钮；服务器本地 Markdown 报告路径不放进通知。`EVENT_INTEL_FEISHU_WEBHOOK` 应配置为 Bot1 的飞书 webhook；未配置时，只有当前进程 `BOT_NAME=42space` 或 `Bot1*` 才回退当前 profile 的 `FEISHU_WEBHOOK`，避免误发到 Bot2。
+- Sports/FIFA 准确比分盘是额外通知类：即使提前创建也会发飞书；`Total Goals` 和 `Goal Differential` 这类体育侧盘口继续只归档不通知。
 - `npm run event:rpc`：预热并测速 broadcast RPC 池，只输出 provider 域名、区块号、延迟和错误摘要，不打印 RPC URL。
 - `npm run event:presign-test`：离线验证“pending records -> pre-signed transaction/bundle -> cached reuse”链路；按 `MAX_BATCH_STAKE_USDT` 选择可完整买入的同期开盘市场，使用公开测试私钥，只签名不广播。
 - `npm run event:due-test`：离线验证“cached pre-signed transaction/bundle -> due drain -> dry-run execution”链路；按批次预算强制到期并 dry-run 执行，不广播。
@@ -118,20 +122,44 @@ STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=100 npm ru
 - `EVENT_DISCOVERY=ws`：通过 WebSocket 订阅 `FTControllerV2` 的 `CreateNewQuestionV2` / `AddOutcome` / `CreateNewMarket` 日志。默认值，最快，优先使用 `BSC_WS_URL` / `CHAINSTACK_BSC_WS_URL` / `ANKR_BSC_WS_URL` / `ANKR_BSC_WS_RPC_URL`。
 - `EVENT_DISCOVERY=chain`：HTTP 轮询同一组 controller 日志，要求 `BSC_RPC_URL` 支持 `eth_getLogs`。
 - `EVENT_DISCOVERY=rest`：REST 轮询兜底。
+- `EVENT_DISCOVERY=feed`：从 `EVENT_DISCOVERY_FEED_FILE` 读取中心 watcher 写入的新事件，Bot 侧不再持续开 WSS/REST discovery；启动时仍会做一次 REST/链上 seed 以补齐重启前已经可见的未来场。feed 只传市场发现信号，买入筛选、planned-buy、预签、nonce、广播 RPC、卖出仍完全由各 profile 自己执行。
+- `EVENT_DISCOVERY_FEED_FILE=output/event-discovery-feed.jsonl`、`EVENT_DISCOVERY_FEED_POLL_MS=1000`、`EVENT_DISCOVERY_FEED_TAIL_BYTES=2097152`：共享发现 feed 的文件、轮询间隔和启动尾读窗口。中心 `event:premium-watch` 写这个文件，各 Bot 可用 `EVENT_DISCOVERY=feed` 消费。
 - `REST_DISCOVERY_ENABLED=1`、`REST_DISCOVERY_POLL_MS=1000`：即使主发现路径是 WSS/链上日志，也每秒轮询一次 42 REST `status=all` markets 作为补漏。REST 会暴露 `not_started` 提前场，程序会提前放入 pending 并在开盘前预构建/预签；官网 New markets 有时先通过 REST 暴露，或不落在当前 controller 日志路径里，这个旁路保证这类场次进入 5 秒开盘窗口处理。
 - `WATCH_FUNDING_MODE=next_batch`：实盘 watch 启动前按已知下一批同一开盘时间的 Event Markets 合计资金校验；设为 `upper_bound` 时只按单场 `STAKE_PER_OUTCOME_USDT * min(EVENT_OUTCOME_COUNT, MAX_OUTCOMES_PER_MARKET)` 校验。
 - `BUNDLE_DUE_MARKETS=1`、`MAX_BATCH_STAKE_USDT=450`：同一 `startDate` 的多个 due Event Markets 会合并成一笔 `FTRouterProxy.multicall`，用批次上限控制总风险；资金不足或超过批次上限时只买优先级最高且能完整买入的 markets。
-- `EVENT_OUTCOME_SELECTION=lowest_odds`、`EVENT_OUTCOME_COUNT=5`：每个 Event Market 只买赔率最低的 5 个 outcome。链上日志缺少赔率字段时，程序会先用 42 单市场 REST 接口按地址补全 outcomes；赔率优先用 `payout` 排序，其次用 `price`。
+- `EVENT_MAX_DUE_MARKETS_PER_OPEN=1`、`BUNDLE_DUE_MARKETS=0`：Bot2 当前生产单市场模式，同一开盘时间只保留最高优先级的 1 个 market，到达配置的 post-open action time 后直接广播已预签名交易。当前生产 action time 是 `T+19.5s`。`EVENT_PRICE_GATE_ENABLED` 可切回价格筛选模式；启用时并发 `simulateMint` 已选 outcomes，任意一个 `collateralFromUser / otToUser` 低于 `EVENT_PRICE_GATE_MAX_EFFECTIVE_PRICE` 就广播，这只是反狙击溢价探测，不是限价单。
+- `EVENT_INTEL_BUY_FILTER=strong`、`EVENT_INTEL_BUY_FILE=output/event-intel.jsonl`：可选的 Bot2 筛选买入策略。启用后，非归档 Meme 板块事件会默认关注；REST categories 为空时，会用题目里的 token-style FDV / `$...人生` / 已知中文 meme 名称兜底识别。非 Meme 事件仍要求本地题目/来源可直接判断为 Binance strong，或情报 JSONL 已记录 `binanceRelation=strong`。固定 daily/weekly/monthly 模板和 Price 事件即使归档报告里有 strong 关系也不会自动买入；`Tweet Count` 等低交易量题材会被排除，不因 `CZ` 命中而自动买入。默认 `off`，不影响 Bot1。
+- `EVENT_OUTCOME_SELECTION=middle`、`EVENT_OUTCOME_COUNT=3`、`STAKE_PER_OUTCOME_USDT=10`：当前 Bot2 生产默认买入策略。每个 Event Market 按 outcome 显示/token 顺序买居中的 3 个选项；如果是 FDV/市值题材，就是买中间三个市值档，每档 `10U`。
+- `EVENT_PLANNED_BUYS_FILE=data/planned-buys.json`：profile-local 的精确买入计划。用于世界杯比分这类需要逐场指定 outcome 的 market。命中计划的 market 会只买该计划里的 outcome names 和 stake，不会套用全局 `middle`；同一开盘时间若多个 market 都在计划里，会全部进入预签/到点队列，未计划 market 仍遵守 `EVENT_MAX_DUE_MARKETS_PER_OPEN`。
+- `EVENT_OUTCOME_SELECTION=lowest_odds`：旧策略。每个 Event Market 只买赔率最低的 outcome，数量由 `EVENT_OUTCOME_COUNT` 控制。链上日志缺少赔率字段时，程序会先用 42 单市场 REST 接口按地址补全 outcomes；赔率优先用 `payout` 排序，其次用 `price`。
 - `EVENT_OUTCOME_SELECTION_FALLBACK=token_order`：速度优先默认值。缺少完整赔率数据时按 token 顺序继续抢，不阻断开盘买入；设为 `error` 才会在缺 odds 时跳过/报错。
 - `EVENT_OUTCOME_SELECTION=all`：恢复旧策略，买入该市场全部 outcome。
+
+`planned-buys.json` 示例：
+
+```json
+{
+  "plans": [
+    {
+      "market": "0x56D609d651f2362000Ce7F20514762F5C0FbDa2F",
+      "question": "Ecuador vs Curaçao",
+      "outcomes": ["ECU 1–0 CUW", "ECU 2–0 CUW", "ECU 3–0 CUW"],
+      "stakePerOutcomeUsdt": 10
+    }
+  ]
+}
+```
+- `MARKET_QUESTION_ALLOWLIST_REGEX=`：可选的 profile 级题目白名单。设置后只有标题匹配该正则的 Event Market 才允许自动买入，手动关注也不能绕过；Bot2 Daily Volume 可设为 `^(BTC|ETH|BNB)/USDT Futures Daily Volume`。
 - `MIN_EVENT_DURATION_HOURS=48`：只自动买入持续时间不少于 48 小时的非 Price Event Market；Daily Volume、OpenRouter 日盘会被过滤掉。
-- `AUTO_SELL_STRATEGY=ladder`、`AUTO_SELL_START_DELAY_SECONDS=10`、`AUTO_SELL_INTERVAL_SECONDS=10`、`AUTO_SELL_CHUNK_PERCENT=10`：只对 `AUTO_SELL_APPLY_AFTER_ISO` 之后买入的新仓生效；买入后 10 秒开始，每 10 秒卖出该 outcome 初始筹码的 10%，最多 10 轮卖完。旧的 `2x 卖 50%` 策略已取消。
-- `AUTO_SELL_STOP_LOSS_ENABLED=1`、`AUTO_SELL_STOP_LOSS_PERCENT=10`、`AUTO_SELL_STOP_LOSS_SELL_PERCENT=100`：按单个 outcome 的 100% 退出报价计算亏损；某个 outcome 跌到 -10% 时，停止该 outcome 的分批卖出并卖出该 outcome 全部剩余筹码，其他 outcome 继续分批。自动卖出统一使用 `minOut=1`，报价失败时到期分批卖出仍直接卖，不绑定价格。
+- `AUTO_SELL_STRATEGY=ladder`、`AUTO_SELL_START_DELAY_SECONDS=10`、`AUTO_SELL_INTERVAL_SECONDS=10`、`AUTO_SELL_CHUNK_PERCENT=10`、`AUTO_SELL_LADDER_PROFIT_PERCENT=100`：只对 `AUTO_SELL_APPLY_AFTER_ISO` 之后买入的新仓生效；买入后至少 10 秒，且该 outcome 的 100% 退出报价相对成本收益达到 `100%` 后，才开始每 10 秒卖出初始筹码的 10%，最多 10 轮卖完。旧的 `2x 卖 50%` 策略已取消。
+- `AUTO_SELL_STRATEGY=open_timed_exit`、`AUTO_SELL_OPEN_EXIT_DELAY_SECONDS=36`、`AUTO_SELL_OPEN_EXIT_PERCENT=100`：保留 ladder 旧策略的同时新增开盘定时退出策略；对符合自动卖出 cutover 的新仓，按市场开盘 `startDate + 36s` 卖出 100%，不等待 100% 盈利门槛，`-10%` 止损仍优先。
+- `AUTO_SELL_STOP_LOSS_ENABLED=1`、`AUTO_SELL_STOP_LOSS_PERCENT=10`、`AUTO_SELL_STOP_LOSS_SELL_PERCENT=100`：按单个 outcome 的 100% 退出报价计算亏损；某个 outcome 跌到 -10% 时，停止该 outcome 的分批卖出并卖出该 outcome 全部剩余筹码，其他 outcome 继续分批。自动卖出统一使用 `minOut=1`，不绑定退出价格；收益门槛开启时，分批卖出必须先成功报价确认收益达标。
 - `AUTO_SELL_BUY_GUARD_BEFORE_MS=120000`、`AUTO_SELL_BUY_GUARD_AFTER_MS=10000`：只要已知待买市场进入开盘前 120 秒到开盘窗口后 10 秒，自动卖出、operator 预授权都会暂停，买入热路径最高优先级。
 - `AUTO_SELL_PREAPPROVE_OPERATOR=1`、`AUTO_SELL_APPROVALS_PER_TICK=1`、`AUTO_SELL_REQUIRE_PREAPPROVED_OPERATOR=1`：自动卖出不再在真正卖出的同一笔流程里临时做 operator 授权；监控 tick 会低优先级提前补授权，未授权 market 的卖出延后到下一轮。
 - `AUTO_SELL_MAX_OUTCOMES_PER_TX=8`、`AUTO_SELL_MAX_MARKETS_PER_TX=4`、`AUTO_SELL_MAX_GAS_PER_TX=12000000`、`AUTO_SELL_MAX_TX_PER_TICK=1`：到期卖出先按 outcome 独立决策，再跨 market 合并成受限批次；单轮最多发 1 笔卖出交易，避免卖出队列占住 nonce。
 - `FEISHU_WEBHOOK=`：长期守护进程告警入口。生产环境放在服务器 env，不提交到 Git；会通知启动、开盘前资金不足、买入广播/失败、receipt 失败、WS/链上降级、自动卖出失败/暂停等关键事件。常态资金不足只展示在 dashboard 和日志里；`ALERT_STATE_FILE` 保存 profile-local 告警状态，避免同一问题在重启后反复刷屏。
 - `MARKET_DECISIONS_FILE=data/market-decisions.jsonl`：记录每个市场的发现、过滤、待买、资金不足、买入成功/失败等决策流水，方便复盘“为什么买/没买”。
+- `GAS_LEDGER_FILE=data/gas-ledger.jsonl`：profile-local Gas 明细账；每条上链交易按 `txHash` 记录 `gasUsed * effectiveGasPrice` 的 BNB 成本，并可通过 `npm run gas:backfill -- --profile-env /etc/42space/profiles/42space.env` 追溯历史交易和补 BNBUSDT 估值。
 - `EVENT_BUY_MODE=fast`：不逐个报价，直接 `minOut=1` 买入选中的 outcome。抢新场默认用这个。
 - `EVENT_BUY_MODE=quoted`：先模拟再买，慢但输出更完整。
 - `FAST_SKIP_PREFLIGHT=1`：触发时不再查余额/allowance，依赖启动前 `event:preflight` 和 `event:approve`。
@@ -160,7 +188,7 @@ STAKE_PER_OUTCOME_USDT=20 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=100 npm ru
 - `FAST_GAS_WALLET_BUDGET=1`、`FAST_GAS_WALLET_BUDGET_BPS=10000`、`FAST_GAS_BLOCK_LIMIT_BPS=10000`、`FAST_GAS_TX_LIMIT=16777216`：实盘预签/补签时不再让 `FAST_GAS_LIMIT` / `BUNDLE_FAST_GAS_LIMIT` 成为硬 cap，而是按 pending BNB 余额和固定 `GAS_PRICE_GWEI` 计算这笔交易最多能承受的 gas limit，并受当前区块 gas limit 与 BSC 单笔交易 gas 上限约束。也就是说，开盘买入优先避免 OOG，但不会签出 RPC 直接拒收的超限交易；钱包里的 BNB 就是买入 gas 预算。
 - Dashboard 手动卖出保护：默认在下一场开盘前 `PRE_SIGN_WINDOW_MS + 15s` 到开盘后 `EVENT_OPEN_WINDOW_SECONDS + 15s` 内，报价和执行都会被拒绝，避免手动卖出消耗 nonce 破坏已预签名的买入交易。可用 `DASHBOARD_MANUAL_SELL_HOT_GUARD_MS` 调整额外保护时间。
 - `WAIT_FOR_RECEIPT=0`：fast 买入热路径只等 raw tx 被 RPC 接收，不在交易锁内等待 receipt；market 会先按“已广播”处理，避免同一窗口重复烧 gas 或挡住下一场。
-- `ASYNC_RECEIPT_WATCH=1`、`RECEIPT_WATCH_TIMEOUT_MS=120000`、`RECEIPT_WATCH_POLLING_MS=1000`：后台等待 receipt，并把成功/失败写入 `FILLS_FILE` 和决策日志；失败通过飞书告警复盘，不阻塞开盘广播。
+- `ASYNC_RECEIPT_WATCH=1`、`RECEIPT_WATCH_TIMEOUT_MS=120000`、`RECEIPT_WATCH_POLLING_MS=1000`：后台等待 receipt，并把成功/失败写入 `FILLS_FILE`、Gas ledger 和决策日志；失败通过飞书告警复盘，不阻塞开盘广播。
 - `EXECUTION_RETRY_MS=500`：只针对签名/广播前错误或 RPC 全部拒收重试；只要 raw tx 已被接受，就不在 5 秒窗口里重复买入。
 - `EVENT_OPEN_WINDOW_SECONDS=5`：硬截止。市场开盘超过 5 秒仍未成功买入时，自动监听会写入 `event-skip-open-window`，把该 market 加入 seen，并从 pending 删除；真实 `event:buy` / bundle 入口也会在发交易前拒绝超窗 market，除非显式设置 `ALLOW_LATE_BUY=1`。
 

@@ -218,12 +218,16 @@ export async function getWalletStatusForAddress(publicClient, address) {
 }
 
 export async function estimateFastGasReserve(publicClient, cfg, funding = {}) {
-  const gasPrice = cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : await publicClient.getGasPrice();
+  const gasPriceGwei = funding.nextBatchGasPriceGwei ?? funding.gasPriceGwei ?? cfg.gasPriceGwei;
+  const gasPrice = gasPriceGwei ? parseGwei(String(gasPriceGwei)) : await publicClient.getGasPrice();
   return calculateFastGasReserve(cfg, funding, gasPrice);
 }
 
 export function calculateFastGasReserve(cfg, funding = {}, gasPrice = null) {
-  const effectiveGasPrice = gasPrice ?? (cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : null);
+  const fundingGasPriceGwei = funding.nextBatchGasPriceGwei ?? funding.gasPriceGwei;
+  const effectiveGasPrice = gasPrice ??
+    (fundingGasPriceGwei ? parseGwei(String(fundingGasPriceGwei)) : null) ??
+    (cfg.gasPriceGwei ? parseGwei(String(cfg.gasPriceGwei)) : null);
   if (!effectiveGasPrice) throw new Error("GAS_PRICE_GWEI is required for synchronous gas reserve calculation");
   const useBundleGas = Boolean(cfg.bundleDueMarkets && Number(funding.nextBatchMarketCount ?? 0) > 1);
   const dynamicGasLimit = useBundleGas
@@ -626,6 +630,57 @@ export function selectEventOutcomes(outcomes, cfg) {
       }
     };
   }
+  if (strategy === "names") {
+    const wantedNames = parseOutcomeNames(cfg.eventOutcomeNames);
+    if (wantedNames.length === 0) {
+      throw new Error("EVENT_OUTCOME_NAMES is required when EVENT_OUTCOME_SELECTION=names");
+    }
+    const byName = new Map(sorted.map((outcome) => [normalizeOutcomeName(outcome.name), outcome]));
+    const selected = [];
+    const seen = new Set();
+    const missing = [];
+    for (const name of wantedNames) {
+      const outcome = byName.get(normalizeOutcomeName(name));
+      if (!outcome) {
+        missing.push(name);
+        continue;
+      }
+      const key = String(outcome.tokenId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      selected.push(outcome);
+    }
+    if (missing.length > 0) {
+      throw new Error(`EVENT_OUTCOME_NAMES not found in market: ${missing.join(", ")}`);
+    }
+    return {
+      outcomes: selected,
+      metadata: {
+        strategy,
+        requestedCount: wantedNames.length,
+        selectedCount: selected.length,
+        availableOutcomeCount: sorted.length,
+        rankSource: "name",
+        fallbackReason: null,
+        requestedNames: wantedNames
+      }
+    };
+  }
+  if (strategy === "middle") {
+    const requestedCount = Math.min(Number(cfg.eventOutcomeCount ?? 3), sorted.length);
+    const start = Math.max(0, Math.floor((sorted.length - requestedCount) / 2));
+    return {
+      outcomes: sorted.slice(start, start + requestedCount),
+      metadata: {
+        strategy,
+        requestedCount: Number(cfg.eventOutcomeCount ?? 3),
+        selectedCount: requestedCount,
+        availableOutcomeCount: sorted.length,
+        rankSource: "token_order",
+        fallbackReason: null
+      }
+    };
+  }
   if (strategy !== "lowest_odds") {
     throw new Error(`Unsupported EVENT_OUTCOME_SELECTION ${strategy}`);
   }
@@ -650,11 +705,15 @@ export function estimateSelectedOutcomeCount(market, cfg) {
   const availableCount = market.outcomes?.length ?? 0;
   if (availableCount <= 0) return 0;
   if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "all") return availableCount;
+  if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "names") return parseOutcomeNames(cfg.eventOutcomeNames).length;
   return Math.min(Number(cfg.eventOutcomeCount ?? 5), availableCount);
 }
 
 export function estimateMaxSelectedOutcomeCount(cfg) {
   if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "all") return cfg.maxOutcomesPerMarket;
+  if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "names") {
+    return Math.min(parseOutcomeNames(cfg.eventOutcomeNames).length, cfg.maxOutcomesPerMarket);
+  }
   return Math.min(Number(cfg.eventOutcomeCount ?? 5), cfg.maxOutcomesPerMarket);
 }
 
@@ -664,11 +723,12 @@ export async function quoteBuyAllOutcomes(publicClient, market, cfg, overrides =
   }
   const availableOutcomes = sortOutcomes(market.outcomes ?? []);
   if (availableOutcomes.length === 0) throw new Error("Market has no outcomes");
-  if (availableOutcomes.length > cfg.maxOutcomesPerMarket) {
+  if (availableOutcomes.length > cfg.maxOutcomesPerMarket && !allowsExplicitLargeMarketSelection(cfg)) {
     throw new Error(`Market has ${availableOutcomes.length} outcomes, above MAX_OUTCOMES_PER_MARKET ${cfg.maxOutcomesPerMarket}`);
   }
   const selection = selectEventOutcomes(availableOutcomes, cfg);
   const outcomes = selection.outcomes;
+  assertSelectedOutcomeLimit(outcomes, cfg);
 
   const stakePerOutcomeUsdt = Number(overrides.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
   const totalStakeUsdt = stakePerOutcomeUsdt * outcomes.length;
@@ -716,11 +776,12 @@ export function buildDirectBuyAllOutcomesPlan(market, cfg, overrides = {}) {
   }
   const availableOutcomes = sortOutcomes(market.outcomes ?? []);
   if (availableOutcomes.length === 0) throw new Error("Market has no outcomes");
-  if (availableOutcomes.length > cfg.maxOutcomesPerMarket) {
+  if (availableOutcomes.length > cfg.maxOutcomesPerMarket && !allowsExplicitLargeMarketSelection(cfg)) {
     throw new Error(`Market has ${availableOutcomes.length} outcomes, above MAX_OUTCOMES_PER_MARKET ${cfg.maxOutcomesPerMarket}`);
   }
   const selection = selectEventOutcomes(availableOutcomes, cfg);
   const outcomes = selection.outcomes;
+  assertSelectedOutcomeLimit(outcomes, cfg);
 
   const stakePerOutcomeUsdt = Number(overrides.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
   const totalStakeUsdt = stakePerOutcomeUsdt * outcomes.length;
@@ -1009,7 +1070,8 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
     outcomeCount: bundle.outcomeCount,
     totalAmount: formatUnits(bundle.totalAmount, 18),
     totalStakeUsdt: bundle.totalStakeUsdt,
-    markets: bundle.markets
+    markets: bundle.markets,
+    ...receiptGasFields(receipt)
   };
 }
 
@@ -1134,7 +1196,8 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
       simulatedOtToUser: outcome.simulated ? formatUnits(outcome.simulated.otToUser, 18) : null,
       minOut: formatUnits(outcome.minOut, 18),
       collateralFromUser: outcome.simulated ? formatUnits(outcome.simulated.collateralFromUser, 18) : formatUnits(outcome.amount, 18)
-    }))
+    })),
+    ...receiptGasFields(receipt)
   };
 }
 
@@ -1203,29 +1266,44 @@ async function writeFastMulticallFanout(cfg, publicClient, account, request, cal
 
   const txHash = keccak256(serializedTransaction);
   const broadcastStartedAt = Date.now();
-  const attempts = cfg.broadcastRpcUrls.map((url) =>
-    sendRawTransactionVia(url, serializedTransaction, txHash, cfg.broadcastTimeoutMs, broadcastStartedAt)
+  const attempts = buildRawTransactionFanoutAttempts(
+    cfg.broadcastRpcUrls,
+    serializedTransaction,
+    txHash,
+    cfg.broadcastTimeoutMs,
+    broadcastStartedAt
   );
 
   try {
     const first = await Promise.any(attempts);
+    logRawTransactionFanoutSettled("raw-tx-fanout-settled", txHash, attempts);
+    scheduleRawTransactionRebroadcast(cfg, {
+      txHash,
+      serializedTransaction,
+      gas: gas.toString(),
+      gasPrice: gasPrice.toString(),
+      nonce
+    }, cfg.broadcastRpcUrls, first.provider);
     return {
       txHash: first.txHash,
       mode: "fanout_raw",
       rpcCount: cfg.broadcastRpcUrls.length,
       firstProvider: first.provider,
+      firstAlreadyKnown: Boolean(first.alreadyKnown),
       broadcastStartedAt: new Date(broadcastStartedAt).toISOString(),
       firstAcceptedAt: first.acceptedAt,
       firstAcceptedLatencyMs: first.latencyMs,
       gas: gas.toString(),
       gasPrice: gasPrice.toString(),
       gasPriceGwei: formatUnits(gasPrice, 9),
-      nonce
+      nonce,
+      rebroadcastIntervalMs: cfg.rebroadcastIntervalMs,
+      rebroadcastDurationMs: cfg.rebroadcastDurationMs
     };
   } catch {
     const settled = await Promise.allSettled(attempts);
     const messages = settled.map((item) =>
-      item.status === "rejected" ? item.reason?.message ?? String(item.reason) : "unexpected success"
+      item.status === "rejected" ? conciseProviderError(item.reason) : "unexpected success"
     );
     throw new Error(`Fanout broadcast failed on all RPCs: ${messages.join(" | ")}`);
   }
@@ -1238,17 +1316,23 @@ async function broadcastPreSignedFastTransaction(cfg, signed) {
   const urls = cfg.broadcastRpcUrls?.length ? cfg.broadcastRpcUrls : [cfg.rpcUrl];
   if (cfg.fanoutBroadcast && urls.length > 1) {
     const broadcastStartedAt = Date.now();
-    const attempts = urls.map((url) =>
-      sendRawTransactionVia(url, signed.serializedTransaction, signed.txHash, cfg.broadcastTimeoutMs, broadcastStartedAt)
+    const attempts = buildRawTransactionFanoutAttempts(
+      urls,
+      signed.serializedTransaction,
+      signed.txHash,
+      cfg.broadcastTimeoutMs,
+      broadcastStartedAt
     );
     try {
       const first = await Promise.any(attempts);
+      logRawTransactionFanoutSettled("presigned-raw-tx-fanout-settled", signed.txHash, attempts);
       scheduleRawTransactionRebroadcast(cfg, signed, urls, first.provider);
       return {
         txHash: first.txHash,
         mode: "presigned_fanout_raw",
         rpcCount: urls.length,
         firstProvider: first.provider,
+        firstAlreadyKnown: Boolean(first.alreadyKnown),
         broadcastStartedAt: new Date(broadcastStartedAt).toISOString(),
         firstAcceptedAt: first.acceptedAt,
         firstAcceptedLatencyMs: first.latencyMs,
@@ -1262,7 +1346,7 @@ async function broadcastPreSignedFastTransaction(cfg, signed) {
     } catch {
       const settled = await Promise.allSettled(attempts);
       const messages = settled.map((item) =>
-        item.status === "rejected" ? item.reason?.message ?? String(item.reason) : "unexpected success"
+        item.status === "rejected" ? conciseProviderError(item.reason) : "unexpected success"
       );
       throw new Error(`Pre-signed fanout broadcast failed on all RPCs: ${messages.join(" | ")}`);
     }
@@ -1292,6 +1376,47 @@ async function broadcastPreSignedFastTransaction(cfg, signed) {
     rebroadcastIntervalMs: cfg.rebroadcastIntervalMs,
     rebroadcastDurationMs: cfg.rebroadcastDurationMs
   };
+}
+
+function buildRawTransactionFanoutAttempts(urls, serializedTransaction, txHash, timeoutMs, broadcastStartedAt) {
+  return urls.map((url) => {
+    const provider = providerLabel(url);
+    return sendRawTransactionVia(url, serializedTransaction, txHash, timeoutMs, broadcastStartedAt)
+      .catch((error) => {
+        error.provider = provider;
+        throw error;
+      });
+  });
+}
+
+function logRawTransactionFanoutSettled(level, txHash, attempts) {
+  if (!attempts?.length) return;
+  void Promise.allSettled(attempts).then((settled) => {
+    const results = settled.map((item) => {
+      if (item.status === "fulfilled") {
+        return {
+          provider: item.value.provider ?? null,
+          status: item.value.alreadyKnown ? "already_known" : "accepted",
+          latencyMs: item.value.latencyMs ?? null
+        };
+      }
+      return {
+        provider: item.reason?.provider ?? null,
+        status: "rejected",
+        message: conciseProviderError(item.reason)
+      };
+    });
+    console.log(JSON.stringify({
+      level,
+      txHash,
+      rpcCount: settled.length,
+      accepted: results.filter((item) => item.status === "accepted" || item.status === "already_known").length,
+      alreadyKnown: results.filter((item) => item.status === "already_known").length,
+      rejected: results.filter((item) => item.status === "rejected").length,
+      results,
+      at: new Date().toISOString()
+    }));
+  }).catch(() => {});
 }
 
 function scheduleRawTransactionRebroadcast(cfg, signed, urls, firstProvider) {
@@ -1367,6 +1492,24 @@ async function waitForReceiptWithConfig(cfg, txHash) {
     timeout: cfg.receiptWatchTimeoutMs,
     pollingInterval: cfg.receiptWatchPollingMs
   });
+}
+
+function receiptGasFields(receipt, prefix = "") {
+  if (!receipt?.gasUsed || !receipt?.effectiveGasPrice) return {};
+  const gasUsed = BigInt(receipt.gasUsed);
+  const effectiveGasPrice = BigInt(receipt.effectiveGasPrice);
+  const gasFeeWei = gasUsed * effectiveGasPrice;
+  const fields = {
+    gasUsed: gasUsed.toString(),
+    effectiveGasPrice: effectiveGasPrice.toString(),
+    gasFeeWei: gasFeeWei.toString(),
+    gasFeeBnb: formatUnits(gasFeeWei, 18)
+  };
+  if (!prefix) return fields;
+  const capitalized = prefix[0].toUpperCase() + prefix.slice(1);
+  return Object.fromEntries(
+    Object.entries(fields).map(([key, value]) => [`${prefix}${capitalized ? key[0].toUpperCase() + key.slice(1) : key}`, value])
+  );
 }
 
 async function getFreshPendingNonce(publicClient, account, runtime = null) {
@@ -1581,6 +1724,7 @@ export async function sellOutcome(cfg, sellPlan) {
   }
 
   let operatorApprovalHash = null;
+  let operatorApprovalReceipt = null;
   let operatorApproved = sellPlan.operatorApproved;
   if (!operatorApproved) {
     operatorApproved = await publicClient.readContract({
@@ -1595,10 +1739,11 @@ export async function sellOutcome(cfg, sellPlan) {
       address: market,
       abi: marketV2Abi,
       functionName: "setOperator",
-      args: [ADDRESSES.routerProxy, true]
+      args: [ADDRESSES.routerProxy, true],
+      ...sellGasPriceOverride(cfg)
     });
-    await publicClient.waitForTransactionReceipt({ hash: operatorApprovalHash });
-    operatorApproved = true;
+    operatorApprovalReceipt = await publicClient.waitForTransactionReceipt({ hash: operatorApprovalHash });
+    operatorApproved = operatorApprovalReceipt.status === "success";
   }
 
   const args = [
@@ -1621,7 +1766,7 @@ export async function sellOutcome(cfg, sellPlan) {
   const request = {
     ...simulated.request,
     account,
-    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+    ...sellGasPriceOverride(cfg)
   };
   const txHash = await walletClient.writeContract(request);
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
@@ -1629,6 +1774,8 @@ export async function sellOutcome(cfg, sellPlan) {
   return {
     operatorApprovalHash,
     operatorApproved,
+    operatorApprovalStatus: operatorApprovalReceipt?.status ?? null,
+    operatorApprovalBlockNumber: operatorApprovalReceipt?.blockNumber?.toString() ?? null,
     txHash,
     status: receipt.status,
     blockNumber: receipt.blockNumber?.toString() ?? null,
@@ -1638,7 +1785,9 @@ export async function sellOutcome(cfg, sellPlan) {
     amountOt: formatUnits(amount, 18),
     minCollateralOut: formatUnits(minOut, 18),
     expectedCollateralToUser: formatUnits(sellPlan.expectedCollateralToUser, 18),
-    slippageBps: sellPlan.slippageBps
+    slippageBps: sellPlan.slippageBps,
+    ...receiptGasFields(operatorApprovalReceipt, "operatorApproval"),
+    ...receiptGasFields(receipt)
   };
 }
 
@@ -1674,7 +1823,7 @@ export async function ensureMarketOperatorApproval(cfg, marketAddress) {
     abi: marketV2Abi,
     functionName: "setOperator",
     args: [ADDRESSES.routerProxy, true],
-    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+    ...sellGasPriceOverride(cfg)
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
   return {
@@ -1683,7 +1832,8 @@ export async function ensureMarketOperatorApproval(cfg, marketAddress) {
     approved: receipt.status === "success",
     txHash,
     status: receipt.status,
-    blockNumber: receipt.blockNumber?.toString() ?? null
+    blockNumber: receipt.blockNumber?.toString() ?? null,
+    ...receiptGasFields(receipt)
   };
 }
 
@@ -1713,10 +1863,17 @@ export async function sellOutcomesBatch(cfg, sellPlans, options = {}) {
         abi: marketV2Abi,
         functionName: "setOperator",
         args: [ADDRESSES.routerProxy, true],
-        ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+        ...sellGasPriceOverride(cfg)
       });
-      await publicClient.waitForTransactionReceipt({ hash: operatorApprovalHash });
+      const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: operatorApprovalHash });
       approved = true;
+      approvals.push({
+        market,
+        operatorApproved: approved,
+        operatorApprovalHash,
+        ...receiptGasFields(approvalReceipt, "operatorApproval")
+      });
+      continue;
     }
     approvals.push({ market, operatorApproved: approved, operatorApprovalHash });
   }
@@ -1773,7 +1930,7 @@ export async function sellOutcomesBatch(cfg, sellPlans, options = {}) {
     args: [calls],
     account,
     gas,
-    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
+    ...sellGasPriceOverride(cfg)
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
 
@@ -1787,8 +1944,105 @@ export async function sellOutcomesBatch(cfg, sellPlans, options = {}) {
     gas: gas.toString(),
     marketCount: markets.length,
     positionCount: positions.length,
-    requirePreapprovedOperator
+    requirePreapprovedOperator,
+    ...receiptGasFields(receipt)
   };
+}
+
+export async function preSignSellOutcomesBatch(cfg, sellPlans, runtime = null, options = {}) {
+  assertSellExecutionAllowed(cfg);
+  const plans = Array.isArray(sellPlans) ? sellPlans : [];
+  if (plans.length === 0) throw new Error("preSignSellOutcomesBatch requires at least one sell plan");
+  const requirePreapprovedOperator = Boolean(options.requirePreapprovedOperator);
+  if (requirePreapprovedOperator) {
+    const missing = plans.find((plan) => !plan.operatorApproved);
+    if (missing) throw new Error(`Operator approval missing for market ${missing.market}`);
+  }
+
+  const { publicClient, account } = makeClients(cfg);
+  const receiver = getAddress(cfg.walletAddress || account.address);
+  const calls = [];
+  const positions = [];
+
+  for (const plan of plans) {
+    const market = getAddress(plan.market);
+    const tokenId = BigInt(plan.tokenId);
+    const amount = plan.amount;
+    const minOut = plan.minCollateralOut > 0n ? plan.minCollateralOut : 1n;
+    if (amount <= 0n) throw new Error(`Sell amount is zero for tokenId ${tokenId.toString()}`);
+    calls.push({
+      allowFailure: false,
+      callData: encodeFunctionData({
+        abi: routerAbi,
+        functionName: "swap",
+        args: [
+          market,
+          receiver,
+          tokenId,
+          [false, amount, true, minOut],
+          "0x",
+          "0x",
+          ADDRESSES.integrator,
+          INTEGRATOR_FEE_BPS
+        ]
+      })
+    });
+    positions.push({
+      market,
+      tokenId: tokenId.toString(),
+      amountOt: formatUnits(amount, 18),
+      minCollateralOut: formatUnits(minOut, 18),
+      expectedCollateralToUser: formatUnits(plan.expectedCollateralToUser ?? 0n, 18),
+      directNoQuote: Boolean(plan.directNoQuote)
+    });
+  }
+
+  const gas = 1500000n + 1000000n * BigInt(plans.length);
+  const gasPrice = cfg.autoSellGasPriceGwei || cfg.gasPriceGwei
+    ? parseGwei(String(cfg.autoSellGasPriceGwei || cfg.gasPriceGwei))
+    : await publicClient.getGasPrice();
+  const nonce = runtime?.nextNonce !== undefined
+    ? runtime.nextNonce
+    : await publicClient.getTransactionCount({
+        address: account.address,
+        blockTag: "pending"
+      });
+  const data = encodeFunctionData({
+    abi: routerAbi,
+    functionName: "multicall",
+    args: [calls]
+  });
+  const serializedTransaction = await account.signTransaction({
+    chainId: bsc.id,
+    to: ADDRESSES.routerProxy,
+    data,
+    gas,
+    gasPrice,
+    nonce,
+    value: 0n,
+    type: "legacy"
+  });
+  if (runtime?.nextNonce !== undefined) runtime.nextNonce += 1;
+  const txHash = keccak256(serializedTransaction);
+
+  return {
+    txHash,
+    serializedTransaction,
+    nonce,
+    gas: gas.toString(),
+    gasPrice: gasPrice.toString(),
+    gasPriceGwei: formatUnits(gasPrice, 9),
+    receiver,
+    positions,
+    marketCount: new Set(plans.map((plan) => getAddress(plan.market))).size,
+    positionCount: positions.length,
+    requirePreapprovedOperator,
+    preparedAt: new Date().toISOString()
+  };
+}
+
+export async function broadcastSignedTransaction(cfg, signed) {
+  return broadcastPreSignedFastTransaction(cfg, signed);
 }
 
 export function describePlan(plan) {
@@ -1881,7 +2135,7 @@ export function describeEventPlan(plan) {
   };
 }
 
-function assertExecutionAllowed(cfg, plan, { checkMarketStake = true } = {}) {
+export function assertExecutionAllowed(cfg, plan, { checkMarketStake = true } = {}) {
   if (cfg.dryRun || !cfg.execute) {
     throw new Error("Refusing real buy: set DRY_RUN=0 and EXECUTE=1");
   }
@@ -1954,6 +2208,7 @@ async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
   }
 
   let resetHash = null;
+  let resetReceipt = null;
   if (allowance > 0n) {
     resetHash = await walletClient.writeContract({
       address: ADDRESSES.busdt,
@@ -1961,7 +2216,7 @@ async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
       functionName: "approve",
       args: [ADDRESSES.routerProxy, 0n]
     });
-    await publicClient.waitForTransactionReceipt({ hash: resetHash });
+    resetReceipt = await publicClient.waitForTransactionReceipt({ hash: resetHash });
   }
 
   const approveHash = await walletClient.writeContract({
@@ -1970,11 +2225,17 @@ async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
     functionName: "approve",
     args: [ADDRESSES.routerProxy, MAX_UINT256]
   });
-  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+  const approveReceipt = await publicClient.waitForTransactionReceipt({ hash: approveHash });
   return {
     allowance: formatUnits(allowance, 18),
     approveHash,
-    resetHash
+    approveStatus: approveReceipt.status,
+    approveBlockNumber: approveReceipt.blockNumber?.toString() ?? null,
+    resetHash,
+    resetStatus: resetReceipt?.status ?? null,
+    resetBlockNumber: resetReceipt?.blockNumber?.toString() ?? null,
+    ...receiptGasFields(approveReceipt, "approve"),
+    ...receiptGasFields(resetReceipt, "reset")
   };
 }
 
@@ -2013,6 +2274,21 @@ function providerLabel(url) {
   }
 }
 
+function conciseProviderError(error) {
+  const message = error?.shortMessage ?? error?.message ?? String(error);
+  return redactProviderUrls(String(message).replace(/\s+/g, " ")).slice(0, 300);
+}
+
+function redactProviderUrls(message) {
+  return String(message).replace(/https?:\/\/[^\s)"']+/g, (value) => {
+    try {
+      return new URL(value).origin;
+    } catch {
+      return "http(s)://redacted";
+    }
+  });
+}
+
 function sortOutcomes(outcomes) {
   return [...outcomes].sort(compareTokenIdAsc);
 }
@@ -2039,6 +2315,34 @@ function compareOutcomeRank(a, b, rankSource) {
     if (delta !== 0) return delta;
   }
   return compareTokenIdAsc(a, b);
+}
+
+function parseOutcomeNames(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeOutcomeName(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/[\u2010-\u2015\u2212]/gu, "-")
+    .replace(/\u2265/gu, ">=")
+    .replace(/\u2264/gu, "<=")
+    .replace(/\s+/gu, " ")
+    .replace(/([<>]=?)\s+(?=[\d.])/gu, "$1")
+    .toLowerCase();
+}
+
+function allowsExplicitLargeMarketSelection(cfg) {
+  return (cfg.eventOutcomeSelection ?? "lowest_odds") === "names";
+}
+
+function assertSelectedOutcomeLimit(outcomes, cfg) {
+  if (outcomes.length > cfg.maxOutcomesPerMarket) {
+    throw new Error(`Selected ${outcomes.length} outcomes, above MAX_OUTCOMES_PER_MARKET ${cfg.maxOutcomesPerMarket}`);
+  }
 }
 
 function compareTokenIdAsc(a, b) {
@@ -2136,6 +2440,11 @@ function isSupportedCollateralMarket(market) {
   );
 }
 
+function sellGasPriceOverride(cfg) {
+  const gasPriceGwei = cfg.autoSellGasPriceGwei || cfg.gasPriceGwei;
+  return gasPriceGwei ? { gasPrice: parseGwei(String(gasPriceGwei)) } : {};
+}
+
 function normalizePrivateKey(value) {
   return value.startsWith("0x") ? value : `0x${value}`;
 }
@@ -2154,7 +2463,11 @@ async function getJsonWithRetry(url, label, attempts = 3) {
         const body = await response.text();
         throw new Error(`${label} ${response.status}: ${body.slice(0, 500)}`);
       }
-      return response.json();
+      try {
+        return await response.json();
+      } catch (error) {
+        throw new Error(`${label} invalid JSON: ${error.message}`);
+      }
     } catch (error) {
       lastError = error;
       if (attempt < attempts) await sleep(500 * attempt);
