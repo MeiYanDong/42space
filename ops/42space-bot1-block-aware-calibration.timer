@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Bot1 block-aware timing calibration
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=45s
+Persistent=true
+Unit=42space-bot1-block-aware-calibration.service
+
+[Install]
+WantedBy=timers.target

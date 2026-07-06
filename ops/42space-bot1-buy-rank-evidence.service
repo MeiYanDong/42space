@@ -1,0 +1,12 @@
+[Unit]
+Description=42space Bot1 buy-rank evidence collector
+After=network-online.target 42space-event@42space.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/42space
+ExecStart=/usr/bin/node /opt/42space/scripts/bot3-buy-rank-evidence.js --profile-env /etc/42space/profiles/42space.env --out-dir /opt/42space/output/bot1-buy-rank --only-new --window-seconds 60 --top 10
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

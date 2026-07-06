@@ -3,4 +3,9 @@ node_modules/
 .env.*
 !.env.example
 data/
+output/*
+!output/annotations/
+!output/annotations/**
+outputs/
+.DS_Store
 *.log

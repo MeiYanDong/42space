@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Bot4 readiness check before the daily 08:00 CST open
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+AccuracySec=1s
+Persistent=true
+Unit=42space-bot4-readiness.service
+
+[Install]
+WantedBy=timers.target

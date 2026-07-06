@@ -1,0 +1,19 @@
+[Unit]
+Description=42space Bot5 Public Dashboard (port 80)
+After=network-online.target 42space-dashboard@42space-5.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+EnvironmentFile=/etc/42space/profiles/42space-5.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/env DASHBOARD_HOST=0.0.0.0 DASHBOARD_PORT=80 BOT_NAME=Bot5_Public_Dashboard /usr/bin/npm run dashboard
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

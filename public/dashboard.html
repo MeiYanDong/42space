@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>42space Bot Console</title>
-    <link rel="stylesheet" href="/assets/dashboard.css">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=gas-ledger-20260706">
   </head>
   <body>
     <main class="shell">
@@ -191,26 +191,6 @@
               </div>
               <div id="historyProjectList" class="projectBoard isHidden"></div>
             </section>
-            <section class="panel positionsPanel">
-              <div class="panelHead">
-                <div>
-                  <h3><i data-icon="badge-dollar-sign"></i>当前持仓明细</h3>
-                  <p>选择仓位后在右侧面板报价和卖出</p>
-                </div>
-                <span id="holdingCount">--</span>
-              </div>
-              <div id="holdingsList" class="holdings"></div>
-            </section>
-            <section class="panel projectsPanel">
-              <div class="panelHead">
-                <div>
-                  <h3><i data-icon="bar-chart-3"></i>项目统计</h3>
-                  <p>按 market 聚合的资金表现</p>
-                </div>
-                <span id="projectCount">--</span>
-              </div>
-              <div id="projectStats" class="projects"></div>
-            </section>
           </section>
 
           <section id="executionView" class="view" data-view="execution">
@@ -240,12 +220,28 @@
                     <strong id="stakeText">--</strong>
                   </div>
                   <div class="settingItem">
-                    <span>开盘窗口</span>
+                    <span>广播/窗口</span>
                     <strong id="windowText">--</strong>
                   </div>
                   <div class="settingItem">
                     <span>自动止盈</span>
                     <strong id="autoSellText">--</strong>
+                  </div>
+                  <div class="settingItem ruleItem">
+                    <span>自动过滤</span>
+                    <strong id="ruleFilterText">--</strong>
+                  </div>
+                  <div class="settingItem ruleItem">
+                    <span>默认显示</span>
+                    <strong id="ruleDisplayText">--</strong>
+                  </div>
+                  <div class="settingItem ruleItem">
+                    <span>默认关注</span>
+                    <strong id="ruleFollowText">--</strong>
+                  </div>
+                  <div class="settingItem ruleItem">
+                    <span>飞书通知</span>
+                    <strong id="ruleNotifyText">--</strong>
                   </div>
                 </div>
                 <form id="runtimeConfigForm" class="configForm">
@@ -253,8 +249,8 @@
                     <label class="field">
                       <span>过滤模式</span>
                       <select id="configMode">
-                        <option value="price_only_test">只过滤 Price</option>
-                        <option value="production">生产过滤</option>
+                        <option value="price_only_test">基础过滤：Price/8hour/日常模板</option>
+                        <option value="production">生产过滤：基础过滤 + 时长门槛</option>
                       </select>
                     </label>
                     <label class="field">
@@ -270,8 +266,12 @@
                       <input id="configMaxBatchStake" type="number" min="0.1" max="5000" step="0.1">
                     </label>
                     <label class="field">
-                      <span>Gas gwei</span>
+                      <span>买入 Gas gwei</span>
                       <input id="configGasPriceGwei" type="number" min="0.01" max="50" step="0.01">
+                    </label>
+                    <label class="field">
+                      <span>卖出 Gas gwei</span>
+                      <input id="configAutoSellGasPriceGwei" type="number" min="0.01" max="50" step="0.01" placeholder="默认同买入">
                     </label>
                     <label class="field">
                       <span>自动卖出</span>
@@ -279,6 +279,10 @@
                         <option value="1">开启</option>
                         <option value="0">关闭</option>
                       </select>
+                    </label>
+                    <label class="field tokenField">
+                      <span>显示过滤规则</span>
+                      <div id="configDisplayFilters" class="filterRuleGrid"></div>
                     </label>
                     <label class="field">
                       <span>卖出延迟秒</span>
@@ -381,6 +385,6 @@
     </aside>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="/assets/dashboard.js"></script>
+    <script type="module" src="/assets/dashboard.js?v=gas-ledger-20260706"></script>
   </body>
 </html>

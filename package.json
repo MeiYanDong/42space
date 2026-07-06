@@ -17,6 +17,19 @@
     "event:status": "node src/event-sniper.js status",
     "event:rehearse": "node src/event-sniper.js rehearse",
     "event:bench": "node src/event-sniper.js bench",
+    "event:premium-probe": "node src/event-sniper.js premium-probe",
+    "event:premium-watch": "node src/event-premium-watch.js",
+    "event:premium-chart": "node scripts/premium-watch-chart.js",
+    "event:intel": "node src/event-intel.js",
+    "event:intel-test": "node src/event-intel.js --self-test",
+    "event:follow-report": "node scripts/follow-rule-report.js",
+    "gas:backfill": "node scripts/gas-ledger-backfill.js",
+    "bot4:readiness": "node scripts/bot4-readiness-check.js",
+    "bot1:block-calibrate": "node scripts/bot1-block-aware-calibrate.js --profile-env /etc/42space/profiles/42space.env",
+    "bot1:buy-rank": "node scripts/bot3-buy-rank-evidence.js --profile-env /etc/42space/profiles/42space.env --out-dir output/bot1-buy-rank",
+    "bot3:buy-rank": "node scripts/bot3-buy-rank-evidence.js",
+    "bot3:fifa-preview": "node src/event-sniper.js bot3-fifa-preview",
+    "bot3:orderflow-sell": "node scripts/orderflow-trigger-sell.js --profile-env /etc/42space/profiles/42space-3.env",
     "event:rpc": "node src/event-sniper.js rpc",
     "event:presign-test": "node src/event-sniper.js presign-test",
     "event:due-test": "node src/event-sniper.js due-test",
@@ -33,8 +46,8 @@
     "event:doctor": "node src/event-sniper.js doctor",
     "dashboard": "node src/dashboard-server.js",
     "volume:heatmap": "node src/binance-volume-heatmap.js",
-    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/market-follow.js && node --check src/binance.js && node --check src/binance-volume-heatmap.js && node --check src/config.js && node --check public/assets/dashboard.js",
-    "verify": "npm run check && npm run event:self-test"
+    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/event-premium-watch.js && node --check src/event-intel.js && node --check src/bot3-fifa-exact-score.js && node --check src/event-library.js && node --check src/gas-ledger.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/market-follow.js && node --check src/binance.js && node --check src/binance-volume-heatmap.js && node --check src/config.js && node --check public/assets/dashboard.js && node --check scripts/premium-watch-chart.js && node --check scripts/follow-rule-report.js && node --check scripts/gas-ledger-backfill.js && node --check scripts/bot4-first-buy-evidence.js && node --check scripts/bot4-readiness-check.js && node --check scripts/bot1-block-aware-calibrate.js && node --check scripts/bot3-buy-rank-evidence.js && node --check scripts/orderflow-trigger-sell.js",
+    "verify": "npm run check && npm run event:self-test && npm run event:intel-test"
   },
   "dependencies": {
     "viem": "^2.41.2"

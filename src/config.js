@@ -2,6 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
+import {
+  DEFAULT_EVENT_DISPLAY_FILTER_RULE_IDS,
+  normalizeEventDisplayFilterRules
+} from "./event-display-rules.js";
+
+const MAX_AUTO_SELL_OPEN_EXIT_DELAY_SECONDS = 86400;
+
 export function loadDotEnv(file = ".env") {
   if (!fs.existsSync(file)) return;
 
@@ -24,6 +31,10 @@ export function loadDotEnv(file = ".env") {
   }
 }
 
+function normalizeProfileRole(value) {
+  return String(value ?? "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+}
+
 export function readConfig() {
   loadDotEnv(".env.local");
   loadDotEnv();
@@ -33,6 +44,7 @@ export function readConfig() {
 
   const cfg = {
     botName: envString("BOT_NAME", "42space"),
+    profileRole: normalizeProfileRole(envString("EVENT_PROFILE_ROLE", envString("BOT_PROFILE_ROLE", ""))),
     runtimeConfigFile,
     runtimeConfig,
     restUrl: envString("FORTYTWO_REST_URL", "https://rest.ft.42.space"),
@@ -53,6 +65,11 @@ export function readConfig() {
     targetTopic: envOptionalString("TARGET_TOPIC", "BTC"),
     targetQuestionRegex: envRegex("TARGET_QUESTION_REGEX", "BTC.*(Futures Daily Volume|Price|USDT)"),
     targetOutcomeRegex: envRegex("TARGET_OUTCOME_REGEX", ""),
+    marketQuestionAllowlistRegex: envRegex("MARKET_QUESTION_ALLOWLIST_REGEX", ""),
+    marketBuyQuestionAllowlistRegex: envRegex(
+      "MARKET_BUY_QUESTION_ALLOWLIST_REGEX",
+      envString("EVENT_BUY_QUESTION_ALLOWLIST_REGEX", "")
+    ),
     strategy: envString("STRATEGY", "binance_volume_projection"),
     stakeUsdt: envNumber("STAKE_USDT", 5),
     stakePerOutcomeUsdt: envNumber("STAKE_PER_OUTCOME_USDT", 5),
@@ -61,14 +78,35 @@ export function readConfig() {
     maxBatchStakeUsdt: envNumber("MAX_BATCH_STAKE_USDT", 100),
     maxOutcomesPerMarket: envInteger("MAX_OUTCOMES_PER_MARKET", 12),
     eventOutcomeSelection: envString("EVENT_OUTCOME_SELECTION", "lowest_odds"),
+    eventOutcomeNames: envString("EVENT_OUTCOME_NAMES", ""),
     eventOutcomeCount: envInteger("EVENT_OUTCOME_COUNT", 5),
     eventOutcomeSelectionFallback: envString("EVENT_OUTCOME_SELECTION_FALLBACK", "token_order"),
     eventBuyMode: envString("EVENT_BUY_MODE", "fast"),
     eventDiscovery: envString("EVENT_DISCOVERY", "ws"),
+    eventDiscoveryFeedFile: envString("EVENT_DISCOVERY_FEED_FILE", ""),
+    eventDiscoveryFeedPollMs: envInteger("EVENT_DISCOVERY_FEED_POLL_MS", 1000),
+    eventDiscoveryFeedTailBytes: envInteger("EVENT_DISCOVERY_FEED_TAIL_BYTES", 2 * 1024 * 1024),
     restDiscoveryEnabled: envBool("REST_DISCOVERY_ENABLED", true),
     restDiscoveryPollMs: envInteger("REST_DISCOVERY_POLL_MS", 1000),
     watchFundingMode: envString("WATCH_FUNDING_MODE", "next_batch"),
     bundleDueMarkets: envBool("BUNDLE_DUE_MARKETS", true),
+    eventMaxDueMarketsPerOpen: envInteger("EVENT_MAX_DUE_MARKETS_PER_OPEN", 0),
+    eventPriceGateEnabled: envBool("EVENT_PRICE_GATE_ENABLED", false),
+    eventPriceGateMaxEffectivePrice: envNumber("EVENT_PRICE_GATE_MAX_EFFECTIVE_PRICE", 0.0012),
+    eventPriceGateRequire: envString("EVENT_PRICE_GATE_REQUIRE", "any"),
+    eventPriceGateTimeoutMs: envInteger("EVENT_PRICE_GATE_TIMEOUT_MS", 1000),
+    bot3FifaExactScoreAutoBuyEnabled: envBool("BOT3_FIFA_EXACT_SCORE_AUTO_BUY_ENABLED", false),
+    bot3FifaExactScoreAutoStakeUsdt: envNumber("BOT3_FIFA_EXACT_SCORE_AUTO_STAKE_USDT", 1),
+    eventIntelBuyFilter: envString("EVENT_INTEL_BUY_FILTER", "off").toLowerCase(),
+    eventIntelBuyFile: envString("EVENT_INTEL_BUY_FILE", envString("EVENT_INTEL_FILE", "output/event-intel.jsonl")),
+    eventDisplayFilterRules: normalizeEventDisplayFilterRules(
+      envOptionalString("EVENT_DISPLAY_FILTER_RULES", undefined),
+      { fallback: DEFAULT_EVENT_DISPLAY_FILTER_RULE_IDS }
+    ),
+    eventDisplayIncludeRules: normalizeEventDisplayFilterRules(
+      envOptionalString("EVENT_DISPLAY_INCLUDE_RULES", undefined),
+      { fallback: [] }
+    ),
     fastSkipPreflight: envBool("FAST_SKIP_PREFLIGHT", true),
     fastSkipDueRestHydration: envBool("FAST_SKIP_DUE_REST_HYDRATION", true),
     fastNonceManager: envBool("FAST_NONCE_MANAGER", true),
@@ -114,9 +152,16 @@ export function readConfig() {
     preopenHotMs: envInteger("PREOPEN_HOT_MS", 60000),
     prebroadcastMs: envInteger("PREBROADCAST_MS", 750),
     allowPreopenBroadcast: envBool("ALLOW_PREOPEN_BROADCAST", false),
+    openBroadcastMode: envString("OPEN_BROADCAST_MODE", "fixed").trim().toLowerCase(),
     openBroadcastDelayMs: envInteger("OPEN_BROADCAST_DELAY_MS", 0),
     openBroadcastScheduleAheadMs: envInteger("OPEN_BROADCAST_SCHEDULE_AHEAD_MS", 60000),
     openBroadcastSpinMs: envInteger("OPEN_BROADCAST_SPIN_MS", 15),
+    openBroadcastBlockTargetOffsetMs: envInteger("OPEN_BROADCAST_BLOCK_TARGET_OFFSET_MS", 20000),
+    openBroadcastBlockAwareLeadMs: envInteger("OPEN_BROADCAST_BLOCK_AWARE_LEAD_MS", 95),
+    openBroadcastBlockAwareMaxWaitMs: envInteger("OPEN_BROADCAST_BLOCK_AWARE_MAX_WAIT_MS", 250),
+    openBroadcastBlockAwarePreTargetCount: envInteger("OPEN_BROADCAST_BLOCK_AWARE_PRE_TARGET_COUNT", 2),
+    openBroadcastBlockAwarePreTargetSendMs: envInteger("OPEN_BROADCAST_BLOCK_AWARE_PRE_TARGET_SEND_MS", 120),
+    openBroadcastBlockAwareHeadMaxAgeMs: envInteger("OPEN_BROADCAST_BLOCK_AWARE_HEAD_MAX_AGE_MS", 2000),
     wsReceiptFallbackMs: envInteger("WS_RECEIPT_FALLBACK_MS", 0),
     wsReceiptFallbackRetries: envInteger("WS_RECEIPT_FALLBACK_RETRIES", 3),
     watchStartupRetryMs: envInteger("WATCH_STARTUP_RETRY_MS", 5000),
@@ -124,6 +169,7 @@ export function readConfig() {
     armFundingRetryMs: envInteger("ARM_FUNDING_RETRY_MS", 60000),
     armFundingHotRetryMs: envInteger("ARM_FUNDING_HOT_RETRY_MS", 1000),
     armFundingHotWindowMs: envInteger("ARM_FUNDING_HOT_WINDOW_MS", 600000),
+    armFundingNotifyWindowMs: envInteger("ARM_FUNDING_NOTIFY_WINDOW_MS", 30 * 60 * 1000),
     armCatchUpAfterFunding: envBool("ARM_CATCH_UP_AFTER_FUNDING", true),
     armCatchUpWindowMs: envInteger("ARM_CATCH_UP_WINDOW_MS", 45000),
     autoApproveRouterOnStart: envBool("AUTO_APPROVE_ROUTER_ON_START", true),
@@ -131,12 +177,24 @@ export function readConfig() {
     feishuWebhook: envString("FEISHU_WEBHOOK", ""),
     feishuAlertCooldownMs: envInteger("FEISHU_ALERT_COOLDOWN_MS", 60000),
     alertStateFile: envString("ALERT_STATE_FILE", path.join(path.dirname(runtimeConfigFile), "alert-state.json")),
+    eventPlannedBuysFile: envString("EVENT_PLANNED_BUYS_FILE", path.join(path.dirname(runtimeConfigFile), "planned-buys.json")),
     autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
     autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 5000),
     autoSellStrategy: envString("AUTO_SELL_STRATEGY", "ladder"),
     autoSellStartDelaySeconds: envInteger("AUTO_SELL_START_DELAY_SECONDS", 10),
     autoSellIntervalSeconds: envInteger("AUTO_SELL_INTERVAL_SECONDS", 10),
     autoSellChunkPercent: envNumber("AUTO_SELL_CHUNK_PERCENT", 10),
+    autoSellLadderProfitPercent: envNumber("AUTO_SELL_LADDER_PROFIT_PERCENT", 0),
+    autoSellOpenExitDelaySeconds: envInteger("AUTO_SELL_OPEN_EXIT_DELAY_SECONDS", 36),
+    autoSellOpenExitPercent: envNumber("AUTO_SELL_OPEN_EXIT_PERCENT", 100),
+    autoSellFastOpenExitEnabled: envBool("AUTO_SELL_FAST_OPEN_EXIT_ENABLED", false),
+    autoSellFastOpenExitMinDelayMs: envInteger("AUTO_SELL_FAST_OPEN_EXIT_MIN_DELAY_MS", 24500),
+    autoSellFastOpenExitMaxDelayMs: envInteger("AUTO_SELL_FAST_OPEN_EXIT_MAX_DELAY_MS", 26000),
+    autoSellFastOpenExitMonitorPauseMs: envInteger("AUTO_SELL_FAST_OPEN_EXIT_MONITOR_PAUSE_MS", 45000),
+    autoSellTakeProfitSteps: envInteger("AUTO_SELL_TAKE_PROFIT_STEPS", 0),
+    autoSellBeforeMarketStartSeconds: envInteger("AUTO_SELL_BEFORE_MARKET_START_SECONDS", 0),
+    autoSellMarketStartEndOffsetSeconds: envInteger("AUTO_SELL_MARKET_START_END_OFFSET_SECONDS", 0),
+    autoSellGasPriceGwei: envString("AUTO_SELL_GAS_PRICE_GWEI", ""),
     autoSellApplyAfterIso: envString("AUTO_SELL_APPLY_AFTER_ISO", ""),
     autoSellProfitMultiplier: envNumber("AUTO_SELL_PROFIT_MULTIPLIER", 2),
     autoSellPercent: envNumber("AUTO_SELL_PERCENT", 50),
@@ -172,6 +230,7 @@ export function readConfig() {
     allowLateBuy: envBool("ALLOW_LATE_BUY", false),
     stateFile: envString("STATE_FILE", "data/seen-markets.json"),
     fillsFile: envString("FILLS_FILE", "data/fills.jsonl"),
+    gasLedgerFile: envString("GAS_LEDGER_FILE", path.join(path.dirname(runtimeConfigFile), "gas-ledger.jsonl")),
     decisionFile: envString("MARKET_DECISIONS_FILE", "data/market-decisions.jsonl"),
     marketFollowFile: envString("MARKET_FOLLOW_FILE", path.join(path.dirname(runtimeConfigFile), "market-follow.json"))
   };
@@ -194,8 +253,8 @@ export function readConfig() {
   if (cfg.slippageBps < 0 || cfg.slippageBps > 5000) {
     throw new Error("SLIPPAGE_BPS must be between 0 and 5000");
   }
-  if (!["all", "lowest_odds"].includes(cfg.eventOutcomeSelection)) {
-    throw new Error("EVENT_OUTCOME_SELECTION must be all or lowest_odds");
+  if (!["all", "lowest_odds", "middle", "names"].includes(cfg.eventOutcomeSelection)) {
+    throw new Error("EVENT_OUTCOME_SELECTION must be all, lowest_odds, middle, or names");
   }
   if (!["token_order", "error"].includes(cfg.eventOutcomeSelectionFallback)) {
     throw new Error("EVENT_OUTCOME_SELECTION_FALLBACK must be token_order or error");
@@ -203,14 +262,50 @@ export function readConfig() {
   if (!["fast", "quoted"].includes(cfg.eventBuyMode)) {
     throw new Error("EVENT_BUY_MODE must be fast or quoted");
   }
-  if (!["ws", "chain", "rest"].includes(cfg.eventDiscovery)) {
-    throw new Error("EVENT_DISCOVERY must be ws, chain, or rest");
+  if (!["ws", "chain", "rest", "feed"].includes(cfg.eventDiscovery)) {
+    throw new Error("EVENT_DISCOVERY must be ws, chain, rest, or feed");
+  }
+  if (cfg.profileRole && !["bot2_like"].includes(cfg.profileRole)) {
+    throw new Error("EVENT_PROFILE_ROLE must be empty or bot2_like");
+  }
+  if (cfg.eventDiscovery === "feed" && !cfg.eventDiscoveryFeedFile) {
+    throw new Error("EVENT_DISCOVERY=feed requires EVENT_DISCOVERY_FEED_FILE");
+  }
+  if (cfg.eventDiscoveryFeedPollMs <= 0) {
+    throw new Error("EVENT_DISCOVERY_FEED_POLL_MS must be positive");
+  }
+  if (cfg.eventDiscoveryFeedTailBytes < 0) {
+    throw new Error("EVENT_DISCOVERY_FEED_TAIL_BYTES must be 0 or a positive integer");
   }
   if (cfg.restDiscoveryPollMs <= 0) {
     throw new Error("REST_DISCOVERY_POLL_MS must be positive");
   }
   if (!["next_batch", "upper_bound"].includes(cfg.watchFundingMode)) {
     throw new Error("WATCH_FUNDING_MODE must be next_batch or upper_bound");
+  }
+  if (cfg.eventMaxDueMarketsPerOpen < 0) {
+    throw new Error("EVENT_MAX_DUE_MARKETS_PER_OPEN must be 0 or a positive integer");
+  }
+  if (cfg.eventPriceGateEnabled && cfg.bundleDueMarkets) {
+    throw new Error("EVENT_PRICE_GATE_ENABLED requires BUNDLE_DUE_MARKETS=0");
+  }
+  if (cfg.eventPriceGateEnabled && cfg.eventPriceGateMaxEffectivePrice <= 0) {
+    throw new Error("EVENT_PRICE_GATE_MAX_EFFECTIVE_PRICE must be positive when EVENT_PRICE_GATE_ENABLED=1");
+  }
+  if (!["any", "all"].includes(cfg.eventPriceGateRequire)) {
+    throw new Error("EVENT_PRICE_GATE_REQUIRE must be any or all");
+  }
+  if (cfg.eventPriceGateTimeoutMs <= 0) {
+    throw new Error("EVENT_PRICE_GATE_TIMEOUT_MS must be positive");
+  }
+  if (cfg.bot3FifaExactScoreAutoStakeUsdt <= 0) {
+    throw new Error("BOT3_FIFA_EXACT_SCORE_AUTO_STAKE_USDT must be positive");
+  }
+  if (cfg.bot3FifaExactScoreAutoStakeUsdt > cfg.maxStakeUsdt) {
+    throw new Error("BOT3_FIFA_EXACT_SCORE_AUTO_STAKE_USDT exceeds MAX_STAKE_USDT");
+  }
+  if (!["off", "strong"].includes(cfg.eventIntelBuyFilter)) {
+    throw new Error("EVENT_INTEL_BUY_FILTER must be off or strong");
   }
   if (cfg.fastGasLimit < 0) {
     throw new Error("FAST_GAS_LIMIT must be 0 or a positive integer");
@@ -245,8 +340,8 @@ export function readConfig() {
   if (cfg.autoSellPollMs <= 0) {
     throw new Error("AUTO_SELL_POLL_MS must be positive");
   }
-  if (!["ladder", "legacy"].includes(cfg.autoSellStrategy)) {
-    throw new Error("AUTO_SELL_STRATEGY must be ladder or legacy");
+  if (!["ladder", "open_timed_exit", "pre_start_exit", "legacy"].includes(cfg.autoSellStrategy)) {
+    throw new Error("AUTO_SELL_STRATEGY must be ladder, open_timed_exit, pre_start_exit, or legacy");
   }
   if (cfg.autoSellStartDelaySeconds < 0) {
     throw new Error("AUTO_SELL_START_DELAY_SECONDS must be 0 or a positive integer");
@@ -256,6 +351,39 @@ export function readConfig() {
   }
   if (cfg.autoSellChunkPercent <= 0 || cfg.autoSellChunkPercent > 100) {
     throw new Error("AUTO_SELL_CHUNK_PERCENT must be > 0 and <= 100");
+  }
+  if (cfg.autoSellLadderProfitPercent < 0) {
+    throw new Error("AUTO_SELL_LADDER_PROFIT_PERCENT must be 0 or a positive number");
+  }
+  if (cfg.autoSellOpenExitDelaySeconds < 0) {
+    throw new Error("AUTO_SELL_OPEN_EXIT_DELAY_SECONDS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellOpenExitPercent <= 0 || cfg.autoSellOpenExitPercent > 100) {
+    throw new Error("AUTO_SELL_OPEN_EXIT_PERCENT must be > 0 and <= 100");
+  }
+  if (cfg.autoSellFastOpenExitMinDelayMs < 0 || cfg.autoSellFastOpenExitMaxDelayMs < 0) {
+    throw new Error("AUTO_SELL_FAST_OPEN_EXIT delay range must be 0 or positive");
+  }
+  if (cfg.autoSellFastOpenExitMaxDelayMs < cfg.autoSellFastOpenExitMinDelayMs) {
+    throw new Error("AUTO_SELL_FAST_OPEN_EXIT_MAX_DELAY_MS must be >= AUTO_SELL_FAST_OPEN_EXIT_MIN_DELAY_MS");
+  }
+  if (cfg.autoSellFastOpenExitMonitorPauseMs < 0) {
+    throw new Error("AUTO_SELL_FAST_OPEN_EXIT_MONITOR_PAUSE_MS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellTakeProfitSteps < 0) {
+    throw new Error("AUTO_SELL_TAKE_PROFIT_STEPS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellBeforeMarketStartSeconds < 0) {
+    throw new Error("AUTO_SELL_BEFORE_MARKET_START_SECONDS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellMarketStartEndOffsetSeconds < 0) {
+    throw new Error("AUTO_SELL_MARKET_START_END_OFFSET_SECONDS must be 0 or a positive integer");
+  }
+  if (cfg.autoSellGasPriceGwei) {
+    const gasPrice = Number(cfg.autoSellGasPriceGwei);
+    if (!Number.isFinite(gasPrice) || gasPrice < 0.01 || gasPrice > 50) {
+      throw new Error("AUTO_SELL_GAS_PRICE_GWEI must be between 0.01 and 50");
+    }
   }
   if (cfg.autoSellProfitMultiplier <= 1) {
     throw new Error("AUTO_SELL_PROFIT_MULTIPLIER must be greater than 1");
@@ -362,6 +490,9 @@ export function readConfig() {
   if (cfg.prebroadcastMs < 0) {
     throw new Error("PREBROADCAST_MS must be 0 or a positive integer");
   }
+  if (!["fixed", "block_aware_20s"].includes(cfg.openBroadcastMode)) {
+    throw new Error("OPEN_BROADCAST_MODE must be fixed or block_aware_20s");
+  }
   if (cfg.openBroadcastDelayMs < 0) {
     throw new Error("OPEN_BROADCAST_DELAY_MS must be 0 or a positive integer");
   }
@@ -370,6 +501,24 @@ export function readConfig() {
   }
   if (cfg.openBroadcastSpinMs < 0) {
     throw new Error("OPEN_BROADCAST_SPIN_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastBlockTargetOffsetMs < 0) {
+    throw new Error("OPEN_BROADCAST_BLOCK_TARGET_OFFSET_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastBlockAwareLeadMs < 0) {
+    throw new Error("OPEN_BROADCAST_BLOCK_AWARE_LEAD_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastBlockAwareMaxWaitMs < 0) {
+    throw new Error("OPEN_BROADCAST_BLOCK_AWARE_MAX_WAIT_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastBlockAwarePreTargetCount < 0) {
+    throw new Error("OPEN_BROADCAST_BLOCK_AWARE_PRE_TARGET_COUNT must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastBlockAwarePreTargetSendMs < 0) {
+    throw new Error("OPEN_BROADCAST_BLOCK_AWARE_PRE_TARGET_SEND_MS must be 0 or a positive integer");
+  }
+  if (cfg.openBroadcastBlockAwareHeadMaxAgeMs < 0) {
+    throw new Error("OPEN_BROADCAST_BLOCK_AWARE_HEAD_MAX_AGE_MS must be 0 or a positive integer");
   }
   if (cfg.wsReceiptFallbackMs < 0) {
     throw new Error("WS_RECEIPT_FALLBACK_MS must be 0 or a positive integer");
@@ -389,6 +538,9 @@ export function readConfig() {
   if (cfg.armFundingHotWindowMs < 0) {
     throw new Error("ARM_FUNDING_HOT_WINDOW_MS must be 0 or a positive integer");
   }
+  if (cfg.armFundingNotifyWindowMs < 0) {
+    throw new Error("ARM_FUNDING_NOTIFY_WINDOW_MS must be 0 or a positive integer");
+  }
   if (cfg.armCatchUpWindowMs < 0) {
     throw new Error("ARM_CATCH_UP_WINDOW_MS must be 0 or a positive integer");
   }
@@ -400,7 +552,9 @@ export function readConfig() {
   }
 
   ensureParentDir(cfg.stateFile);
+  if (cfg.eventDiscoveryFeedFile) ensureParentDir(cfg.eventDiscoveryFeedFile);
   ensureParentDir(cfg.fillsFile);
+  ensureParentDir(cfg.gasLedgerFile);
   ensureParentDir(cfg.decisionFile);
   ensureParentDir(cfg.marketFollowFile);
   ensureParentDir(cfg.alertStateFile);
@@ -460,9 +614,32 @@ export function normalizeRuntimeConfig(input = {}, { partial = false } = {}) {
   take("autoSellStartDelaySeconds", 10, integerInRange(0, 3600));
   take("autoSellIntervalSeconds", 10, integerInRange(1, 3600));
   take("autoSellChunkPercent", 10, numberInRange(0.1, 100));
+  take("autoSellStrategy", "ladder", (value, key) => {
+    const strategy = String(value ?? "").trim();
+    if (!["ladder", "open_timed_exit", "pre_start_exit", "legacy"].includes(strategy)) {
+      throw new Error(`${key} must be ladder, open_timed_exit, pre_start_exit, or legacy`);
+    }
+    return strategy;
+  });
+  take("autoSellOpenExitDelaySeconds", 36, integerInRange(0, MAX_AUTO_SELL_OPEN_EXIT_DELAY_SECONDS));
+  take("autoSellOpenExitPercent", 100, numberInRange(0.1, 100));
+  take("autoSellTakeProfitSteps", 0, integerInRange(0, 100));
+  take("autoSellBeforeMarketStartSeconds", 0, integerInRange(0, 86400));
+  take("autoSellMarketStartEndOffsetSeconds", 0, integerInRange(0, 86400));
+  take("autoSellGasPriceGwei", "", (value, key) => {
+    const text = String(value ?? "").trim();
+    if (!text) return "";
+    return decimalStringInRange(0.01, 50)(text, key);
+  });
   take("autoSellStopLossEnabled", true, booleanValue);
   take("autoSellStopLossPercent", 10, numberInRange(0.1, 100));
   take("autoSellStopLossSellPercent", 100, numberInRange(0.1, 100));
+  take("eventDisplayFilterRules", DEFAULT_EVENT_DISPLAY_FILTER_RULE_IDS, (value) =>
+    normalizeEventDisplayFilterRules(value, { fallback: DEFAULT_EVENT_DISPLAY_FILTER_RULE_IDS })
+  );
+  take("eventDisplayIncludeRules", [], (value) =>
+    normalizeEventDisplayFilterRules(value, { fallback: [] })
+  );
 
   const mode = result.filterMode ?? (partial ? raw.filterMode : "price_only_test");
   if (!partial || mode === "price_only_test") {
@@ -501,12 +678,22 @@ function applyRuntimeConfig(cfg, runtimeConfig = {}) {
   if (runtimeConfig.minEventDurationHours !== undefined) cfg.minEventDurationHours = runtimeConfig.minEventDurationHours;
   if (runtimeConfig.gasPriceGwei !== undefined) cfg.gasPriceGwei = runtimeConfig.gasPriceGwei;
   if (runtimeConfig.autoSellEnabled !== undefined) cfg.autoSellEnabled = runtimeConfig.autoSellEnabled;
+  if (runtimeConfig.autoSellStrategy !== undefined) cfg.autoSellStrategy = runtimeConfig.autoSellStrategy;
   if (runtimeConfig.autoSellStartDelaySeconds !== undefined) cfg.autoSellStartDelaySeconds = runtimeConfig.autoSellStartDelaySeconds;
   if (runtimeConfig.autoSellIntervalSeconds !== undefined) cfg.autoSellIntervalSeconds = runtimeConfig.autoSellIntervalSeconds;
   if (runtimeConfig.autoSellChunkPercent !== undefined) cfg.autoSellChunkPercent = runtimeConfig.autoSellChunkPercent;
+  if (runtimeConfig.autoSellLadderProfitPercent !== undefined) cfg.autoSellLadderProfitPercent = runtimeConfig.autoSellLadderProfitPercent;
+  if (runtimeConfig.autoSellOpenExitDelaySeconds !== undefined) cfg.autoSellOpenExitDelaySeconds = runtimeConfig.autoSellOpenExitDelaySeconds;
+  if (runtimeConfig.autoSellOpenExitPercent !== undefined) cfg.autoSellOpenExitPercent = runtimeConfig.autoSellOpenExitPercent;
+  if (runtimeConfig.autoSellTakeProfitSteps !== undefined) cfg.autoSellTakeProfitSteps = runtimeConfig.autoSellTakeProfitSteps;
+  if (runtimeConfig.autoSellBeforeMarketStartSeconds !== undefined) cfg.autoSellBeforeMarketStartSeconds = runtimeConfig.autoSellBeforeMarketStartSeconds;
+  if (runtimeConfig.autoSellMarketStartEndOffsetSeconds !== undefined) cfg.autoSellMarketStartEndOffsetSeconds = runtimeConfig.autoSellMarketStartEndOffsetSeconds;
+  if (runtimeConfig.autoSellGasPriceGwei !== undefined) cfg.autoSellGasPriceGwei = runtimeConfig.autoSellGasPriceGwei;
   if (runtimeConfig.autoSellStopLossEnabled !== undefined) cfg.autoSellStopLossEnabled = runtimeConfig.autoSellStopLossEnabled;
   if (runtimeConfig.autoSellStopLossPercent !== undefined) cfg.autoSellStopLossPercent = runtimeConfig.autoSellStopLossPercent;
   if (runtimeConfig.autoSellStopLossSellPercent !== undefined) cfg.autoSellStopLossSellPercent = runtimeConfig.autoSellStopLossSellPercent;
+  if (runtimeConfig.eventDisplayFilterRules !== undefined) cfg.eventDisplayFilterRules = runtimeConfig.eventDisplayFilterRules;
+  if (runtimeConfig.eventDisplayIncludeRules !== undefined) cfg.eventDisplayIncludeRules = runtimeConfig.eventDisplayIncludeRules;
   if (runtimeConfig.marketCategoryBlocklist !== undefined) cfg.marketCategoryBlocklist = runtimeConfig.marketCategoryBlocklist;
   if (runtimeConfig.marketTagBlocklist !== undefined) cfg.marketTagBlocklist = runtimeConfig.marketTagBlocklist;
   if (runtimeConfig.filterMode === "price_only_test") {
@@ -565,8 +752,15 @@ function ensureListIncludes(value, required) {
 }
 
 function loadProviderEnv() {
-  const file = path.join(process.env.HOME ?? "", ".codex/secrets/evm-rpc-providers.env");
-  loadDotEnv(file);
+  const home = process.env.HOME ?? "";
+  for (const file of [
+    path.join(home, ".codex/secrets/evm-rpc-providers.env"),
+    path.join(home, ".codex/secrets/twitterapi-io.env"),
+    path.join(home, ".Codex/secrets/twitterapi-io.env"),
+    "/etc/42space/secrets/twitterapi-io.env"
+  ]) {
+    loadDotEnv(file);
+  }
 }
 
 function readKeychainPrivateKey() {

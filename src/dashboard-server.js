@@ -7,8 +7,21 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { loadDotEnv, normalizeRuntimeConfig, readConfig, writeRuntimeConfig } from "./config.js";
+import {
+  eventDisplayFilterRuleLabels,
+  eventDisplayFilterRuleOptions,
+  normalizeEventDisplayFilterRules
+} from "./event-display-rules.js";
 import { fetchActivity, fetchMarket, fetchMarkets } from "./fortytwo.js";
-import { eventDurationMs, getBaseEventMarketDecision, getEventMarketDecision, isEventMarket, isPriceMarket } from "./event-strategy.js";
+import { isSportsExactScoreMarket } from "./event-intel.js";
+import {
+  eventDurationMs,
+  getBaseEventMarketDecision,
+  getEventMarketDecision,
+  getEventMarketDisplayDecision,
+  isEventMarket,
+  isPriceMarket
+} from "./event-strategy.js";
 import {
   blockMarket,
   blockMarkets,
@@ -17,6 +30,13 @@ import {
   marketFollowStatus,
   readMarketFollowState
 } from "./market-follow.js";
+import {
+  buildGasSummary,
+  gasForMarket,
+  gasForOutcome,
+  gasLedgerFileForConfig,
+  readGasLedger
+} from "./gas-ledger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -32,9 +52,13 @@ const launchLabel = process.env.BOT_LAUNCH_LABEL ?? "com.myandong.42space-event-
 const systemdService = process.env.BOT_SYSTEMD_SERVICE ?? "42space-event-arm.service";
 const fillsFile = path.resolve(rootDir, process.env.FILLS_FILE ?? "data/fills.jsonl");
 const actionsFile = path.resolve(rootDir, process.env.DASHBOARD_ACTIONS_FILE ?? "data/dashboard-actions.jsonl");
+const bot4ReadinessFile = process.env.BOT4_READINESS_FILE ?? "/opt/42space/output/bot4-readiness/latest.json";
+const bot4FirstBuyEvidenceFile = process.env.BOT4_FIRST_BUY_EVIDENCE_FILE ?? "/opt/42space/output/bot4-first-buy/latest.json";
+const dashboardActivitySince = process.env.DASHBOARD_ACTIVITY_SINCE ?? "";
 const overviewCacheMs = Number(process.env.DASHBOARD_OVERVIEW_CACHE_MS ?? 30000);
 const overviewStaleMs = Number(process.env.DASHBOARD_OVERVIEW_STALE_MS ?? 300000);
 const overviewRefreshMs = Number(process.env.DASHBOARD_OVERVIEW_REFRESH_MS ?? 60000);
+const overviewStartupRefresh = envBool("DASHBOARD_STARTUP_REFRESH", true);
 const overviewHotPauseBeforeMs = Number(process.env.DASHBOARD_OVERVIEW_HOT_PAUSE_BEFORE_MS ?? 120000);
 const overviewHotPauseAfterMs = Number(process.env.DASHBOARD_OVERVIEW_HOT_PAUSE_AFTER_MS ?? 30000);
 const dashboardEventTimeoutMs = Number(process.env.DASHBOARD_EVENT_TIMEOUT_MS ?? 20000);
@@ -55,7 +79,7 @@ const server = http.createServer(async (req, res) => {
       return serveStatic(res, url.pathname);
     }
     if (url.pathname === "/api/overview" && req.method === "GET") {
-      return sendJson(res, await getOverview());
+      return sendJson(res, await getOverview({ force: url.searchParams.get("refresh") === "1" }));
     }
     if (url.pathname === "/api/runtime-config" && req.method === "GET") {
       return sendJson(res, runtimeConfigPayload());
@@ -95,7 +119,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`42 dashboard listening on http://${host}:${port}`);
-  void refreshOverviewCache().catch(logOverviewRefreshError);
+  if (overviewStartupRefresh) {
+    void refreshOverviewCache().catch(logOverviewRefreshError);
+  }
   if (overviewRefreshMs > 0) {
     setInterval(() => {
       void refreshOverviewCache({ background: true }).catch(logOverviewRefreshError);
@@ -103,11 +129,11 @@ server.listen(port, host, () => {
   }
 });
 
-async function getOverview() {
+async function getOverview({ force = false } = {}) {
   const now = Date.now();
-  if (overviewCache && now - overviewCache.at < overviewCacheMs) return overviewCache.data;
-  if (overviewCache && overviewHotWindowInfo(overviewCache.data, now)) return overviewCache.data;
-  if (overviewCache && now - overviewCache.at < overviewStaleMs) {
+  if (!force && overviewCache && now - overviewCache.at < overviewCacheMs) return overviewCache.data;
+  if (!force && overviewCache && overviewHotWindowInfo(overviewCache.data, now)) return overviewCache.data;
+  if (!force && overviewCache && now - overviewCache.at < overviewStaleMs) {
     void refreshOverviewCache({ background: true }).catch(logOverviewRefreshError);
     return overviewCache.data;
   }
@@ -180,29 +206,90 @@ async function buildOverview() {
     fetchUserActivity(),
     fetchNewMarketsFeed()
   ]);
-  const holdings = normalizeHoldings(positions, walletActivity);
+  const gasSummary = buildGasSummary(readGasLedger(gasLedgerFileForConfig(cfg)));
+  const holdings = normalizeHoldings(positions, walletActivity, cfg, gasSummary);
   const recentRows = readRecentActivity();
   const newMarketFeed = normalizeNewMarkets(newMarkets, status, walletActivity, recentRows, strategyCfg, followState);
-  const analytics = buildAnalytics(positions, walletActivity);
+  const analytics = buildAnalytics(positions, walletActivity, gasSummary);
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
     bot: normalizeBot(bot, status),
-    wallet: normalizeWallet(status.wallet),
+    wallet: normalizeWallet(status.wallet, status),
     next: normalizeNext(status),
     manualSell: manualSellState(status, cfg),
     newMarkets: newMarketFeed,
     holdings,
-    projectBoard: buildProjectBoard(newMarketFeed, holdings, walletActivity, followState),
+    projectBoard: buildProjectBoard(newMarketFeed, holdings, walletActivity, followState, cfg, gasSummary),
     analytics,
     activity: normalizeActivity(recentRows, walletActivity),
+    evidence: evidenceSummary(),
     settings: {
       appName,
       runtimeConfig: runtimeConfigSummary(cfg, status.watchConfig),
+      ruleSummary: botRuleSummary(cfg),
       stakeText: `${status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5} 档 / ${status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5}U`,
-      windowText: `${status.watchConfig?.eventOpenWindowSeconds ?? 60}s`,
+      windowText: broadcastWindowText(status.watchConfig, cfg),
       autoSellText: autoSellText(status.watchConfig, cfg)
     }
+  };
+}
+
+function evidenceSummary() {
+  const readiness = safeReadJson(bot4ReadinessFile);
+  const firstBuy = safeReadJson(bot4FirstBuyEvidenceFile);
+  return {
+    readiness: readiness ? {
+      ok: readiness.ok === true,
+      phase: readiness.phase ?? null,
+      generatedAt: readiness.generatedAt ?? null,
+      failedCount: Array.isArray(readiness.failed) ? readiness.failed.length : null,
+      autoSellMonitorStarted: Boolean(readiness.summary?.autoSellMonitorStarted),
+      walletReady: Boolean(readiness.summary?.walletReady),
+      nextBatchStartDate: readiness.summary?.nextBatchStartDate ?? null
+    } : null,
+    firstBuy: firstBuy ? {
+      conclusion: firstBuy.conclusion ?? null,
+      generatedAt: firstBuy.generatedAt ?? null,
+      expectedBroadcastIso: firstBuy.target?.expectedBroadcastIso ?? null,
+      latestAllowedBroadcastStartIso: firstBuy.target?.latestAllowedBroadcastStartIso ?? null,
+      checks: pickEvidenceChecks(firstBuy.checks),
+      txCount: Array.isArray(firstBuy.txHashes) ? firstBuy.txHashes.length : 0,
+      broadcastTimings: Array.isArray(firstBuy.broadcastTimings)
+        ? firstBuy.broadcastTimings.map(summarizeBroadcastTiming).filter(Boolean).slice(-3)
+        : []
+    } : null
+  };
+}
+
+function pickEvidenceChecks(checks = {}) {
+  return {
+    botRunning: Boolean(checks.botRunning),
+    nextBatchKnown: Boolean(checks.nextBatchKnown),
+    scheduledOnTime: Boolean(checks.scheduledOnTime),
+    preSigned: Boolean(checks.preSigned),
+    broadcasted: Boolean(checks.broadcasted),
+    broadcastStartedBefore20s: Boolean(checks.broadcastStartedBefore20s),
+    firstAcceptedRpc: Boolean(checks.firstAcceptedRpc),
+    outcomeOk: Boolean(checks.outcomeOk),
+    receiptSuccess: Boolean(checks.receiptSuccess),
+    autoSellMonitorStarted: Boolean(checks.autoSellMonitorStarted),
+    stopLossConfigured: Boolean(checks.stopLossConfigured),
+    noUnintendedBuys: Boolean(checks.noUnintendedBuys)
+  };
+}
+
+function summarizeBroadcastTiming(item) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    status: item.status ?? null,
+    broadcastMode: item.broadcastMode ?? null,
+    broadcastStartedAt: item.broadcastStartedAt ?? null,
+    firstAcceptedAt: item.firstAcceptedAt ?? null,
+    broadcastStartDelayMs: item.broadcastStartDelayMs ?? null,
+    firstAcceptedDelayMs: item.firstAcceptedDelayMs ?? null,
+    firstAcceptedLatencyMs: item.firstAcceptedLatencyMs ?? null,
+    broadcastStartedBefore20s: Boolean(item.broadcastStartedBefore20s)
   };
 }
 
@@ -213,9 +300,10 @@ function runtimeConfigPayload() {
     config: runtimeConfigSummary(cfg, null),
     editable: {
       filterModes: [
-        { value: "price_only_test", label: "只过滤 Price" },
-        { value: "production", label: "生产过滤" }
+        { value: "price_only_test", label: "买入门槛：基础 Price/8hour 排除" },
+        { value: "production", label: "买入门槛：基础排除 + 时长门槛" }
       ],
+      displayFilterRules: eventDisplayFilterRuleOptions(),
       limits: {
         eventOutcomeCount: { min: 1, max: 12, step: 1 },
         stakePerOutcomeUsdt: { min: 0.1, max: 100, step: 0.1 },
@@ -242,12 +330,28 @@ function runtimeConfigSummary(cfg, watchConfig) {
     minEventDurationHours: Number(watchConfig?.minEventDurationHours ?? cfg.minEventDurationHours),
     gasPriceGwei: String(watchConfig?.gasPriceGwei ?? cfg.gasPriceGwei),
     autoSellEnabled: Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled),
+    autoSellStrategy: String(watchConfig?.autoSellStrategy ?? cfg.autoSellStrategy),
     autoSellStartDelaySeconds: Number(watchConfig?.autoSellStartDelaySeconds ?? cfg.autoSellStartDelaySeconds),
     autoSellIntervalSeconds: Number(watchConfig?.autoSellIntervalSeconds ?? cfg.autoSellIntervalSeconds),
     autoSellChunkPercent: Number(watchConfig?.autoSellChunkPercent ?? cfg.autoSellChunkPercent),
+    autoSellLadderProfitPercent: Number(watchConfig?.autoSellLadderProfitPercent ?? cfg.autoSellLadderProfitPercent ?? 0),
+    autoSellOpenExitDelaySeconds: Number(watchConfig?.autoSellOpenExitDelaySeconds ?? cfg.autoSellOpenExitDelaySeconds ?? 36),
+    autoSellOpenExitPercent: Number(watchConfig?.autoSellOpenExitPercent ?? cfg.autoSellOpenExitPercent ?? 100),
+    autoSellTakeProfitSteps: Number(watchConfig?.autoSellTakeProfitSteps ?? cfg.autoSellTakeProfitSteps ?? 0),
+    autoSellBeforeMarketStartSeconds: Number(watchConfig?.autoSellBeforeMarketStartSeconds ?? cfg.autoSellBeforeMarketStartSeconds ?? 0),
+    autoSellMarketStartEndOffsetSeconds: Number(watchConfig?.autoSellMarketStartEndOffsetSeconds ?? cfg.autoSellMarketStartEndOffsetSeconds ?? 0),
+    autoSellGasPriceGwei: String(watchConfig?.autoSellGasPriceGwei ?? cfg.autoSellGasPriceGwei ?? ""),
     autoSellStopLossEnabled: Boolean(watchConfig?.autoSellStopLossEnabled ?? cfg.autoSellStopLossEnabled),
     autoSellStopLossPercent: Number(watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent),
     autoSellStopLossSellPercent: Number(watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent),
+    eventDisplayFilterRules: normalizeEventDisplayFilterRules(
+      watchConfig?.eventDisplayFilterRules ?? cfg.eventDisplayFilterRules
+    ),
+    eventDisplayIncludeRules: normalizeEventDisplayFilterRules(
+      watchConfig?.eventDisplayIncludeRules ?? cfg.eventDisplayIncludeRules,
+      { fallback: [] }
+    ),
+    eventDisplayFilterRuleOptions: eventDisplayFilterRuleOptions(),
     marketCategoryBlocklist: cfg.marketCategoryBlocklist ?? [],
     marketTagBlocklist: cfg.marketTagBlocklist ?? [],
     runtimeConfigFile: cfg.runtimeConfigFile,
@@ -255,9 +359,60 @@ function runtimeConfigSummary(cfg, watchConfig) {
   };
 }
 
+function botRuleSummary(cfg) {
+  const normalizedBotName = String(cfg?.botName ?? appName).trim().toLowerCase();
+  const normalizedProfileRole = String(cfg?.profileRole ?? "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  const isBot2 = normalizedBotName === "42space-2"
+    || normalizedBotName === "bot2"
+    || normalizedBotName.startsWith("bot2");
+  const isBot5 = normalizedBotName === "42space-5"
+    || normalizedBotName === "bot5"
+    || normalizedBotName.startsWith("bot5")
+    || normalizedBotName.includes("bot5");
+  const isBot2Like = isBot2 || isBot5 || normalizedProfileRole === "bot2_like";
+  const isBot3 = normalizedBotName === "42space-3"
+    || normalizedBotName === "bot3"
+    || normalizedBotName.startsWith("bot3");
+  const isBot4 = normalizedBotName === "42space-4"
+    || normalizedBotName === "bot4"
+    || normalizedBotName.startsWith("bot4")
+    || normalizedBotName.includes("bot4");
+  const focusBuyEnabled = String(cfg?.eventIntelBuyFilter ?? "off").trim().toLowerCase() === "strong";
+  const buyQuestionAllowlistEnabled = Boolean(cfg?.marketBuyQuestionAllowlistRegex);
+  const enabledIncludeLabels = eventDisplayFilterRuleLabels(cfg?.eventDisplayIncludeRules ?? []);
+  const enabledFilterLabels = eventDisplayFilterRuleLabels(cfg?.eventDisplayFilterRules ?? []);
+  const filterRule = enabledIncludeLabels.length
+    ? `当前只显示：${enabledIncludeLabels.join("、")}`
+    : enabledFilterLabels.length
+      ? `当前过滤：${enabledFilterLabels.join("、")}`
+      : "当前未启用显示过滤：所有监控到且数据完整的 live/not_started 事件都会显示";
+  const displayRule = enabledIncludeLabels.length
+    ? "默认显示并通知：只展示命中显示白名单且数据完整的 live/not_started 事件"
+    : "默认显示并通知：除上述过滤外的所有 live/not_started 事件；Meme、Binance strong、准确比分、球员表现会重点标记";
+  const followRule = buyQuestionAllowlistEnabled
+    ? isBot4
+      ? "默认关注：仅命中 Bot4 买入题目白名单的日常模板符合买入；其他日常模板只展示/通知，不买入"
+      : "默认关注：买入题目白名单是硬边界；未命中的显示事件只展示/通知，不买入"
+    : focusBuyEnabled
+      ? "默认关注：仅 Meme 和 Binance strong；其他显示事件需手动关注或 planned buy 才买入"
+      : "默认关注：未启用 Meme/Binance strong 默认关注；显示事件需手动关注或 planned buy 才买入";
+  return {
+    profile: cfg?.botName ?? appName,
+    filterRule,
+    displayRule,
+    followRule,
+    notificationRule: isBot4
+      ? "Bot4 飞书通知：命中日常模板显示白名单的新事件；买入仍受 Bot4 买入题目白名单限制"
+      : isBot2Like || isBot3
+      ? `${isBot3 ? "Bot3" : isBot5 ? "Bot5" : "Bot2-like"} 飞书通知：所有未被基础过滤的新事件；过滤项不通知`
+      : "飞书通知按当前 profile 配置执行"
+  };
+}
+
 async function updateRuntimeConfig(req) {
   const body = await readJsonBody(req);
   requireAdminToken(req, body);
+  const cfg = readConfig();
   const isProduction = body.filterMode === "production";
   const input = {
     filterMode: body.filterMode,
@@ -265,20 +420,49 @@ async function updateRuntimeConfig(req) {
     stakePerOutcomeUsdt: body.stakePerOutcomeUsdt,
     maxBatchStakeUsdt: body.maxBatchStakeUsdt,
     gasPriceGwei: body.gasPriceGwei,
+    autoSellGasPriceGwei: body.autoSellGasPriceGwei !== undefined
+      ? body.autoSellGasPriceGwei
+      : cfg.autoSellGasPriceGwei,
     autoSellEnabled: body.autoSellEnabled,
+    autoSellStrategy: body.autoSellStrategy !== undefined
+      ? body.autoSellStrategy
+      : cfg.autoSellStrategy,
     autoSellStartDelaySeconds: body.autoSellStartDelaySeconds,
     autoSellIntervalSeconds: body.autoSellIntervalSeconds,
     autoSellChunkPercent: body.autoSellChunkPercent,
+    autoSellLadderProfitPercent: body.autoSellLadderProfitPercent !== undefined
+      ? body.autoSellLadderProfitPercent
+      : cfg.autoSellLadderProfitPercent,
+    autoSellOpenExitDelaySeconds: body.autoSellOpenExitDelaySeconds !== undefined
+      ? body.autoSellOpenExitDelaySeconds
+      : cfg.autoSellOpenExitDelaySeconds,
+    autoSellOpenExitPercent: body.autoSellOpenExitPercent !== undefined
+      ? body.autoSellOpenExitPercent
+      : cfg.autoSellOpenExitPercent,
+    autoSellTakeProfitSteps: body.autoSellTakeProfitSteps !== undefined
+      ? body.autoSellTakeProfitSteps
+      : cfg.autoSellTakeProfitSteps,
+    autoSellBeforeMarketStartSeconds: body.autoSellBeforeMarketStartSeconds !== undefined
+      ? body.autoSellBeforeMarketStartSeconds
+      : cfg.autoSellBeforeMarketStartSeconds,
+    autoSellMarketStartEndOffsetSeconds: body.autoSellMarketStartEndOffsetSeconds !== undefined
+      ? body.autoSellMarketStartEndOffsetSeconds
+      : cfg.autoSellMarketStartEndOffsetSeconds,
     autoSellStopLossEnabled: body.autoSellStopLossEnabled,
     autoSellStopLossPercent: body.autoSellStopLossPercent,
     autoSellStopLossSellPercent: body.autoSellStopLossSellPercent,
+    eventDisplayFilterRules: Array.isArray(body.eventDisplayFilterRules)
+      ? body.eventDisplayFilterRules
+      : cfg.eventDisplayFilterRules,
+    eventDisplayIncludeRules: Array.isArray(body.eventDisplayIncludeRules)
+      ? body.eventDisplayIncludeRules
+      : (cfg.eventDisplayIncludeRules ?? []),
     minEventDurationHours: isProduction ? (body.minEventDurationHours ?? 48) : 0,
     marketCategoryBlocklist: ["Price"],
     marketTagBlocklist: isProduction ? ["8 hour", "automated"] : ["Price"]
   };
   input.maxMarketStakeUsdt = roundMoney(Number(input.eventOutcomeCount) * Number(input.stakePerOutcomeUsdt));
   const config = normalizeRuntimeConfig(input, { partial: false });
-  const cfg = readConfig();
   writeRuntimeConfig(cfg.runtimeConfigFile, config);
   const restarted = await restartWorker();
   overviewCache = null;
@@ -415,17 +599,55 @@ function autoSellText(watchConfig, cfg) {
   const enabled = Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled);
   if (!enabled) return "关闭";
   const strategy = watchConfig?.autoSellStrategy ?? cfg.autoSellStrategy;
+  if (strategy === "open_timed_exit") {
+    const delay = watchConfig?.autoSellOpenExitDelaySeconds ?? cfg.autoSellOpenExitDelaySeconds ?? 36;
+    const percent = watchConfig?.autoSellOpenExitPercent ?? cfg.autoSellOpenExitPercent ?? 100;
+    return `开盘 T+${delay}s 卖 ${percent}% / ${autoSellStopLossText(watchConfig, cfg)}`;
+  }
+  if (strategy === "pre_start_exit") {
+    const beforeStart = Number(watchConfig?.autoSellBeforeMarketStartSeconds ?? cfg.autoSellBeforeMarketStartSeconds ?? 0);
+    const preStart = beforeStart > 0 ? `赛前 ${Math.round(beforeStart / 60)}min 清仓` : "赛前清仓未配置";
+    return `持有不分批卖 / ${preStart} / ${autoSellStopLossText(watchConfig, cfg)}`;
+  }
   if (strategy === "ladder") {
     const delay = watchConfig?.autoSellStartDelaySeconds ?? cfg.autoSellStartDelaySeconds;
     const interval = watchConfig?.autoSellIntervalSeconds ?? cfg.autoSellIntervalSeconds;
     const chunk = watchConfig?.autoSellChunkPercent ?? cfg.autoSellChunkPercent;
-    const stop = watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent;
-    return `${delay}s 后每 ${interval}s 卖 ${chunk}% / 亏 ${stop}% 全卖`;
+    const profit = Number(watchConfig?.autoSellLadderProfitPercent ?? cfg.autoSellLadderProfitPercent ?? 0);
+    const takeProfitSteps = Number(watchConfig?.autoSellTakeProfitSteps ?? cfg.autoSellTakeProfitSteps ?? 0);
+    const beforeStart = Number(watchConfig?.autoSellBeforeMarketStartSeconds ?? cfg.autoSellBeforeMarketStartSeconds ?? 0);
+    const gate = profit > 0 ? `盈 ${profit}% 后` : `${delay}s 后`;
+    const takeProfit = takeProfitSteps > 0
+      ? `${gate}卖 ${chunk}% ${takeProfitSteps} 次`
+      : `${gate}每 ${interval}s 卖 ${chunk}%`;
+    const preStart = beforeStart > 0 ? ` / 赛前 ${Math.round(beforeStart / 60)}min 清剩余` : "";
+    return `${takeProfit}${preStart} / ${autoSellStopLossText(watchConfig, cfg)}`;
   }
   const takeProfit = `${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x 卖 ${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`;
-  const stopLossEnabled = Boolean(watchConfig?.autoSellStopLossEnabled ?? cfg.autoSellStopLossEnabled);
-  if (!stopLossEnabled) return takeProfit;
-  return `${takeProfit} / 亏 ${watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent}% 卖 ${watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent}%`;
+  return `${takeProfit} / ${autoSellStopLossText(watchConfig, cfg)}`;
+}
+
+function autoSellStopLossText(watchConfig, cfg) {
+  const enabled = Boolean(watchConfig?.autoSellStopLossEnabled ?? cfg.autoSellStopLossEnabled);
+  if (!enabled) return "止损关闭";
+  const percent = watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent;
+  const sellPercent = Number(watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent ?? 100);
+  return sellPercent >= 100 ? `亏 ${percent}% 全卖` : `亏 ${percent}% 卖 ${sellPercent}%`;
+}
+
+function broadcastWindowText(watchConfig, cfg) {
+  const openBroadcastDelayMs = Number(watchConfig?.openBroadcastDelayMs ?? cfg.openBroadcastDelayMs ?? 0);
+  const openWindowSeconds = Number(watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 60);
+  const broadcastText = openBroadcastDelayMs > 0
+    ? `广播 T+${formatSeconds(openBroadcastDelayMs / 1000)}s`
+    : "开盘立即广播";
+  return `${broadcastText} / 超窗 ${formatSeconds(openWindowSeconds)}s`;
+}
+
+function formatSeconds(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value ?? "");
+  return Number.isInteger(number) ? String(number) : number.toFixed(3).replace(/0+$/u, "").replace(/\.$/u, "");
 }
 
 async function sellQuote(body) {
@@ -560,40 +782,46 @@ function sellArgs(body) {
 }
 
 function normalizeBot(bot, status) {
-  const wallet = normalizeWallet(status.wallet);
+  const wallet = normalizeWallet(status.wallet, status);
   const waitingFunds = wallet && wallet.state === "blocked";
   const partialFunding = wallet?.state === "partial";
+  const idle = wallet?.state === "idle";
   return {
     running: bot.running,
-    label: bot.running ? (waitingFunds ? "等待资金" : (partialFunding ? "部分可买" : "运行中")) : "未运行",
+    label: bot.running ? (waitingFunds ? "等待资金" : (partialFunding ? "部分可买" : (idle ? "等待新盘" : "运行中"))) : "未运行",
     tone: bot.running && !waitingFunds ? "good" : "warn",
-    message: waitingFunds || partialFunding ? wallet.message : bot.message
+    message: waitingFunds || partialFunding || idle ? wallet.message : bot.message
   };
 }
 
-function normalizeWallet(wallet) {
+function normalizeWallet(wallet, status = null) {
   if (!wallet) return null;
   const executableMarketCount = Number(wallet.executableMarketCount ?? 0);
   const hasExecutableFunds = Boolean((wallet.balanceReady || executableMarketCount > 0) && wallet.bnbReady);
+  const nextBatchMarketCount = Number(status?.funding?.nextBatchMarketCount ?? wallet.nextBatchMarketCount ?? NaN);
+  const hasNextBatchInfo = Number.isFinite(nextBatchMarketCount);
+  const hasNoNextBatch = hasNextBatchInfo && nextBatchMarketCount === 0;
+  const upperBoundReady = Boolean(wallet.balanceReadyForUpperBound && wallet.allowanceReadyForUpperBound && wallet.bnbReady);
   const partial = Boolean(wallet.partialFunding);
-  const state = hasExecutableFunds ? (partial ? "partial" : "all") : "blocked";
-  const label = state === "all" ? "全部可买" : (state === "partial" ? "部分可买" : "不可买");
+  const state = hasExecutableFunds ? (partial ? "partial" : "all") : (hasNoNextBatch && upperBoundReady ? "idle" : "blocked");
+  const label = state === "all" ? "全部可买" : (state === "partial" ? "部分可买" : (state === "idle" ? "等待新盘" : "不可买"));
   return {
     busdt: money(wallet.busdtBalance),
     bnb: Number(wallet.bnbBalance ?? 0).toFixed(6),
-    ready: hasExecutableFunds,
+    ready: state !== "blocked",
     partial,
     state,
     label,
     tone: state === "blocked" ? "warn" : "good",
     executableMarketCount,
     unfundedMarketCount: Number(wallet.unfundedMarketCount ?? 0),
-    message: fundingMessage(wallet)
+    message: fundingMessage(wallet, { state })
   };
 }
 
-function fundingMessage(wallet) {
+function fundingMessage(wallet, context = {}) {
   if (!wallet) return "";
+  if (context.state === "idle") return "当前没有待买事件";
   if ((wallet.balanceReady || wallet.executableMarketCount > 0) && wallet.bnbReady) {
     if (wallet.partialFunding) {
       const executable = Number(wallet.executableMarketCount ?? 0);
@@ -653,6 +881,7 @@ function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readC
   const bought = boughtMarketSummary(walletRows, localRows);
   const skipped = skippedMarketSet(localRows);
   const future = new Map((status.future ?? []).map((market) => [normAddress(market.address), market]));
+  const plannedBuys = readDashboardPlannedBuys(cfg);
   const rows = [];
   let excluded = 0;
   const plannedChoices = Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5);
@@ -660,18 +889,23 @@ function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readC
 
   for (const market of markets) {
     const baseDecision = getBaseEventMarketDecision(market, cfg);
-    const decision = getEventMarketDecision(market, cfg);
-    if (!decision.eligible && !["short-duration", "missing-time", "price-market", "follow-blocked"].includes(decision.reason)) continue;
+    const rawDecision = getEventMarketDecision(market, cfg);
+    const plannedBuy = findDashboardPlannedBuy(plannedBuys, market);
+    const decision = dashboardPlannedBuyDecision(rawDecision, plannedBuy);
+    const displayDecision = getEventMarketDisplayDecision(market, cfg, decision);
+    if (!displayDecision.visible) continue;
     const key = normAddress(market.address);
     const pending = future.get(key);
-    const follow = marketFollowStatus(followState, market, baseDecision, decision);
+    const follow = dashboardPlannedBuyFollow(marketFollowStatus(followState, market, baseDecision, decision), plannedBuy, decision);
     if (!decision.eligible) excluded += 1;
-    const state = marketState(market, { bought, skipped, pending, openWindowSeconds, decision });
+    const state = marketState(market, { bought, skipped, pending, openWindowSeconds, decision, displayDecision });
     const boughtInfo = bought.get(key);
+    const displayChoices = plannedBuy?.outcomes?.length ?? plannedChoices;
+    const displayStakePerOutcome = Number(plannedBuy?.stakePerOutcomeUsdt ?? plannedStakePerOutcome);
     const choices = state === "已买" && boughtInfo?.outcomeCount > 0
       ? boughtInfo.outcomeCount
-      : Math.min(plannedChoices, market.outcomes?.length ?? 0);
-    const plannedStake = plannedStakePerOutcome * Math.min(plannedChoices, market.outcomes?.length ?? 0);
+      : Math.min(displayChoices, market.outcomes?.length ?? 0);
+    const plannedStake = displayStakePerOutcome * Math.min(displayChoices, market.outcomes?.length ?? 0);
     const stake = state === "已买" && boughtInfo?.amount > 0 ? boughtInfo.amount : plannedStake;
     rows.push({
       title: market.question,
@@ -680,13 +914,16 @@ function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readC
       createdAt: market.createdAt,
       startsAt: market.startDate,
       endsAt: market.endDate,
+      matchStartsAt: dashboardMatchStartAt(market, plannedBuy, cfg),
       timeGroup: marketTimeGroup(market),
       duration: durationText(market),
       durationHours: durationHoursValue(market),
       categories: market.categories ?? [],
       rawTags: market.tags ?? [],
-      tags: marketTags(market, decision, pending, cfg),
+      tags: marketTags(market, decision, pending, cfg, displayDecision),
       filterReason: decision.eligible ? "" : decision.reasonText,
+      displayReason: displayDecision.reasonText,
+      notify: displayDecision.notify,
       choices,
       stake: money(stake),
       stakeValue: stake,
@@ -706,9 +943,126 @@ function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readC
   };
 }
 
-function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
+function dashboardPlannedBuyDecision(decision, plannedBuy) {
+  if (!plannedBuy) return decision;
+  if (["missing-market", "status", "no-outcomes", "price-market", "follow-blocked"].includes(decision?.reason)) {
+    return decision;
+  }
+  return {
+    ...decision,
+    eligible: true,
+    reason: "planned-buy",
+    reasonText: "计划买入",
+    tags: [...new Set([...(decision?.tags ?? []), "计划买入"])]
+  };
+}
+
+function dashboardPlannedBuyFollow(follow, plannedBuy, decision) {
+  if (!plannedBuy || !decision?.eligible || follow?.manuallyBlocked) return follow;
+  return {
+    ...follow,
+    allowed: true,
+    source: follow?.source === "none" ? "planned" : follow?.source,
+    label: follow?.label === "未关注" ? "计划买入" : follow?.label
+  };
+}
+
+function readDashboardPlannedBuys(cfg) {
+  const file = cfg?.eventPlannedBuysFile;
+  if (!file) return [];
+  try {
+    const json = JSON.parse(fs.readFileSync(file, "utf8"));
+    const rows = Array.isArray(json) ? json : (Array.isArray(json?.plans) ? json.plans : []);
+    return rows.map(normalizeDashboardPlannedBuy).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function normalizeDashboardPlannedBuy(row) {
+  if (!row || typeof row !== "object") return null;
+  const outcomes = Array.isArray(row.outcomes ?? row.outcomeNames ?? row.names)
+    ? (row.outcomes ?? row.outcomeNames ?? row.names).map((item) => String(item).trim()).filter(Boolean)
+    : String(row.outcomes ?? row.outcomeNames ?? row.names ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  if (outcomes.length === 0) return null;
+  const market = normAddress(row.market ?? row.address);
+  const question = normQuestion(row.question ?? row.title);
+  const questionRegex = normQuestionRegex(row.questionRegex ?? row.titleRegex);
+  if (!market && !question && !questionRegex) return null;
+  const stakePerOutcomeUsdt = Number(row.stakePerOutcomeUsdt ?? row.stake ?? row.stakeUsdt);
+  const kickoffAt = normalizeDashboardDate(row.kickoffAt ?? row.marketStartAt ?? row.matchStartAt);
+  return {
+    enabled: row.enabled !== false && row.disabled !== true,
+    market,
+    question,
+    questionRegex,
+    outcomes,
+    stakePerOutcomeUsdt: Number.isFinite(stakePerOutcomeUsdt) && stakePerOutcomeUsdt > 0 ? stakePerOutcomeUsdt : null,
+    kickoffAt
+  };
+}
+
+function findDashboardPlannedBuy(plans, market) {
+  const marketAddress = normAddress(market?.address);
+  const marketQuestion = normQuestion(market?.question);
+  const marketQuestionText = String(market?.question ?? "").trim().replace(/\s+/gu, " ");
+  return plans.find((plan) => {
+    if (!plan.enabled) return false;
+    if (plan.market && marketAddress && plan.market === marketAddress) return true;
+    if (plan.question && marketQuestion && plan.question === marketQuestion) return true;
+    if (plan.questionRegex && marketQuestionText && questionRegexMatches(plan.questionRegex, marketQuestionText)) return true;
+    return false;
+  }) ?? null;
+}
+
+function normQuestion(value) {
+  return String(value ?? "").trim().replace(/\s+/gu, " ").toLowerCase();
+}
+
+function normQuestionRegex(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  try {
+    new RegExp(text, "iu");
+    return text;
+  } catch {
+    return "";
+  }
+}
+
+function questionRegexMatches(pattern, question) {
+  try {
+    return new RegExp(pattern, "iu").test(question);
+  } catch {
+    return false;
+  }
+}
+
+function uniqueStrings(values = []) {
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+function normalizeDashboardDate(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+function dashboardMatchStartAt(market, plannedBuy = null, cfg = readConfig()) {
+  if (plannedBuy?.kickoffAt) return plannedBuy.kickoffAt;
+  if (!isSportsExactScoreMarket(market)) return null;
+  const endOffsetSeconds = Number(cfg.autoSellMarketStartEndOffsetSeconds ?? 0);
+  if (endOffsetSeconds <= 0) return null;
+  const endMs = Date.parse(market?.endDate ?? market?.endsAt ?? "");
+  if (!Number.isFinite(endMs)) return null;
+  return new Date(endMs - endOffsetSeconds * 1000).toISOString();
+}
+
+function buildProjectBoard(marketFeed, holdings, walletActivity, followState, cfg = readConfig(), gasSummary = null) {
   const openGroups = new Map((holdings.groups ?? []).map((group) => [normAddress(group.market), group]));
   const ledger = buildTradeLedger(walletActivity);
+  const plannedBuys = readDashboardPlannedBuys(cfg);
   const active = new Map();
 
   for (const item of marketFeed.items ?? []) {
@@ -720,6 +1074,7 @@ function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
       category: item.category,
       startsAt: item.startsAt,
       endsAt: item.endsAt,
+      matchStartsAt: item.matchStartsAt,
       duration: item.duration,
       state: item.state,
       source: item.follow?.source ?? "default",
@@ -733,12 +1088,14 @@ function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
   for (const record of Object.values(followState.followed ?? {})) {
     const key = normAddress(record.market);
     if (active.has(key)) continue;
+    const plannedBuy = findDashboardPlannedBuy(plannedBuys, { address: record.market, question: record.title });
     upsertProjectBoardItem(active, record.market, {
       market: record.market,
       title: record.title,
       category: record.category,
       startsAt: record.startsAt,
       endsAt: record.endsAt,
+      matchStartsAt: plannedBuy?.kickoffAt ?? null,
       duration: "",
       state: "等待发现",
       source: "manual",
@@ -760,9 +1117,10 @@ function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
     upsertProjectBoardItem(active, group.market, {
       market: group.market,
       title: group.title,
-      category: "",
-      startsAt: "",
-      endsAt: "",
+      category: group.category ?? "",
+      startsAt: group.startsAt ?? "",
+      endsAt: group.endsAt ?? "",
+      matchStartsAt: group.matchStartsAt ?? "",
       duration: "",
       state: "持仓中",
       source: "holding",
@@ -791,16 +1149,34 @@ function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
     if (activeKeys.has(key)) active.delete(key);
     const sold = Number(trade.sold ?? 0);
     const realized = Number(trade.realized ?? 0);
+    const gas = gasForMarket(gasSummary, trade.marketAddress);
+    const gasUsdt = Number(gas.gasFeeUsdt ?? 0);
+    const netRealized = realized - gasUsdt;
+    const plannedBuy = findDashboardPlannedBuy(plannedBuys, { address: trade.marketAddress, question: trade.title });
     history.push({
       market: trade.marketAddress,
       title: trade.title || trade.marketAddress,
+      category: trade.category ?? "",
+      startsAt: trade.startsAt ?? "",
+      endsAt: trade.endsAt ?? "",
+      matchStartsAt: plannedBuy?.kickoffAt ?? dashboardMatchStartAt({
+        question: trade.title,
+        startDate: trade.startsAt,
+        endDate: trade.endsAt,
+        categories: trade.categories ?? [],
+        tags: trade.tags ?? []
+      }, plannedBuy, cfg),
       bought: money(bought),
       sold: money(sold),
       realized: money(realized, { sign: true }),
-      pnl: money(realized, { sign: true }),
-      roi: pct(bought > 0 ? (realized / bought) * 100 : 0),
-      positive: realized >= 0,
-      lastAt: trade.lastAt ?? null
+      grossPnl: money(realized, { sign: true }),
+      gas: money(gasUsdt),
+      gasBnb: money(gas.gasFeeBnb, { decimals: 6 }),
+      pnl: money(netRealized, { sign: true }),
+      roi: pct(bought > 0 ? (netRealized / bought) * 100 : 0),
+      positive: netRealized >= 0,
+      lastAt: trade.lastAt ?? null,
+      items: historyOutcomeItems(ledger, key, gasSummary)
     });
   }
 
@@ -814,12 +1190,20 @@ function buildProjectBoard(marketFeed, holdings, walletActivity, followState) {
 function upsertProjectBoardItem(map, market, input) {
   const key = normAddress(market);
   if (!key) return;
-  const existing = map.get(key);
+  const existing = map.get(key) ?? {};
   map.set(key, {
-    ...(existing ?? {}),
+    ...existing,
     ...input,
-    holding: input.holding ?? existing?.holding ?? null,
-    follow: input.follow ?? existing?.follow ?? null
+    title: input.title || existing.title,
+    category: input.category || existing.category || "",
+    startsAt: input.startsAt || existing.startsAt || "",
+    endsAt: input.endsAt || existing.endsAt || "",
+    matchStartsAt: input.matchStartsAt || existing.matchStartsAt || "",
+    duration: input.duration || existing.duration || "",
+    stake: input.stake || existing.stake || "",
+    choices: input.choices || existing.choices || "",
+    holding: input.holding ?? existing.holding ?? null,
+    follow: input.follow ?? existing.follow ?? null
   });
 }
 
@@ -831,6 +1215,7 @@ function formatProjectBoardItem(item) {
     category: item.category || "",
     startsAt: item.startsAt || "",
     endsAt: item.endsAt || "",
+    matchStartsAt: item.matchStartsAt || "",
     duration: item.duration || "",
     state: holding ? "持仓中" : item.state,
     source: item.source,
@@ -843,7 +1228,11 @@ function formatProjectBoardItem(item) {
       value: holding.value,
       realized: holding.realized,
       unrealized: holding.unrealized,
+      grossPnl: holding.grossPnl,
+      gas: holding.gas,
+      gasBnb: holding.gasBnb,
       pnl: holding.pnl,
+      roi: holding.roi,
       positive: holding.positive,
       sellable: holding.sellable,
       sellableCount: holding.sellableCount,
@@ -856,6 +1245,36 @@ function compareProjectBoardItems(a, b) {
   const holdingDelta = Number(Boolean(b.holding)) - Number(Boolean(a.holding));
   if (holdingDelta !== 0) return holdingDelta;
   return safeTime(a.startsAt) - safeTime(b.startsAt);
+}
+
+function historyOutcomeItems(ledger, marketKey, gasSummary = null) {
+  return [...ledger.outcomes.values()]
+    .filter((outcome) => normAddress(outcome.marketAddress) === marketKey)
+    .filter((outcome) => Number(outcome.bought ?? 0) > 0)
+    .sort((a, b) => safeTime(b.lastAt) - safeTime(a.lastAt))
+    .map((outcome) => {
+      const bought = Number(outcome.bought ?? 0);
+      const sold = Number(outcome.sold ?? 0);
+      const realized = Number(outcome.realized ?? 0);
+      const gas = gasForOutcome(gasSummary, outcome.marketAddress, outcome.tokenId);
+      const gasUsdt = Number(gas.gasFeeUsdt ?? 0);
+      const netPnl = realized - gasUsdt;
+      return {
+        tokenId: outcome.tokenId ?? "",
+        outcome: outcome.outcome || outcome.tokenId || "选项",
+        buyPrice: price(outcome.boughtSize > 0 ? outcome.buyPriceCost / outcome.boughtSize : 0),
+        bought: money(bought),
+        sold: money(sold),
+        realized: money(realized, { sign: true }),
+        gas: money(gasUsdt),
+        gasBnb: money(gas.gasFeeBnb),
+        grossPnl: money(realized, { sign: true }),
+        pnl: money(netPnl, { sign: true }),
+        roi: pct(bought > 0 ? (netPnl / bought) * 100 : 0),
+        positive: netPnl >= 0,
+        lastAt: outcome.lastAt ?? null
+      };
+    });
 }
 
 function boughtMarketSummary(walletRows, localRows) {
@@ -926,12 +1345,12 @@ function skippedMarketSet(localRows) {
   return set;
 }
 
-function marketState(market, { bought, skipped, pending, openWindowSeconds, decision }) {
+function marketState(market, { bought, skipped, pending, openWindowSeconds, decision, displayDecision = null }) {
   const key = normAddress(market.address);
   if (bought.has(key)) return "已买";
   if (skipped.has(key)) return "已跳过";
   if (decision?.reason === "follow-blocked") return "禁止买入";
-  if (!decision?.eligible) return "已过滤";
+  if (!decision?.eligible) return displayDecision?.visible ? "观察" : "已过滤";
   if (pending?.fundingState === "funded") return "待买";
   if (pending?.fundingState === "insufficient-funds") return "资金不足";
   if (pending) return pending.prepared ? "已准备" : "待准备";
@@ -949,14 +1368,17 @@ function marketTone(state) {
   return "neutral";
 }
 
-function marketTags(market, decision, pending, cfg) {
+function marketTags(market, decision, pending, cfg, displayDecision = null) {
   const tags = [];
+  for (const tag of displayDecision?.tags ?? []) tags.push(tag);
+  if (displayDecision?.notify) tags.push("飞书通知");
   if (decision.reason === "short-duration") tags.push(`短于${minDurationLabel(cfg)}`);
   if (decision.reason === "missing-time") tags.push("缺少时间");
   if (decision.reason === "price-market" || isPriceMarket(market, cfg)) tags.push("Price");
   if (decision.follow?.manuallyBlocked) tags.push("禁止买入");
   if (decision.follow?.manuallyFollowed) tags.push("手动关注");
   if (decision.follow?.defaultFollowed && !decision.follow?.manuallyFollowed) tags.push("默认关注");
+  if (decision.reason === "planned-buy") tags.push("计划买入");
   if (decision.eligible) tags.push("符合买入");
   if (pending?.fundingState === "funded") tags.push("当前可买");
   if (pending?.fundingState === "insufficient-funds") tags.push("资金不足");
@@ -1039,7 +1461,7 @@ function roundDisplay(value, decimals = 2) {
   return Number(value).toFixed(decimals).replace(/\.0+$|(\.\d*?)0+$/u, "$1");
 }
 
-function normalizeHoldings(raw, activityRows = []) {
+function normalizeHoldings(raw, activityRows = [], cfg = readConfig(), gasSummary = null) {
   const rows = raw.positions ?? [];
   const ledger = buildTradeLedger(activityRows);
   const groups = new Map();
@@ -1056,10 +1478,20 @@ function normalizeHoldings(raw, activityRows = []) {
         realized: 0,
         unrealized: 0,
         totalPnl: 0,
+        startsAt: row.startDate ?? row.startsAt ?? null,
+        endsAt: row.endDate ?? row.endsAt ?? null,
+        matchStartsAt: row.kickoffAt ?? row.matchStartAt ?? null,
+        categories: row.categories ?? [],
+        tags: row.tags ?? [],
         items: []
       });
     }
     const group = groups.get(key);
+    if (!group.startsAt && (row.startDate || row.startsAt)) group.startsAt = row.startDate ?? row.startsAt;
+    if (!group.endsAt && (row.endDate || row.endsAt)) group.endsAt = row.endDate ?? row.endsAt;
+    if (!group.matchStartsAt && (row.kickoffAt || row.matchStartAt)) group.matchStartsAt = row.kickoffAt ?? row.matchStartAt;
+    group.categories = uniqueStrings([...(group.categories ?? []), ...(row.categories ?? [])]);
+    group.tags = uniqueStrings([...(group.tags ?? []), ...(row.tags ?? [])]);
     const trade = ledger.outcomes.get(outcomeLedgerKey(row.marketAddress, row.tokenId));
     const remainingCost = num(row.costBasisUsdt);
     const value = num(row.markValueUsdt);
@@ -1067,14 +1499,17 @@ function normalizeHoldings(raw, activityRows = []) {
     const invested = trade?.bought > 0 ? trade.bought : remainingCost;
     const sold = trade?.sold ?? 0;
     const realized = trade?.realized ?? num(row.realizedPnlUsdt);
-    const totalPnl = realized + unrealized;
+    const grossPnl = realized + unrealized;
+    const gas = gasForOutcome(gasSummary, row.marketAddress, row.tokenId);
+    const gasUsdt = Number(gas.gasFeeUsdt ?? 0);
+    const totalPnl = grossPnl - gasUsdt;
     group.invested += invested;
     group.remainingCost += remainingCost;
     group.sold += sold;
     group.value += value;
     group.realized += realized;
     group.unrealized += unrealized;
-    group.totalPnl += totalPnl;
+    group.totalPnl += grossPnl;
     group.items.push({
       market: row.marketAddress,
       tokenId: row.tokenId,
@@ -1089,13 +1524,28 @@ function normalizeHoldings(raw, activityRows = []) {
       value: money(value),
       realized: money(realized, { sign: true }),
       unrealized: money(unrealized, { sign: true }),
+      grossPnl: money(grossPnl, { sign: true }),
+      gas: money(gasUsdt),
+      gasBnb: money(gas.gasFeeBnb),
       pnl: money(totalPnl, { sign: true }),
       pnlPct: pct(invested > 0 ? (totalPnl / invested) * 100 : 0),
       positive: totalPnl >= 0,
       sellable: !row.isFinalized
     });
   }
-  const finalizedGroups = [...groups.values()].map((group) => finalizeHoldingGroup(group, ledger));
+  const finalizedGroups = [...groups.values()]
+    .map((group) => ({
+      ...group,
+      matchStartsAt: group.matchStartsAt ?? dashboardMatchStartAt({
+        question: group.title,
+        startDate: group.startsAt,
+        endDate: group.endsAt,
+        categories: group.categories ?? [],
+        tags: group.tags ?? [],
+        outcomes: group.items.map((item) => ({ name: item.outcome }))
+      }, null, cfg)
+    }))
+    .map((group) => finalizeHoldingGroup(group, ledger, gasSummary));
   const totals = finalizedGroups.reduce((acc, group) => {
     acc.invested += group.invested;
     acc.remainingCost += group.remainingCost;
@@ -1104,6 +1554,9 @@ function normalizeHoldings(raw, activityRows = []) {
     acc.realized += group.realized;
     acc.unrealized += group.unrealized;
     acc.totalPnl += group.totalPnl;
+    acc.grossPnl += group.grossPnl;
+    acc.gasUsdt += group.gasUsdt;
+    acc.gasBnb += group.gasBnb;
     return acc;
   }, {
     invested: 0,
@@ -1112,7 +1565,10 @@ function normalizeHoldings(raw, activityRows = []) {
     value: 0,
     realized: 0,
     unrealized: 0,
-    totalPnl: 0
+    totalPnl: 0,
+    grossPnl: 0,
+    gasUsdt: 0,
+    gasBnb: 0
   });
   return {
     count: rows.length,
@@ -1123,6 +1579,9 @@ function normalizeHoldings(raw, activityRows = []) {
       value: money(totals.value),
       realized: money(totals.realized, { sign: true }),
       unrealized: money(totals.unrealized, { sign: true }),
+      grossPnl: money(totals.grossPnl, { sign: true }),
+      gas: money(totals.gasUsdt),
+      gasBnb: money(totals.gasBnb),
       pnl: money(totals.totalPnl, { sign: true }),
       positive: totals.totalPnl >= 0
     },
@@ -1130,17 +1589,24 @@ function normalizeHoldings(raw, activityRows = []) {
   };
 }
 
-function finalizeHoldingGroup(group, ledger) {
+function finalizeHoldingGroup(group, ledger, gasSummary = null) {
   const marketTrade = ledger.markets.get(normAddress(group.market));
   const invested = marketTrade?.bought > 0 ? marketTrade.bought : group.invested;
   const sold = marketTrade?.sold ?? group.sold;
   const realized = marketTrade ? marketTrade.realized : group.realized;
-  const totalPnl = realized + group.unrealized;
+  const grossPnl = realized + group.unrealized;
+  const gas = gasForMarket(gasSummary, group.market);
+  const gasUsdt = Number(gas.gasFeeUsdt ?? 0);
+  const gasBnb = Number(gas.gasFeeBnb ?? 0);
+  const totalPnl = grossPnl - gasUsdt;
   return {
     ...group,
     invested,
     sold,
     realized,
+    grossPnl,
+    gasUsdt,
+    gasBnb,
     totalPnl
   };
 }
@@ -1149,20 +1615,28 @@ function formatHoldingGroup(group) {
   const sellableCount = group.items.filter((item) => item.sellable).length;
   return {
     ...group,
+    startsAt: group.startsAt ?? "",
+    endsAt: group.endsAt ?? "",
+    matchStartsAt: group.matchStartsAt ?? "",
+    category: group.categories?.[0] ?? "",
     cost: money(group.invested),
     remainingCost: money(group.remainingCost),
     sold: money(group.sold),
     value: money(group.value),
     realized: money(group.realized, { sign: true }),
     unrealized: money(group.unrealized, { sign: true }),
+    grossPnl: money(group.grossPnl, { sign: true }),
+    gas: money(group.gasUsdt),
+    gasBnb: money(group.gasBnb),
     pnl: money(group.totalPnl, { sign: true }),
+    roi: pct(group.invested > 0 ? (group.totalPnl / group.invested) * 100 : 0),
     positive: group.totalPnl >= 0,
     sellable: sellableCount > 0,
     sellableCount
   };
 }
 
-function buildAnalytics(rawPositions, activityRows) {
+function buildAnalytics(rawPositions, activityRows, gasSummary = null) {
   const positions = rawPositions.positions ?? [];
   const projects = new Map();
   const ledger = buildTradeLedger(activityRows);
@@ -1172,7 +1646,10 @@ function buildAnalytics(rawPositions, activityRows) {
     realized: 0,
     openCost: 0,
     openValue: 0,
-    openPnl: 0
+    openPnl: 0,
+    gasUsdt: Number(gasSummary?.totalGasFeeUsdt ?? 0),
+    gasBnb: Number(gasSummary?.totalGasFeeBnb ?? 0),
+    unpricedGasBnb: Number(gasSummary?.unpricedGasFeeBnb ?? 0)
   };
 
   for (const row of positions) {
@@ -1193,12 +1670,17 @@ function buildAnalytics(rawPositions, activityRows) {
     project.bought += trade.bought;
     project.sold += trade.sold;
     project.realized += trade.realized;
+    const gas = gasForMarket(gasSummary, trade.marketAddress);
+    project.gasUsdt = Number(gas.gasFeeUsdt ?? 0);
+    project.gasBnb = Number(gas.gasFeeBnb ?? 0);
+    if (safeTime(trade.lastAt) > safeTime(project.lastAt)) project.lastAt = trade.lastAt;
     totals.bought += trade.bought;
     totals.sold += trade.sold;
     totals.realized += trade.realized;
   }
 
-  const totalPnl = totals.realized + totals.openPnl;
+  const grossTotalPnl = totals.realized + totals.openPnl;
+  const totalPnl = grossTotalPnl - totals.gasUsdt;
   const invested = totals.bought > 0 ? totals.bought : totals.openCost;
   const cards = {
     invested: money(invested),
@@ -1210,6 +1692,11 @@ function buildAnalytics(rawPositions, activityRows) {
     totalSold: money(totals.sold),
     realizedPnl: money(totals.realized, { sign: true }),
     unrealizedPnl: money(totals.openPnl, { sign: true }),
+    grossPnl: money(grossTotalPnl, { sign: true }),
+    gasFee: money(totals.gasUsdt),
+    gasFeeBnb: money(totals.gasBnb),
+    unpricedGasFeeBnb: money(totals.unpricedGasBnb),
+    gasTxCount: Number(gasSummary?.txCount ?? 0),
     totalPnl: money(totalPnl, { sign: true }),
     totalPositive: totalPnl >= 0,
     realizedPositive: totals.realized >= 0,
@@ -1221,9 +1708,15 @@ function buildAnalytics(rawPositions, activityRows) {
     cards,
     projects: [...projects.values()]
       .map((project) => normalizeProject(project))
-      .sort((a, b) => Math.abs(b.pnlValue) - Math.abs(a.pnlValue))
+      .sort(compareAnalyticsProjects)
       .slice(0, 12)
   };
+}
+
+function compareAnalyticsProjects(a, b) {
+  const timeDelta = safeTime(b.lastAt) - safeTime(a.lastAt);
+  if (timeDelta !== 0) return timeDelta;
+  return Math.abs(b.pnlValue) - Math.abs(a.pnlValue);
 }
 
 function getProject(projects, key, title) {
@@ -1236,7 +1729,10 @@ function getProject(projects, key, title) {
       realized: 0,
       openCost: 0,
       openValue: 0,
-      openPnl: 0
+      openPnl: 0,
+      gasUsdt: 0,
+      gasBnb: 0,
+      lastAt: null
     });
   }
   const project = projects.get(projectKey);
@@ -1245,7 +1741,9 @@ function getProject(projects, key, title) {
 }
 
 function normalizeProject(project) {
-  const pnl = project.realized + project.openPnl;
+  const grossPnl = project.realized + project.openPnl;
+  const gasUsdt = Number(project.gasUsdt ?? 0);
+  const pnl = grossPnl - gasUsdt;
   const invested = project.bought > 0 ? project.bought : project.openCost;
   return {
     title: project.title,
@@ -1255,8 +1753,12 @@ function normalizeProject(project) {
     openValue: money(project.openValue),
     realized: money(project.realized, { sign: true }),
     unrealized: money(project.openPnl, { sign: true }),
+    grossPnl: money(grossPnl, { sign: true }),
+    gas: money(gasUsdt),
+    gasBnb: money(project.gasBnb),
     pnl: money(pnl, { sign: true }),
     pnlValue: pnl,
+    lastAt: project.lastAt ?? null,
     positive: pnl >= 0,
     realizedPositive: project.realized >= 0,
     unrealizedPositive: project.openPnl >= 0,
@@ -1269,25 +1771,36 @@ function buildTradeLedger(activityRows = []) {
   const outcomes = new Map();
   for (const row of activityRows) {
     const type = String(row.type ?? "").toUpperCase();
-    if (type !== "MINT" && type !== "REDEEM") continue;
+    if (!isLedgerBuyType(type) && !isLedgerExitType(type)) continue;
     const marketKey = normAddress(row.marketAddress ?? row.market);
     if (!marketKey) continue;
     const market = ensureTradeRecord(markets, marketKey, {
       marketAddress: row.marketAddress ?? row.market,
-      title: row.title
+      title: row.title,
+      startsAt: row.startDate ?? row.startsAt ?? row.market?.startDate ?? row.question?.startDate ?? null,
+      endsAt: row.endDate ?? row.endsAt ?? row.market?.endDate ?? row.question?.endDate ?? null,
+      categories: row.categories ?? row.market?.categories ?? row.question?.categories ?? [],
+      tags: row.tags ?? row.market?.tags ?? row.question?.tags ?? []
     });
     const outcomeKey = outcomeLedgerKey(row.marketAddress ?? row.market, row.tokenId);
     const outcome = ensureTradeRecord(outcomes, outcomeKey, {
       marketAddress: row.marketAddress ?? row.market,
       title: row.title,
       tokenId: row.tokenId,
-      outcome: row.outcome
+      outcome: row.outcome,
+      startsAt: row.startDate ?? row.startsAt ?? row.market?.startDate ?? row.question?.startDate ?? null,
+      endsAt: row.endDate ?? row.endsAt ?? row.market?.endDate ?? row.question?.endDate ?? null
     });
     const collateral = num(row.collateral);
     const realized = num(row.realizedPnlDelta);
-    if (type === "MINT") {
+    if (isLedgerBuyType(type)) {
+      const size = num(row.size);
+      const tradePrice = num(row.tradePrice);
+      const priceCost = size > 0 && tradePrice > 0 ? size * tradePrice : collateral;
       market.bought += collateral;
       outcome.bought += collateral;
+      outcome.boughtSize += size;
+      outcome.buyPriceCost += priceCost;
     } else {
       market.sold += collateral;
       market.realized += realized;
@@ -1301,11 +1814,21 @@ function buildTradeLedger(activityRows = []) {
   return { markets, outcomes };
 }
 
+function isLedgerBuyType(type) {
+  return type === "MINT";
+}
+
+function isLedgerExitType(type) {
+  return type === "REDEEM" || type === "FINALISE" || type === "FINALIZE";
+}
+
 function ensureTradeRecord(map, key, initial = {}) {
   if (!map.has(key)) {
     map.set(key, {
       ...initial,
       bought: 0,
+      boughtSize: 0,
+      buyPriceCost: 0,
       sold: 0,
       realized: 0
     });
@@ -1313,6 +1836,11 @@ function ensureTradeRecord(map, key, initial = {}) {
   const record = map.get(key);
   if (!record.title && initial.title) record.title = initial.title;
   if (!record.outcome && initial.outcome) record.outcome = initial.outcome;
+  if (!record.tokenId && initial.tokenId) record.tokenId = initial.tokenId;
+  if (!record.startsAt && initial.startsAt) record.startsAt = initial.startsAt;
+  if (!record.endsAt && initial.endsAt) record.endsAt = initial.endsAt;
+  record.categories = uniqueStrings([...(record.categories ?? []), ...(initial.categories ?? [])]);
+  record.tags = uniqueStrings([...(record.tags ?? []), ...(initial.tags ?? [])]);
   return record;
 }
 
@@ -1384,12 +1912,13 @@ function normalizeActivity(rows, walletRows = []) {
 
 function normalizeWalletActivity(rows) {
   const groupedBuys = new Map();
+  const groupedSettlements = new Map();
   const normalized = [];
   for (const row of rows) {
     const type = String(row.type ?? "").toUpperCase();
     const time = row.timestamp ? new Date(Number(row.timestamp) * 1000).toISOString() : null;
     if (!time) continue;
-    if (type === "MINT") {
+    if (isLedgerBuyType(type)) {
       const key = row.transactionHash || `${row.title}:${row.timestamp}`;
       const group = groupedBuys.get(key) ?? {
         source: "chain",
@@ -1411,6 +1940,20 @@ function normalizeWalletActivity(rows) {
         amount: row.collateral ? `${money(row.collateral)} U` : ""
       });
     }
+    if (type === "FINALISE" || type === "FINALIZE") {
+      const key = row.transactionHash || `${row.title}:${row.timestamp}`;
+      const group = groupedSettlements.get(key) ?? {
+        source: "chain",
+        time,
+        label: "结算",
+        title: row.title,
+        collateral: 0,
+        realized: 0
+      };
+      group.collateral += num(row.collateral);
+      group.realized += num(row.realizedPnlDelta);
+      groupedSettlements.set(key, group);
+    }
   }
   for (const group of groupedBuys.values()) {
     normalized.push({
@@ -1419,6 +1962,15 @@ function normalizeWalletActivity(rows) {
       label: group.label,
       title: group.title,
       amount: `${money(group.amountValue)} U`
+    });
+  }
+  for (const group of groupedSettlements.values()) {
+    normalized.push({
+      source: "chain",
+      time: group.time,
+      label: group.label,
+      title: group.title,
+      amount: `收回 ${money(group.collateral)} U / 盈亏 ${money(group.realized, { sign: true })} U`
     });
   }
   return normalized;
@@ -1553,13 +2105,27 @@ async function fetchUserActivity() {
   if (!botWallet) return [];
   try {
     const cfg = readConfig();
-    return await fetchActivity(cfg, {
+    const rows = await fetchActivity(cfg, {
       user: botWallet,
       limit: Number(process.env.DASHBOARD_ACTIVITY_LIMIT ?? 500)
     });
+    return filterActivitySince(rows, dashboardActivitySince);
   } catch {
     return [];
   }
+}
+
+function filterActivitySince(rows, since) {
+  const cutoffMs = Date.parse(String(since ?? ""));
+  if (!Number.isFinite(cutoffMs)) return rows;
+  return rows.filter((row) => activityRowTime(row) >= cutoffMs);
+}
+
+function activityRowTime(row) {
+  const timestamp = Number(row?.timestamp);
+  if (Number.isFinite(timestamp) && timestamp > 0) return timestamp * 1000;
+  const at = Date.parse(row?.at ?? row?.createdAt ?? row?.updatedAt ?? "");
+  return Number.isFinite(at) ? at : 0;
 }
 
 async function fetchNewMarketsFeed() {
@@ -1675,6 +2241,15 @@ function readJsonl(file, limit) {
       return null;
     }
   }).filter(Boolean);
+}
+
+function safeReadJson(file) {
+  try {
+    if (!file || !fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
 }
 
 function readTextTail(file, maxBytes) {

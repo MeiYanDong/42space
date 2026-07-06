@@ -1,0 +1,10 @@
+[Unit]
+Description=42space Bot4 first live buy evidence collector
+After=network-online.target 42space-event@42space-4.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/42space
+ExecStart=/usr/bin/node /opt/42space/scripts/bot4-first-buy-evidence.js --profile-env /etc/42space/profiles/42space-4.env --out-dir /opt/42space/output/bot4-first-buy --unit 42space-event@42space-4.service --wait-until-complete --retry-ms 60000 --max-wait-ms 1800000
+SuccessExitStatus=2
