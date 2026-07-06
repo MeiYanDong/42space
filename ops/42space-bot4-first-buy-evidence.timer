@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Bot4 buy evidence collector after the daily 08:00 CST open
+
+[Timer]
+OnCalendar=*-*-* 08:04:00
+AccuracySec=1s
+Persistent=true
+Unit=42space-bot4-first-buy-evidence.service
+
+[Install]
+WantedBy=timers.target

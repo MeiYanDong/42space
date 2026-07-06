@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Bot1 buy-rank evidence collector for new Bot1 buys
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Persistent=true
+Unit=42space-bot1-buy-rank-evidence.service
+
+[Install]
+WantedBy=timers.target

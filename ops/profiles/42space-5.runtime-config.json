@@ -1,0 +1,31 @@
+{
+  "filterMode": "price_only_test",
+  "eventOutcomeCount": 3,
+  "stakePerOutcomeUsdt": 10,
+  "maxMarketStakeUsdt": 30,
+  "maxBatchStakeUsdt": 30,
+  "minEventDurationHours": 0,
+  "gasPriceGwei": "6",
+  "autoSellEnabled": true,
+  "autoSellStrategy": "open_timed_exit",
+  "autoSellStartDelaySeconds": 10,
+  "autoSellIntervalSeconds": 10,
+  "autoSellChunkPercent": 10,
+  "autoSellLadderProfitPercent": 100,
+  "autoSellOpenExitDelaySeconds": 25,
+  "autoSellOpenExitPercent": 100,
+  "autoSellTakeProfitSteps": 0,
+  "autoSellBeforeMarketStartSeconds": 0,
+  "autoSellMarketStartEndOffsetSeconds": 0,
+  "autoSellGasPriceGwei": "0.15",
+  "autoSellStopLossEnabled": true,
+  "autoSellStopLossPercent": 10,
+  "autoSellStopLossSellPercent": 100,
+  "eventDisplayFilterRules": [
+    "price",
+    "daily_fixed_template",
+    "sports_total_goals",
+    "sports_goal_differential"
+  ],
+  "eventDisplayIncludeRules": []
+}

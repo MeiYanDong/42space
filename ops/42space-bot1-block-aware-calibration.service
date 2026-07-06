@@ -1,0 +1,12 @@
+[Unit]
+Description=42space Bot1 block-aware timing calibration
+After=network-online.target 42space-event@42space.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/42space
+ExecStart=/usr/bin/node /opt/42space/scripts/bot1-block-aware-calibrate.js --profile-env /etc/42space/profiles/42space.env --out /opt/42space/output/bot1-block-aware-calibration/latest.json --limit 12 --gas-price-gwei 6 --quiet
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

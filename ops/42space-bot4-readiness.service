@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Bot4 pre-open readiness check
+After=network-online.target 42space-event@42space-4.service 42space-dashboard@42space-4.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/42space
+ExecStart=/bin/sh -lc 'mkdir -p /opt/42space/output/bot4-readiness && node /opt/42space/scripts/bot4-readiness-check.js > /opt/42space/output/bot4-readiness/latest.json'
