@@ -30,19 +30,19 @@ Existing production project:
 
 Current strategy baseline:
 
-- Buy 5 outcomes.
-- Buy lowest-odds outcomes.
-- Stake per outcome: `20U`.
-- Normal max cost per market: `100U`.
-- Buy only within `EVENT_OPEN_WINDOW_SECONDS=5`.
+- Buy 3 outcomes.
+- Buy the middle outcomes by display/token order.
+- Stake per outcome: `6U`.
+- Normal max cost per market: `18U`.
+- Buy path must start within `EVENT_OPEN_WINDOW_SECONDS=20`.
 - Exclude Price markets.
 - Buy only non-Price Event Markets with duration at least `48h`.
 - Use speed-first fallback when odds are missing.
 - Pre-sign in hot window.
 - Do not pre-open broadcast by default: `ALLOW_PREOPEN_BROADCAST=0`.
-- Broadcast at open time: `OPEN_BROADCAST_DELAY_MS=0`.
+- Current anti-snipe entry time: `OPEN_BROADCAST_DELAY_MS=19000` (`T+19s`).
 - Do not wait for receipt in buy lock: `WAIT_FOR_RECEIPT=0`, `ASYNC_RECEIPT_WATCH=1`.
-- Auto-sell ladder: buy + 10s, then every 10s sell 10% of initial outcome tokens.
+- Current Bot2 auto-sell strategy: `open_timed_exit`, sell 100% at market-open `T+25s`; fast randomized open-exit is enabled to pre-sign the sell batch after buy receipt and broadcast inside `T+24.5s` to `T+26.0s`; the old `ladder` strategy remains available for rollback.
 - Auto stop-loss: one outcome down 10%, sell that outcome fully.
 
 ## Required Isolation
@@ -146,25 +146,31 @@ AUTO_SELL_POSITION_STATE_FILE=data/auto-sell-positions.json
 Keep strategy values aligned with current production:
 
 ```bash
-STAKE_PER_OUTCOME_USDT=20
-EVENT_OUTCOME_COUNT=5
-EVENT_OUTCOME_SELECTION=lowest_odds
-MAX_MARKET_STAKE_USDT=100
-MAX_BATCH_STAKE_USDT=450
-EVENT_OPEN_WINDOW_SECONDS=5
+STAKE_PER_OUTCOME_USDT=6
+EVENT_OUTCOME_COUNT=3
+EVENT_OUTCOME_SELECTION=middle
+MAX_MARKET_STAKE_USDT=18
+MAX_BATCH_STAKE_USDT=18
+EVENT_OPEN_WINDOW_SECONDS=20
 MARKET_CATEGORY_BLOCKLIST=Price
 MARKET_TAG_BLOCKLIST=8 hour,automated
 MIN_EVENT_DURATION_HOURS=48
 AUTO_SELL_ENABLED=1
-AUTO_SELL_STRATEGY=ladder
+AUTO_SELL_STRATEGY=open_timed_exit
 AUTO_SELL_START_DELAY_SECONDS=10
 AUTO_SELL_INTERVAL_SECONDS=10
 AUTO_SELL_CHUNK_PERCENT=10
+AUTO_SELL_LADDER_PROFIT_PERCENT=100
+AUTO_SELL_OPEN_EXIT_DELAY_SECONDS=25
+AUTO_SELL_OPEN_EXIT_PERCENT=100
+AUTO_SELL_FAST_OPEN_EXIT_ENABLED=1
+AUTO_SELL_FAST_OPEN_EXIT_MIN_DELAY_MS=24500
+AUTO_SELL_FAST_OPEN_EXIT_MAX_DELAY_MS=26000
 AUTO_SELL_STOP_LOSS_ENABLED=1
 AUTO_SELL_STOP_LOSS_PERCENT=10
 AUTO_SELL_STOP_LOSS_SELL_PERCENT=100
 ALLOW_PREOPEN_BROADCAST=0
-OPEN_BROADCAST_DELAY_MS=0
+OPEN_BROADCAST_DELAY_MS=19000
 WAIT_FOR_RECEIPT=0
 ASYNC_RECEIPT_WATCH=1
 ```
