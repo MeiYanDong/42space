@@ -38,6 +38,7 @@ const state = {
   expandedMarkets: new Set(),
   marketDetails: new Map(),
   projectExpanded: new Set(),
+  historyExpanded: new Set(),
   showHistoryProjects: false,
   selected: null,
   sellPercent: 100,
@@ -48,6 +49,7 @@ const state = {
   runtimeWriteProtected: false,
   timer: null
 };
+const overviewRefreshMs = 60000;
 
 const ICONS = {
   activity: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>`,
@@ -96,15 +98,11 @@ const els = {
   nextCount: $("nextCount"),
   upcomingList: $("upcomingList"),
   upcomingCategoryFilter: $("upcomingCategoryFilter"),
-  holdingCount: $("holdingCount"),
-  holdingsList: $("holdingsList"),
   positionSummary: $("positionSummary"),
   projectBoardCount: $("projectBoardCount"),
   projectBoardList: $("projectBoardList"),
   toggleHistoryProjects: $("toggleHistoryProjects"),
   historyProjectList: $("historyProjectList"),
-  projectCount: $("projectCount"),
-  projectStats: $("projectStats"),
   activityList: $("activityList"),
   attentionList: $("attentionList"),
   overviewSnapshot: $("overviewSnapshot"),
@@ -113,13 +111,19 @@ const els = {
   stakeText: $("stakeText"),
   windowText: $("windowText"),
   autoSellText: $("autoSellText"),
+  ruleFilterText: $("ruleFilterText"),
+  ruleDisplayText: $("ruleDisplayText"),
+  ruleFollowText: $("ruleFollowText"),
+  ruleNotifyText: $("ruleNotifyText"),
   preflightList: $("preflightList"),
   runtimeConfigForm: $("runtimeConfigForm"),
   configMode: $("configMode"),
+  configDisplayFilters: $("configDisplayFilters"),
   configOutcomeCount: $("configOutcomeCount"),
   configStakePerOutcome: $("configStakePerOutcome"),
   configMaxBatchStake: $("configMaxBatchStake"),
   configGasPriceGwei: $("configGasPriceGwei"),
+  configAutoSellGasPriceGwei: $("configAutoSellGasPriceGwei"),
   configAutoSellEnabled: $("configAutoSellEnabled"),
   configAutoSellStartDelay: $("configAutoSellStartDelay"),
   configAutoSellInterval: $("configAutoSellInterval"),
@@ -158,14 +162,17 @@ loadOverview();
 loadRuntimeConfig();
 state.timer = setInterval(() => {
   updateCountdowns();
-  loadOverview();
-}, 5000);
+  if (document.visibilityState === "visible") loadOverview();
+}, overviewRefreshMs);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") loadOverview();
+});
 setInterval(updateCountdowns, 1000);
 
 async function loadOverview({ force = false } = {}) {
   if (force) els.refreshBtn.disabled = true;
   try {
-    const data = await api("/api/overview");
+    const data = await api(force ? "/api/overview?refresh=1" : "/api/overview");
     state.data = data;
     render(data);
   } catch (error) {
@@ -179,6 +186,7 @@ async function loadRuntimeConfig({ force = false } = {}) {
   try {
     const data = await api("/api/runtime-config");
     state.runtimeConfig = data.config;
+    state.runtimeConfigEditable = data.editable ?? state.runtimeConfigEditable ?? {};
     state.runtimeWriteProtected = Boolean(data.writeProtected);
     if (!state.configDirty || force) setRuntimeConfigForm(data.config);
     els.configStatus.textContent = runtimeStatusText(data.config);
@@ -212,6 +220,14 @@ function formatConsoleTitle(appName) {
   const name = String(appName || "42space").trim();
   if (/\bConsole$/i.test(name)) return name;
   return `${name} Bot Console`;
+}
+
+function gasCardMeta(cards) {
+  const parts = [`${cards.gasFeeBnb} BNB`, `${cards.gasTxCount || 0} tx`];
+  if (Number(cards.unpricedGasFeeBnb || 0) > 0) {
+    parts.push(`${cards.unpricedGasFeeBnb} BNB 未定价`);
+  }
+  return parts.join(" · ");
 }
 
 function renderOverview(data) {
@@ -249,7 +265,9 @@ function renderOverview(data) {
     ${summaryCard("当前", `${cards.openValue} U`, "剩余仓位", true)}
     ${summaryCard("已实现", `${cards.realizedPnl} U`, "已卖出盈亏", cards.realizedPositive)}
     ${summaryCard("未实现", `${cards.unrealizedPnl} U`, "当前浮盈亏", cards.unrealizedPositive)}
-    ${summaryCard("总盈亏", `${cards.totalPnl} U`, cards.totalRoi, cards.totalPositive)}
+    ${summaryCard("毛盈亏", `${cards.grossPnl} U`, "未扣 Gas", cards.totalPositive)}
+    ${summaryCard("Gas", `${cards.gasFee} U`, gasCardMeta(cards), false)}
+    ${summaryCard("净盈亏", `${cards.totalPnl} U`, `已扣 Gas · ${cards.totalRoi}`, cards.totalPositive)}
   `;
 
   const next = data.next.first;
@@ -467,11 +485,11 @@ function renderPositions(data) {
     ${summaryCard("当前", `${cards.openValue} U`, `${data.holdings.count} 个可卖`, true)}
     ${summaryCard("已实现", `${cards.realizedPnl} U`, "已卖出盈亏", cards.realizedPositive)}
     ${summaryCard("未实现", `${cards.unrealizedPnl} U`, "当前浮盈亏", cards.unrealizedPositive)}
-    ${summaryCard("总盈亏", `${cards.totalPnl} U`, cards.totalRoi, cards.totalPositive)}
+    ${summaryCard("毛盈亏", `${cards.grossPnl} U`, "未扣 Gas", cards.totalPositive)}
+    ${summaryCard("Gas", `${cards.gasFee} U`, gasCardMeta(cards), false)}
+    ${summaryCard("净盈亏", `${cards.totalPnl} U`, `已扣 Gas · ${cards.totalRoi}`, cards.totalPositive)}
   `;
   renderProjectBoard(data.projectBoard);
-  renderHoldings(data.holdings);
-  renderProjectStats(data.analytics.projects);
 }
 
 function renderProjectBoard(board) {
@@ -506,10 +524,10 @@ function renderProjectBoardRow(project) {
       <div class="projectBoardTop">
         <div class="projectBoardTitle">
           <strong title="${escapeAttr(project.title)}">${escapeHtml(project.title)}</strong>
-          <span>${project.category ? `${escapeHtml(project.category)} · ` : ""}${escapeHtml(project.follow?.label ?? project.state)} · ${project.startsAt ? `${formatDate(project.startsAt)} 开` : "等待自动更新"}</span>
+          <span>${projectMetaText(project)}</span>
         </div>
         <div class="projectBoardStats">
-          ${holding ? `<span>投入 ${holding.cost} U</span><span>当前 ${holding.value} U</span><strong class="${holding.positive ? "good" : "bad"}">${holding.pnl} U</strong>` : `<span>${escapeHtml(project.state || "")}</span><span>${project.stake ? `${escapeHtml(project.stake)} U` : ""}</span>`}
+          ${holding ? renderProjectTotalStats(holding) : renderPlannedProjectStats(project)}
         </div>
         <button class="ghost iconButton iconOnly" type="button" data-expand-project="${escapeAttr(project.market)}" aria-label="展开项目">
           ${icon(expanded ? "chevron-down" : "chevron-right")}
@@ -533,60 +551,123 @@ function renderProjectBoardDetail(project) {
   const sellBlockMessage = state.data?.manualSell?.message ?? "";
   return `
     <div class="projectBoardDetail">
+      <div class="projectBoardDetailActions">
+        <button
+          class="sellAllBtn iconButton"
+          data-sell='${escapeAttr(JSON.stringify(projectSellItem(project)))}'
+          title="${escapeAttr(sellBlocked ? sellBlockMessage : "卖出该事件全部持仓")}"
+          ${holding.sellable && !sellBlocked ? "" : "disabled"}
+        >${icon("badge-dollar-sign")}<span>一键卖出全部</span></button>
+      </div>
       ${holding.items.map((item) => renderPosition(item, { sellBlocked, sellBlockMessage })).join("")}
     </div>
   `;
 }
 
 function renderHistoryProjectRow(project) {
+  const expanded = state.historyExpanded.has(project.market);
   return `
-    <div class="historyProjectRow">
-      <div>
-        <strong title="${escapeAttr(project.title)}">${escapeHtml(project.title)}</strong>
-        <span>${project.lastAt ? formatTime(project.lastAt) : "--"}</span>
+    <section class="projectBoardRow historyProjectRow ${expanded ? "isExpanded" : ""}">
+      <div class="projectBoardTop">
+        <div class="projectBoardTitle">
+          <strong title="${escapeAttr(project.title)}">${escapeHtml(project.title)}</strong>
+          <span>${projectMetaText(project, { history: true })}</span>
+        </div>
+        <div class="projectBoardStats">
+          ${renderProjectTotalStats(project)}
+        </div>
+        <button class="ghost iconButton iconOnly" type="button" data-expand-history-project="${escapeAttr(project.market)}" aria-label="展开历史项目">
+          ${icon(expanded ? "chevron-down" : "chevron-right")}
+        </button>
       </div>
-      <div class="projectBoardStats">
-        <span>买入 ${project.bought} U</span>
-        <span>卖出 ${project.sold} U</span>
-        <strong class="${project.positive ? "good" : "bad"}">${project.pnl} U</strong>
-        <span>${project.roi}</span>
+      ${expanded ? renderHistoryProjectDetail(project) : ""}
+    </section>
+  `;
+}
+
+function renderHistoryProjectDetail(project) {
+  const items = project.items ?? [];
+  return `
+    <div class="projectBoardDetail">
+      ${items.length ? items.map(renderHistoryPosition).join("") : `<div class="empty">暂无选项明细</div>`}
+    </div>
+  `;
+}
+
+function renderHistoryPosition(item) {
+  return `
+    <div class="positionRow historyPositionRow">
+      <div class="positionName">
+        ${escapeHtml(item.outcome)}
+        ${item.tokenId ? `<small>Token ${escapeHtml(String(item.tokenId))}</small>` : ""}
+      </div>
+      <div class="positionStats">
+        <div class="stat"><span>买入价</span><strong>${item.buyPrice}</strong></div>
+        <div class="stat"><span>投入</span><strong>${item.bought} U</strong></div>
+        <div class="stat"><span>已卖出</span><strong>${item.sold} U</strong></div>
+        <div class="stat"><span>已实现</span><strong class="${signedTone(item.realized)}">${item.realized} U</strong></div>
+        <div class="stat"><span>Gas</span><strong>${item.gas ?? "0"} U</strong></div>
+        <div class="stat"><span>毛盈亏</span><strong class="${signedTone(item.grossPnl ?? item.realized)}">${item.grossPnl ?? item.realized} U</strong></div>
+        <div class="stat"><span>净盈亏</span><strong class="${item.positive ? "good" : "bad"}">${item.pnl} U</strong></div>
+        <div class="stat"><span>收益</span><strong class="${item.positive ? "good" : "bad"}">${item.roi}</strong></div>
+        <div class="stat"><span>最后</span><strong>${item.lastAt ? formatDate(item.lastAt) : "--"}</strong></div>
       </div>
     </div>
   `;
 }
 
-function renderHoldings(holdings) {
-  els.holdingCount.textContent = `${holdings.count} 个`;
-  const sellBlocked = Boolean(state.data?.manualSell?.blocked);
-  const sellBlockMessage = state.data?.manualSell?.message ?? "";
-  if (!holdings.groups.length) {
-    els.holdingsList.innerHTML = `<div class="empty">暂无</div>`;
-    return;
-  }
-  els.holdingsList.innerHTML = holdings.groups.map((group) => `
-    <section class="marketGroup">
-      <div class="marketTop">
-        <div>
-          <div class="marketTitle" title="${escapeAttr(group.title)}">${escapeHtml(group.title)}</div>
-          <div class="marketMeta">投入 ${group.cost} U · 卖出 ${group.sold} U · 当前 ${group.value} U · 已实现 ${group.realized} U · 未实现 ${group.unrealized} U</div>
-        </div>
-        <div class="marketActions">
-          <strong class="${group.positive ? "good" : "bad"}">${group.pnl} U</strong>
-          <button
-            class="sellAllBtn iconButton"
-            data-sell='${escapeAttr(JSON.stringify(groupSellItem(group)))}'
-            title="${escapeAttr(sellBlocked ? sellBlockMessage : "卖出该事件全部持仓")}"
-            ${group.sellable && !sellBlocked ? "" : "disabled"}
-          >${icon("badge-dollar-sign")}<span>一键卖出</span></button>
-        </div>
-      </div>
-      <div class="positionTable">
-        ${group.items.map((item) => renderPosition(item, { sellBlocked, sellBlockMessage })).join("")}
-      </div>
-    </section>
-  `).join("");
+function projectMetaText(project, { history = false } = {}) {
+  const parts = [];
+  if (project.category) parts.push(escapeHtml(project.category));
+  parts.push(escapeHtml(history ? "历史项目" : (project.follow?.label ?? project.state ?? "项目")));
+  if (project.startsAt) parts.push(`开盘 ${formatDate(project.startsAt)}`);
+  if (project.matchStartsAt) parts.push(`比赛 ${formatDate(project.matchStartsAt)}`);
+  if (history && project.lastAt) parts.push(`最后 ${formatDate(project.lastAt)}`);
+  if (!project.startsAt && !project.matchStartsAt && !history) parts.push("等待自动更新");
+  return parts.join(" · ");
+}
 
-  bindSellButtons(els.holdingsList);
+function renderProjectTotalStats(project) {
+  const current = project.value ?? project.openValue;
+  return `
+    <span>投入 ${escapeHtml(project.cost ?? project.bought ?? "--")} U</span>
+    ${project.sold !== undefined ? `<span>已卖出 ${escapeHtml(project.sold)} U</span>` : ""}
+    ${current !== undefined ? `<span>当前 ${escapeHtml(current)} U</span>` : ""}
+    ${project.grossPnl !== undefined ? `<span>毛盈亏 ${escapeHtml(project.grossPnl)} U</span>` : ""}
+    ${project.gas !== undefined ? `<span>Gas ${escapeHtml(project.gas)} U</span>` : ""}
+    <strong class="${project.positive ? "good" : "bad"}">净盈亏 ${escapeHtml(project.pnl ?? "--")} U</strong>
+    ${project.roi ? `<span>收益 ${escapeHtml(project.roi)}</span>` : ""}
+  `;
+}
+
+function renderPlannedProjectStats(project) {
+  const pieces = [];
+  if (project.choices) pieces.push(`<span>买 ${escapeHtml(String(project.choices))} 档</span>`);
+  if (project.stake) pieces.push(`<span>计划 ${escapeHtml(project.stake)} U</span>`);
+  return pieces.join("") || `<span>${escapeHtml(project.state || "")}</span>`;
+}
+
+function projectSellItem(project) {
+  const holding = project.holding ?? {};
+  return {
+    all: true,
+    market: project.market,
+    title: project.title,
+    outcome: "全部选项",
+    chips: `${holding.sellableCount ?? 0} 个选项`,
+    cost: holding.cost,
+    sold: holding.sold,
+    value: holding.value,
+    realized: holding.realized,
+    unrealized: holding.unrealized,
+    grossPnl: holding.grossPnl,
+    gas: holding.gas,
+    gasBnb: holding.gasBnb,
+    pnl: holding.pnl,
+    pnlPct: holding.roi ?? "",
+    positive: holding.positive,
+    sellable: holding.sellable
+  };
 }
 
 function bindSellButtons(root = document) {
@@ -595,25 +676,6 @@ function bindSellButtons(root = document) {
     button.dataset.sellBound = "1";
     button.addEventListener("click", () => openSell(JSON.parse(button.dataset.sell)));
   }
-}
-
-function groupSellItem(group) {
-  return {
-    all: true,
-    market: group.market,
-    title: group.title,
-    outcome: "全部选项",
-    chips: `${group.sellableCount} 个选项`,
-    cost: group.cost,
-    sold: group.sold,
-    value: group.value,
-    realized: group.realized,
-    unrealized: group.unrealized,
-    pnl: group.pnl,
-    pnlPct: "",
-    positive: group.positive,
-    sellable: group.sellable
-  };
 }
 
 function renderPosition(item, { sellBlocked = false, sellBlockMessage = "" } = {}) {
@@ -625,11 +687,13 @@ function renderPosition(item, { sellBlocked = false, sellBlockMessage = "" } = {
         <div class="stat"><span>当前价</span><strong>${item.nowPrice}</strong></div>
         <div class="stat"><span>筹码</span><strong>${item.chips}</strong></div>
         <div class="stat"><span>投入</span><strong>${item.cost} U</strong></div>
-        <div class="stat"><span>卖出</span><strong>${item.sold} U</strong></div>
+        <div class="stat"><span>已卖出</span><strong>${item.sold} U</strong></div>
         <div class="stat"><span>当前</span><strong>${item.value} U</strong></div>
         <div class="stat"><span>已实现</span><strong class="${signedTone(item.realized)}">${item.realized} U</strong></div>
         <div class="stat"><span>未实现</span><strong class="${signedTone(item.unrealized)}">${item.unrealized} U</strong></div>
-        <div class="stat"><span>总盈亏</span><strong class="${item.positive ? "good" : "bad"}">${item.pnl} U</strong></div>
+        <div class="stat"><span>Gas</span><strong>${item.gas ?? "0"} U</strong></div>
+        <div class="stat"><span>毛盈亏</span><strong class="${signedTone(item.grossPnl ?? item.pnl)}">${item.grossPnl ?? item.pnl} U</strong></div>
+        <div class="stat"><span>净盈亏</span><strong class="${item.positive ? "good" : "bad"}">${item.pnl} U</strong></div>
         <div class="stat"><span>收益</span><strong class="${item.positive ? "good" : "bad"}">${item.pnlPct}</strong></div>
       </div>
       <button
@@ -640,28 +704,6 @@ function renderPosition(item, { sellBlocked = false, sellBlockMessage = "" } = {
       >${icon("badge-dollar-sign")}<span>卖出</span></button>
     </div>
   `;
-}
-
-function renderProjectStats(projects) {
-  els.projectCount.textContent = `${projects.length} 个`;
-  if (!projects.length) {
-    els.projectStats.innerHTML = `<div class="empty">暂无</div>`;
-    return;
-  }
-  els.projectStats.innerHTML = projects.map((project) => `
-    <div class="projectRow">
-      <div class="projectTitle" title="${escapeAttr(project.title)}">${escapeHtml(project.title)}</div>
-      <div class="projectNums">
-        <div class="stat"><span>买入</span><strong>${project.bought} U</strong></div>
-        <div class="stat"><span>卖出</span><strong>${project.sold} U</strong></div>
-        <div class="stat"><span>当前</span><strong>${project.openValue} U</strong></div>
-        <div class="stat"><span>已实现</span><strong class="${project.realizedPositive ? "good" : "bad"}">${project.realized} U</strong></div>
-        <div class="stat"><span>未实现</span><strong class="${project.unrealizedPositive ? "good" : "bad"}">${project.unrealized} U</strong></div>
-        <div class="stat"><span>总盈亏</span><strong class="${project.positive ? "good" : "bad"}">${project.pnl} U</strong></div>
-        <div class="stat"><span>收益</span><strong class="${project.positive ? "good" : "bad"}">${project.roi}</strong></div>
-      </div>
-    </div>
-  `).join("");
 }
 
 function renderExecution(rows) {
@@ -702,13 +744,19 @@ function renderStrategy(data) {
   els.stakeText.textContent = data.settings?.stakeText ?? "--";
   els.windowText.textContent = data.settings?.windowText ?? "--";
   els.autoSellText.textContent = data.settings?.autoSellText ?? "--";
+  const rules = data.settings?.ruleSummary ?? {};
+  if (els.ruleFilterText) els.ruleFilterText.textContent = rules.filterRule ?? "--";
+  if (els.ruleDisplayText) els.ruleDisplayText.textContent = rules.displayRule ?? "--";
+  if (els.ruleFollowText) els.ruleFollowText.textContent = rules.followRule ?? "--";
+  if (els.ruleNotifyText) els.ruleNotifyText.textContent = rules.notificationRule ?? "--";
   if (!state.configDirty && data.settings?.runtimeConfig) setRuntimeConfigForm(data.settings.runtimeConfig);
   const checks = [
     { label: "运行状态", value: data.bot.label, tone: data.bot.tone },
     { label: "资金状态", value: data.wallet ? `${data.wallet.label} · ${data.wallet.busdt} U / ${data.wallet.bnb} BNB` : "--", tone: data.wallet?.tone ?? "warn" },
     { label: "手动卖出", value: data.manualSell?.label ?? "--", tone: data.manualSell?.blocked ? "warn" : "good" },
     { label: "下一批市场", value: `${data.next.count} 场`, tone: data.next.count ? "warn" : "neutral" },
-    { label: "持仓数量", value: `${data.holdings.count} 个`, tone: data.holdings.count ? "good" : "neutral" }
+    { label: "持仓数量", value: `${data.holdings.count} 个`, tone: data.holdings.count ? "good" : "neutral" },
+    ...evidencePreflightRows(data.evidence)
   ];
   els.preflightList.innerHTML = checks.map((check) => `
     <div class="preflightRow">
@@ -718,13 +766,85 @@ function renderStrategy(data) {
   `).join("");
 }
 
+function evidencePreflightRows(evidence) {
+  const readiness = evidence?.readiness;
+  const firstBuy = evidence?.firstBuy;
+  const rows = [];
+  if (readiness) {
+    rows.push({
+      label: "Bot4 Readiness",
+      value: readiness.ok
+        ? `${phaseLabel(readiness.phase)} · OK`
+        : `${readiness.failedCount ?? "?"} 项未通过`,
+      tone: readiness.ok ? "good" : "bad"
+    });
+    rows.push({
+      label: "止损监控",
+      value: readiness.autoSellMonitorStarted ? "已启动 · 10% 全卖" : "未确认",
+      tone: readiness.autoSellMonitorStarted ? "good" : "warn"
+    });
+  }
+  if (firstBuy) {
+    rows.push({
+      label: "首次买入证据",
+      value: firstBuy.conclusion === "complete"
+        ? `Complete · ${firstBuy.txCount ?? 0} tx`
+        : firstBuy.conclusion === "timeout"
+          ? "Timeout"
+          : `Pending · ${formatShortIso(firstBuy.expectedBroadcastIso)}`,
+      tone: firstBuy.conclusion === "complete" ? "good" : firstBuy.conclusion === "timeout" ? "bad" : "warn"
+    });
+    const checks = firstBuy.checks ?? {};
+    rows.push({
+      label: "证据硬检查",
+      value: evidenceCheckSummary(checks),
+      tone: checks.noUnintendedBuys && checks.autoSellMonitorStarted && checks.stopLossConfigured ? "good" : "warn"
+    });
+  }
+  return rows;
+}
+
+function evidenceCheckSummary(checks) {
+  const passed = [
+    checks.botRunning,
+    checks.nextBatchKnown,
+    checks.scheduledOnTime,
+    checks.preSigned,
+    checks.broadcasted,
+    checks.broadcastStartedBefore20s,
+    checks.firstAcceptedRpc,
+    checks.outcomeOk,
+    checks.receiptSuccess,
+    checks.autoSellMonitorStarted,
+    checks.stopLossConfigured,
+    checks.noUnintendedBuys
+  ].filter(Boolean).length;
+  return `${passed}/12`;
+}
+
+function phaseLabel(value) {
+  if (value === "pre_open") return "开盘前";
+  if (value === "evidence_window") return "取证中";
+  if (value === "post_evidence_window") return "取证后";
+  return value || "--";
+}
+
+function formatShortIso(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return String(value);
+  return `${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")} ${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}:${String(date.getUTCSeconds()).padStart(2, "0")}Z`;
+}
+
 function setRuntimeConfigForm(config) {
   if (!config) return;
   els.configMode.value = config.filterMode ?? "price_only_test";
+  renderDisplayFilterOptions(config);
   els.configOutcomeCount.value = config.eventOutcomeCount ?? 2;
   els.configStakePerOutcome.value = config.stakePerOutcomeUsdt ?? 1;
   els.configMaxBatchStake.value = config.maxBatchStakeUsdt ?? 20;
   els.configGasPriceGwei.value = config.gasPriceGwei ?? 2;
+  els.configAutoSellGasPriceGwei.value = config.autoSellGasPriceGwei ?? "";
   els.configAutoSellEnabled.value = config.autoSellEnabled ? "1" : "0";
   els.configAutoSellStartDelay.value = config.autoSellStartDelaySeconds ?? 10;
   els.configAutoSellInterval.value = config.autoSellIntervalSeconds ?? 10;
@@ -736,11 +856,33 @@ function setRuntimeConfigForm(config) {
 
 function runtimeStatusText(config) {
   if (!config) return "--";
-  const mode = config.filterMode === "price_only_test" ? "只过滤 Price" : "生产过滤";
+  const mode = config.filterMode === "price_only_test"
+    ? "买入门槛：基础 Price/8hour 排除"
+    : "买入门槛：基础排除+时长门槛";
+  const filterCount = Array.isArray(config.eventDisplayFilterRules) ? config.eventDisplayFilterRules.length : 0;
+  const filterText = filterCount ? `过滤${filterCount}项` : "显示全部";
   const sell = config.autoSellEnabled
     ? `${config.autoSellStartDelaySeconds}s/${config.autoSellIntervalSeconds}s/${config.autoSellChunkPercent}%`
     : "卖出关";
-  return `${mode} · ${config.eventOutcomeCount} 档 · ${config.stakePerOutcomeUsdt}U/档 · gas ${config.gasPriceGwei} · ${sell}`;
+  const sellGas = config.autoSellGasPriceGwei ? `卖 gas ${config.autoSellGasPriceGwei}` : "卖 gas 同买入";
+  return `${mode} · ${filterText} · ${config.eventOutcomeCount} 档 · ${config.stakePerOutcomeUsdt}U/档 · 买 gas ${config.gasPriceGwei} · ${sellGas} · ${sell}`;
+}
+
+function renderDisplayFilterOptions(config) {
+  if (!els.configDisplayFilters) return;
+  const options = config.eventDisplayFilterRuleOptions
+    ?? state.runtimeConfigEditable?.displayFilterRules
+    ?? [];
+  const enabled = new Set(config.eventDisplayFilterRules ?? []);
+  els.configDisplayFilters.innerHTML = options.map((option) => `
+    <label class="filterRuleOption">
+      <input type="checkbox" name="configDisplayFilterRule" value="${escapeAttr(option.id)}" ${enabled.has(option.id) ? "checked" : ""}>
+      <span>
+        <strong>${escapeHtml(option.label)}</strong>
+        <span>${escapeHtml(option.description ?? "")}</span>
+      </span>
+    </label>
+  `).join("");
 }
 
 function openSell(item) {
@@ -757,7 +899,8 @@ function openSell(item) {
       <div class="stat"><span>当前价值</span><strong>${item.value} U</strong></div>
       <div class="stat"><span>已实现</span><strong class="${signedTone(item.realized)}">${item.realized} U</strong></div>
       <div class="stat"><span>未实现</span><strong class="${signedTone(item.unrealized)}">${item.unrealized} U</strong></div>
-      <div class="stat"><span>总盈亏</span><strong class="${item.positive ? "good" : "bad"}">${item.pnl} U</strong></div>
+      <div class="stat"><span>Gas</span><strong>${item.gas ?? "0"} U</strong></div>
+      <div class="stat"><span>净盈亏</span><strong class="${item.positive ? "good" : "bad"}">${item.pnl} U</strong></div>
       <div class="stat"><span>收益</span><strong class="${item.positive ? "good" : "bad"}">${item.pnlPct}</strong></div>
     </div>
   `;
@@ -917,6 +1060,11 @@ function bindNavigation() {
       toggleProjectExpansion(projectButton.dataset.expandProject);
       return;
     }
+    const historyProjectButton = event.target.closest("[data-expand-history-project]");
+    if (historyProjectButton) {
+      toggleHistoryProjectExpansion(historyProjectButton.dataset.expandHistoryProject);
+      return;
+    }
     const followButton = event.target.closest("[data-follow-action]");
     if (followButton) {
       void saveMarketFollow(followButton);
@@ -975,6 +1123,16 @@ function toggleProjectExpansion(address) {
     state.projectExpanded.delete(address);
   } else {
     state.projectExpanded.add(address);
+  }
+  if (state.data) renderProjectBoard(state.data.projectBoard);
+}
+
+function toggleHistoryProjectExpansion(address) {
+  if (!address) return;
+  if (state.historyExpanded.has(address)) {
+    state.historyExpanded.delete(address);
+  } else {
+    state.historyExpanded.add(address);
   }
   if (state.data) renderProjectBoard(state.data.projectBoard);
 }
@@ -1052,6 +1210,7 @@ function bindRuntimeConfigControls() {
     els.configStakePerOutcome,
     els.configMaxBatchStake,
     els.configGasPriceGwei,
+    els.configAutoSellGasPriceGwei,
     els.configAutoSellEnabled,
     els.configAutoSellStartDelay,
     els.configAutoSellInterval,
@@ -1065,6 +1224,10 @@ function bindRuntimeConfigControls() {
       els.configStatus.textContent = "未应用";
     });
   }
+  els.configDisplayFilters?.addEventListener("change", () => {
+    state.configDirty = true;
+    els.configStatus.textContent = "未应用";
+  });
   els.configAdminToken?.addEventListener("input", () => {
     localStorage.setItem("42spaceAdminToken", els.configAdminToken.value);
   });
@@ -1090,13 +1253,15 @@ async function saveRuntimeConfig(event) {
     stakePerOutcomeUsdt: Number(els.configStakePerOutcome.value),
     maxBatchStakeUsdt: Number(els.configMaxBatchStake.value),
     gasPriceGwei: String(els.configGasPriceGwei.value),
+    autoSellGasPriceGwei: String(els.configAutoSellGasPriceGwei.value).trim(),
     autoSellEnabled: els.configAutoSellEnabled.value === "1",
     autoSellStartDelaySeconds: Number(els.configAutoSellStartDelay.value),
     autoSellIntervalSeconds: Number(els.configAutoSellInterval.value),
     autoSellChunkPercent: Number(els.configAutoSellChunk.value),
     autoSellStopLossEnabled: els.configAutoSellStopLossEnabled.value === "1",
     autoSellStopLossPercent: Number(els.configAutoSellStopLoss.value),
-    autoSellStopLossSellPercent: Number(els.configAutoSellStopLossSell.value)
+    autoSellStopLossSellPercent: Number(els.configAutoSellStopLossSell.value),
+    eventDisplayFilterRules: selectedDisplayFilterRules()
   };
   els.saveConfigBtn.disabled = true;
   try {
@@ -1117,6 +1282,12 @@ async function saveRuntimeConfig(event) {
   } finally {
     els.saveConfigBtn.disabled = false;
   }
+}
+
+function selectedDisplayFilterRules() {
+  return [...(els.configDisplayFilters?.querySelectorAll("input[name='configDisplayFilterRule']:checked") ?? [])]
+    .map((input) => input.value)
+    .filter(Boolean);
 }
 
 function setRoute(route, { replace = false } = {}) {
@@ -1170,7 +1341,7 @@ function splitActivityTitle(value) {
 }
 
 function activityTone(label) {
-  if (label === "卖出" || label === "手动卖出" || label === "自动卖出") return "sell";
+  if (label === "卖出" || label === "手动卖出" || label === "自动卖出" || label === "结算") return "sell";
   if (label === "买入" || label === "买入成功") return "buy";
   if (label === "买入失败" || label === "禁止买入") return "badTone";
   if (label === "等待确认") return "wait";
