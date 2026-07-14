@@ -137,8 +137,30 @@ export const FOLLOW_RULE_EVENT_LIBRARY = [
     }
   },
   {
+    id: "meme-fdv-price-resolution-not-price-filtered",
+    note: "Meme FDV markets that mention price in resolution text or subcategory must not be hidden by the display Price filter.",
+    market: eventMarket({
+      address: "0x21593B06B62aad3108cC984E8605c13139eB4D25",
+      question: "$ARROW FDV by July 10th, 12:00 UTC?",
+      categories: ["Crypto", "Meme"],
+      subcategories: ["Prices"],
+      tags: ["Normal"],
+      description: "FDV is calculated as Price x Maximum Supply. Resolution uses price data from DEX Screener."
+    }),
+    expected: {
+      eligible: true,
+      reason: "eligible",
+      defaultFollowed: true,
+      tagsAny: ["Meme 默认关注"],
+      displayVisible: true,
+      displayNotify: true,
+      displayReason: "display-meme",
+      displayTagsAny: ["Meme"]
+    }
+  },
+  {
     id: "price-range-still-excluded",
-    note: "Price events remain excluded even if they are common in the feed.",
+    note: "BTC Price events remain excluded even if they are common in the feed.",
     market: eventMarket({
       address: "0x0000000000000000000000000000000000005108",
       question: "BTC price range, Jun 6th?",

@@ -8,21 +8,25 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import readline from "node:readline/promises";
 import { promisify } from "node:util";
-import { formatUnits, parseGwei, parseUnits } from "viem";
+import { decodeFunctionData, formatUnits, parseGwei, parseUnits } from "viem";
 import WebSocket from "ws";
 import { appendJsonl, loadSeen, normalizeRuntimeConfig, parseArgs, readConfig, saveSeen } from "./config.js";
 import { appendGasLedgerEntries, bnbUsdtPriceForBlock, buildGasLedgerEntry } from "./gas-ledger.js";
 import {
   approveRouterMax,
+  applyBuilderBundleTimingPreset,
   assertExecutionAllowed,
   buildDirectSellPlan,
   buildFastBuyBundlePlan,
+  buildBuilderBundleDryRun,
   buildDirectBuyAllOutcomesPlan,
   buildMarketFromCreationLog,
   buildMarketsFromControllerLogs,
   buyOutcomesBatch,
+  broadcastPreSignedFastTransaction,
   broadcastSignedTransaction,
   calculateFastGasReserve,
+  clearTimestampGuardFallbackTransactions,
   describeFastBundlePlan,
   describeEventPlan,
   describeSellPlan,
@@ -37,6 +41,7 @@ import {
   fetchOpenPositions,
   getWalletStatus,
   getWalletStatusForAddress,
+  getTimestampGuardFallbackTransactions,
   makeClients,
   makeWsClient,
   preSignSellOutcomesBatch,
@@ -44,11 +49,14 @@ import {
   preSignFastBuyTransaction,
   quoteSellOutcome,
   quoteBuyAllOutcomes,
+  resolveBuilderBundleTimingPreset,
   resolveWalletBudgetGasLimit,
   roundDownSellAmount,
   sellOutcome,
   sellOutcomesBatch,
   simulateMintAmount,
+  submitPreSignedBuilderBundle,
+  warmBuilderBundleClient,
   warmBroadcastRpcClients,
   withPrebuiltFastExecution,
   watchControllerLogs
@@ -63,27 +71,38 @@ import {
   selectEventMarket,
   summarizeEventMarket
 } from "./event-strategy.js";
-import { isSportsExactScoreMarket, isSportsSideMarketQuestion } from "./event-intel.js";
+import { isMemeIntelMarket, isSportsExactScoreMarket, isSportsSideMarketQuestion } from "./event-intel.js";
 import {
   annotateBot3FifaExactScorePlan,
+  BOT3_FIFA_EXACT_SCORE_AUTO_OUTCOME_COUNT,
   bot3FifaExactScoreAutoBuyActive,
   bot3FifaExactScoreConfigForMarket,
   previewBot3FifaExactScoreMarket
 } from "./bot3-fifa-exact-score.js";
 import { FOLLOW_RULE_EVENT_LIBRARY, FOLLOW_RULE_LIBRARY_CONFIG } from "./event-library.js";
 import { isMarketFollowBlocked } from "./market-follow.js";
+import {
+  lockedMemeRangeOutcomeNames,
+  runMemeRangeSelectionSelfTest
+} from "./meme-range-selection.js";
+import { encodeTimedBuyExecutorCall, TIMED_BUY_EXECUTOR_ABI } from "./timed-buy-executor.js";
 
 const execFileAsync = promisify(execFile);
 const PUBLIC_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const alertCooldowns = new Map();
 const marketDecisionDedupe = new Set();
+const builderTargetExpiryWatches = new Set();
 const plannedBuysFileCache = new Map();
+const memeRangeSelectionFileCache = new Map();
+const autoSellBuyRecordsCache = new Map();
 const WILL_BUY_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SELL_BATCH_BASE_GAS = 1_500_000;
 const SELL_BATCH_PER_OUTCOME_GAS = 1_000_000;
 const OPERATOR_APPROVAL_GAS = 250_000;
 const AUTO_SELL_TRANSIENT_POSITIONS_ALERT_AFTER = 12;
+const RUNTIME_HEALTH_INTERVAL_MS = 5000;
+let runtimeHealthWriteWarningAt = 0;
 
 async function main() {
   const [command = "scan", ...rest] = process.argv.slice(2);
@@ -590,6 +609,8 @@ async function status(cfg, args) {
         : (unfundedAddressSet.has(String(market.address).toLowerCase()) ? "insufficient-funds" : "future"),
       prepared: Boolean(record.preparedPlan),
       prepareError: record.prepareError,
+      selectedOutcomes: record.preparedPlan?.outcomes?.map((outcome) => outcome.name) ?? [],
+      selection: record.preparedPlan?.selection ?? null,
       transactionHash: market.transactionHash,
       blockNumber: market.blockNumber
     };
@@ -617,6 +638,12 @@ async function status(cfg, args) {
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+      memeRangeSelectionEnabled: cfg.memeRangeSelectionEnabled,
+      memeRangeSelectionFile: cfg.memeRangeSelectionFile,
+      memeRangeSelectionOutcomeCount: cfg.memeRangeSelectionOutcomeCount,
+      memeRangeSelectionPolicy: cfg.memeRangeSelectionEnabled
+        ? "first_observation_lock_then_middle_fallback"
+        : "disabled",
       filterMode: cfg.filterMode ?? "production",
       marketQuestionAllowlistRegex: cfg.marketQuestionAllowlistRegex?.source ?? null,
       autoSellEnabled: cfg.autoSellEnabled,
@@ -624,6 +651,8 @@ async function status(cfg, args) {
       autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
+      autoSellLadderProfitPercent: cfg.autoSellLadderProfitPercent,
+      autoSellTakeProfitSteps: cfg.autoSellTakeProfitSteps,
       autoSellApplyAfterIso: cfg.autoSellApplyAfterIso,
       autoSellOpenExitDelaySeconds: cfg.autoSellOpenExitDelaySeconds,
       autoSellOpenExitPercent: cfg.autoSellOpenExitPercent,
@@ -652,6 +681,7 @@ async function status(cfg, args) {
       fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
       fanoutBroadcast: cfg.fanoutBroadcast,
       broadcastRpcCount: cfg.broadcastRpcUrls.length,
+      builderBundle: builderBundleConfigSummary(cfg),
       preSignFastTx: cfg.preSignFastTx,
       preSignWindowMs: cfg.preSignWindowMs,
       preSignRetryMs: cfg.preSignRetryMs,
@@ -687,6 +717,8 @@ async function status(cfg, args) {
       autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
+      autoSellLadderProfitPercent: cfg.autoSellLadderProfitPercent,
+      autoSellTakeProfitSteps: cfg.autoSellTakeProfitSteps,
       autoSellApplyAfterIso: cfg.autoSellApplyAfterIso,
       autoSellOpenExitDelaySeconds: cfg.autoSellOpenExitDelaySeconds,
       autoSellOpenExitPercent: cfg.autoSellOpenExitPercent,
@@ -873,6 +905,8 @@ async function bench(cfg, args) {
       autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
       autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
       autoSellChunkPercent: cfg.autoSellChunkPercent,
+      autoSellLadderProfitPercent: cfg.autoSellLadderProfitPercent,
+      autoSellTakeProfitSteps: cfg.autoSellTakeProfitSteps,
       autoSellFastOpenExitEnabled: cfg.autoSellFastOpenExitEnabled,
       autoSellFastOpenExitMinDelayMs: cfg.autoSellFastOpenExitMinDelayMs,
       autoSellFastOpenExitMaxDelayMs: cfg.autoSellFastOpenExitMaxDelayMs,
@@ -1305,7 +1339,7 @@ async function rpc(cfg) {
 }
 
 async function presignTest(cfg, args) {
-  const { chain, batch, startDate, testCfg, runtime, records } = await buildPresignTestRecords(cfg, args);
+  const { chain, batch, startDate, testCfg, runtime, records, signerMode } = await buildPresignTestRecords(cfg, args);
 
   const signStart = performance.now();
   const preSignMode = records.length > 1 ? "bundle" : "single";
@@ -1327,7 +1361,10 @@ async function presignTest(cfg, args) {
 
   console.log(JSON.stringify({
     level: "event-presign-test",
-    note: "offline presign/cache test only; uses a public test private key and does not broadcast",
+    note: signerMode === "profile"
+      ? "offline presign/cache test only; uses the loaded profile signer to validate Executor operator access and never broadcasts"
+      : "offline presign/cache test only; uses a public test private key and does not broadcast",
+    signerMode,
     chainLoad: {
       source: chain.discoverySource,
       head: chain.head,
@@ -1379,7 +1416,7 @@ async function presignTest(cfg, args) {
 }
 
 async function dueTest(cfg, args) {
-  const { chain, batch, startDate, testCfg, runtime, records } = await buildPresignTestRecords(cfg, args);
+  const { chain, batch, startDate, testCfg, runtime, records, signerMode } = await buildPresignTestRecords(cfg, args);
   const preSignMode = records.length > 1 ? "bundle" : "single";
   if (preSignMode === "bundle") {
     await attachPreSignedFastBundleTransaction(testCfg, records, runtime);
@@ -1399,11 +1436,21 @@ async function dueTest(cfg, args) {
     stateFile: `/tmp/42space-due-test-seen-${Date.now()}.json`,
     fillsFile: `/tmp/42space-due-test-fills-${Date.now()}.jsonl`
   };
-  const forcedStartDate = new Date(Date.now() - 1000).toISOString();
+  const forcedAt = Date.now();
+  const forcedStarts = [];
   const pending = new Map();
   const seen = new Set();
   for (const record of records) {
+    const actionCfg = actionConfigForRecord(record, dueCfg);
+    const actionDelayMs = effectivePostOpenBroadcastDelayMs(actionCfg);
+    const forcedStartDate = new Date(forcedAt - actionDelayMs - 10).toISOString();
     record.market = { ...record.market, startDate: forcedStartDate };
+    forcedStarts.push({
+      market: record.market.address,
+      question: record.market.question,
+      actionDelayMs,
+      forcedStartDate
+    });
     pending.set(eventSeenKey(record.market, dueCfg), record);
   }
 
@@ -1413,7 +1460,10 @@ async function dueTest(cfg, args) {
 
   console.log(JSON.stringify({
     level: "event-due-test",
-    note: "offline due-path test only; uses a public test private key for pre-signing and dry-run execution, no broadcast",
+    note: signerMode === "profile"
+      ? "offline due-path test only; uses the loaded profile signer, forces each record just past its configured action time, and never broadcasts"
+      : "offline due-path test only; uses a public test private key for pre-signing and dry-run execution, no broadcast",
+    signerMode,
     chainLoad: {
       source: chain.discoverySource,
       head: chain.head,
@@ -1422,7 +1472,7 @@ async function dueTest(cfg, args) {
     },
     marketBatch: {
       originalStartDate: startDate,
-      forcedStartDate,
+      forcedStarts,
       marketCount: batch.length,
       outcomeCount: batchSelectedOutcomeCount(batch, dueCfg),
       availableOutcomeCount: batch.reduce((sum, market) => sum + (market.outcomes?.length ?? 0), 0),
@@ -1441,7 +1491,7 @@ async function dueTest(cfg, args) {
       dryRun: dueCfg.dryRun,
       fillsFile: dueCfg.fillsFile,
       stateFile: dueCfg.stateFile,
-      usedCachedBundleBeforeDrain: Boolean(cachedBundle)
+      usedCachedBundleBeforeDrain: Boolean(cachedBundle ?? signed)
     },
     runtime: {
       startNonce: 1000,
@@ -1689,6 +1739,8 @@ async function selfTest(cfg) {
   };
   const passed = [];
 
+  passed.push(...await runMemeRangeSelectionSelfTest());
+
   const lowestOddsPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket(), testCfg);
   assertSelfTest(
     lowestOddsPlan.selection?.rankSource === "payout",
@@ -1738,6 +1790,133 @@ async function selfTest(cfg) {
   );
   assertSelfTest(middlePlan.totalStakeUsdt === 18, `expected middle plan total 18U, got ${middlePlan.totalStakeUsdt}`);
   passed.push("middle selection buys the centered three outcomes at the configured stake");
+
+  const firstPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket(), {
+    ...testCfg,
+    eventOutcomeSelection: "first",
+    eventOutcomeCount: 3,
+    stakePerOutcomeUsdt: 10,
+    maxMarketStakeUsdt: 30
+  });
+  assertSelfTest(
+    firstPlan.selection?.rankSource === "token_order",
+    `expected token_order first selection, got ${firstPlan.selection?.rankSource}`
+  );
+  assertArrayEqual(
+    firstPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["1", "2", "4"],
+    "first outcome selection"
+  );
+  assertSelfTest(firstPlan.totalStakeUsdt === 30, `expected first plan total 30U, got ${firstPlan.totalStakeUsdt}`);
+  passed.push("first selection buys the first configured outcomes by token order");
+
+  const bot2MemeMarket = mockEventMarket({
+    question: "$TEST FDV by July 20th?",
+    categories: ["Crypto", "Meme"],
+    memeRangeSelection: {
+      locked: true,
+      mode: "metric_adjacent",
+      metric: "fdv",
+      market: "0x0000000000000000000000000000000000000042",
+      matchedOutcomeName: "D",
+      selectedOutcomeNames: ["C", "D", "E"],
+      evidence: { computedValue: 12_000_000 },
+      source: { provider: "dexscreener" },
+      lockedAt: "2026-07-11T00:00:00.000Z"
+    }
+  });
+  const bot2MemeCfg = eventBuyConfigForMarket({
+    ...testCfg,
+    botName: "Bot2 Console",
+    profileRole: "",
+    memeRangeSelectionEnabled: true,
+    memeRangeSelectionOutcomeCount: 5,
+    eventOutcomeSelection: "first",
+    eventOutcomeCount: 3,
+    stakePerOutcomeUsdt: 10,
+    maxMarketStakeUsdt: 50,
+    maxBatchStakeUsdt: 50
+  }, bot2MemeMarket);
+  const bot2MemePlan = annotateBuyConfigPlan(buildDirectBuyAllOutcomesPlan(bot2MemeMarket, bot2MemeCfg), bot2MemeCfg);
+  assertArrayEqual(bot2MemePlan.outcomes.map((outcome) => outcome.name), ["B", "C", "D", "E", "F"], "Bot2 locked Meme metric selection");
+  assertSelfTest(bot2MemePlan.totalStakeUsdt === 50, `expected Bot2 Meme plan total 50U, got ${bot2MemePlan.totalStakeUsdt}`);
+  assertSelfTest(bot2MemePlan.selection?.memeRangeSelection, "Bot2 Meme plan should retain lock evidence");
+  passed.push("Bot2/Bot5 Meme buys consume locked metric-adjacent outcome names");
+
+  const bot2MemeFallbackMarket = { ...bot2MemeMarket, memeRangeSelection: null };
+  const bot2MemeFallbackCfg = eventBuyConfigForMarket({
+    ...bot2MemeCfg,
+    eventOutcomeSelection: "first"
+  }, bot2MemeFallbackMarket);
+  const bot2MemeFallbackPlan = annotateBuyConfigPlan(
+    buildDirectBuyAllOutcomesPlan(bot2MemeFallbackMarket, bot2MemeFallbackCfg),
+    bot2MemeFallbackCfg
+  );
+  assertArrayEqual(bot2MemeFallbackPlan.outcomes.map((outcome) => outcome.name), ["A", "B", "C", "D", "E"], "Bot2 Meme middle fallback");
+  assertSelfTest(
+    bot2MemeFallbackPlan.selection?.memeRangeSelectionMode === "middle_fallback",
+    "Bot2 Meme fallback should be auditable"
+  );
+  passed.push("Bot2/Bot5 unsupported Meme events fall back to middle three outcomes");
+
+  const memeLockDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-meme-lock-test-"));
+  try {
+    const memeLockFile = path.join(memeLockDir, "locks.jsonl");
+    fs.writeFileSync(memeLockFile, `${JSON.stringify({
+      level: "meme-range-selection-lock",
+      market: bot2MemeMarket.address,
+      selection: bot2MemeMarket.memeRangeSelection
+    })}\n{\"partial\":`, "utf8");
+    const sharedLockCfg = eventBuyConfigForMarket({
+      ...bot2MemeCfg,
+      memeRangeSelectionFile: memeLockFile
+    }, bot2MemeFallbackMarket);
+    const sharedLockPlan = annotateBuyConfigPlan(
+      buildDirectBuyAllOutcomesPlan(bot2MemeFallbackMarket, sharedLockCfg),
+      sharedLockCfg
+    );
+    assertArrayEqual(sharedLockPlan.outcomes.map((outcome) => outcome.name), ["B", "C", "D", "E", "F"], "shared Meme lock file selection");
+    passed.push("Bot2/Bot5 read the same durable Meme lock and tolerate a partial trailing row");
+
+    const memePriceMarket = {
+      ...bot2MemeFallbackMarket,
+      question: "$PUMP price range by July 20th?",
+      categories: ["Crypto", "Meme"]
+    };
+    const memePriceLock = {
+      ...bot2MemeMarket.memeRangeSelection,
+      metric: "price",
+      matchedOutcomeName: "D"
+    };
+    fs.writeFileSync(memeLockFile, `${JSON.stringify({
+      level: "meme-range-selection-lock",
+      market: memePriceMarket.address,
+      selection: memePriceLock
+    })}\n`, "utf8");
+    const memePriceCfg = {
+      ...bot2MemeCfg,
+      memeRangeSelectionFile: memeLockFile,
+      eventIntelBuyFilter: "strong",
+      minEventDurationHours: 0,
+      minMarketCreatedAt: null,
+      marketCategoryBlocklist: ["Price"],
+      marketTagBlocklist: ["Price"]
+    };
+    const memePriceDecision = marketFilterDecision(memePriceMarket, memePriceCfg);
+    assertSelfTest(memePriceDecision.eligible, `locked Meme price range should be eligible: ${JSON.stringify(memePriceDecision)}`);
+    const nonMemePriceDecision = marketFilterDecision({
+      ...memePriceMarket,
+      question: "$SOL price range by July 20th?",
+      categories: ["Crypto"]
+    }, memePriceCfg);
+    assertSelfTest(
+      !nonMemePriceDecision.eligible && nonMemePriceDecision.reason === "price-market",
+      `non-Meme price range must remain blocked: ${JSON.stringify(nonMemePriceDecision)}`
+    );
+    passed.push("locked Meme price ranges bypass Price blocking without enabling non-Meme price markets");
+  } finally {
+    fs.rmSync(memeLockDir, { recursive: true, force: true });
+  }
 
   const namedLargePlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
     address: "0x0000000000000000000000000000000000000942",
@@ -1796,8 +1975,29 @@ async function selfTest(cfg) {
   assertSelfTest(fifaPreview.selectedSide === "home_win", `expected home_win side, got ${fifaPreview.selectedSide}`);
   assertArrayEqual(
     fifaPreview.selectedOutcomeNames,
-    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 2-1 CUW"],
+    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW", "ECU 2-1 CUW", "ECU 3-1 CUW"],
     "Bot3 FIFA exact-score preview selected home win tier"
+  );
+  const fifaPreviewWithNonUniformAddedScores = previewBot3FifaExactScoreMarket({
+    ...fifaExactScoreMarket,
+    outcomes: mockFifaExactScoreOutcomes({
+      homePrice: 0.22,
+      awayPrice: 0.35,
+      drawPrice: 0.9
+    }).map((outcome) => {
+      if (outcome.name === "ECU 3-0 CUW") return { ...outcome, price: 0.24 };
+      if (outcome.name === "ECU 3-1 CUW") return { ...outcome, price: 0.25 };
+      return outcome;
+    })
+  });
+  assertSelfTest(
+    !fifaPreviewWithNonUniformAddedScores.skipReason,
+    `FIFA exact-score preview should not require added score prices to be uniform, got ${fifaPreviewWithNonUniformAddedScores.skipReason}`
+  );
+  assertArrayEqual(
+    fifaPreviewWithNonUniformAddedScores.selectedOutcomeNames,
+    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW", "ECU 2-1 CUW", "ECU 3-1 CUW"],
+    "Bot3 FIFA exact-score preview keeps five-score selection when added score prices differ"
   );
   const fifaAwayMarket = {
     ...fifaExactScoreMarket,
@@ -1810,7 +2010,7 @@ async function selfTest(cfg) {
   };
   assertArrayEqual(
     previewBot3FifaExactScoreMarket(fifaAwayMarket).selectedOutcomeNames,
-    ["ECU 0-1 CUW", "ECU 0-2 CUW", "ECU 1-2 CUW"],
+    ["ECU 0-1 CUW", "ECU 0-2 CUW", "ECU 0-3 CUW", "ECU 1-2 CUW", "ECU 1-3 CUW"],
     "Bot3 FIFA exact-score preview selected away win tier"
   );
   const sideMarketPreview = previewBot3FifaExactScoreMarket({
@@ -1840,21 +2040,78 @@ async function selfTest(cfg) {
   const bot3AutoPlan = annotateBuyConfigPlan(buildDirectBuyAllOutcomesPlan(fifaExactScoreMarket, bot3AutoBuyCfg), bot3AutoBuyCfg);
   assertArrayEqual(
     bot3AutoPlan.outcomes.map((outcome) => outcome.name),
-    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 2-1 CUW"],
+    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW", "ECU 2-1 CUW", "ECU 3-1 CUW"],
     "Bot3 FIFA auto plan selected names"
   );
-  assertSelfTest(bot3AutoPlan.totalStakeUsdt === 3, `Bot3 FIFA auto plan should use 1U x 3, got ${bot3AutoPlan.totalStakeUsdt}`);
+  assertSelfTest(bot3AutoPlan.totalStakeUsdt === 5, `Bot3 FIFA auto plan should use 1U x 5, got ${bot3AutoPlan.totalStakeUsdt}`);
   assertSelfTest(bot3AutoPlan.selection?.bot3FifaExactScoreAutoBuy, "Bot3 FIFA auto plan should be annotated");
   const bot3AutoFunding = computeFundingRequirement(bot3AutoCfg, []);
   assertSelfTest(
-    bot3AutoFunding.requiredBusdt === 3 && bot3AutoFunding.reason === "bot3_fifa_exact_score_auto_single_market_fallback",
-    `Bot3 FIFA auto funding fallback should require 3U before the next batch is known, got ${JSON.stringify(bot3AutoFunding)}`
+    bot3AutoFunding.requiredBusdt === 5 && bot3AutoFunding.reason === "bot3_fifa_exact_score_auto_single_market_fallback",
+    `Bot3 FIFA auto funding fallback should require 5U before the next batch is known, got ${JSON.stringify(bot3AutoFunding)}`
   );
   assertSelfTest(
     !marketFilterDecision(fifaExactScoreMarket, { ...bot3AutoCfg, botName: "42space-2" }).eligible,
     "Bot3 FIFA auto switch should not activate on Bot2"
   );
-  passed.push("Bot3 FIFA exact-score preview and 1U auto selection are profile-gated");
+  const bot1ExactScoreAutoCfg = {
+    ...bot3AutoCfg,
+    botName: "Bot1 Console",
+    profileRole: "bot3_like"
+  };
+  const bot1ExactScoreDecision = marketFilterDecision(fifaExactScoreMarket, bot1ExactScoreAutoCfg);
+  assertSelfTest(
+    bot1ExactScoreDecision.eligible && bot1ExactScoreDecision.reason === "bot3-fifa-exact-score-auto-buy",
+    `Bot1 bot3_like should activate the exact-score selector, got ${JSON.stringify(bot1ExactScoreDecision)}`
+  );
+  assertArrayEqual(
+    buildDirectBuyAllOutcomesPlan(
+      fifaExactScoreMarket,
+      eventBuyConfigForMarket(bot1ExactScoreAutoCfg, fifaExactScoreMarket)
+    ).outcomes.map((outcome) => outcome.name),
+    ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW", "ECU 2-1 CUW", "ECU 3-1 CUW"],
+    "Bot1 bot3_like exact-score selection"
+  );
+  passed.push("Bot3 and bot3_like FIFA exact-score preview and 1U auto selection are profile-gated");
+
+  const runtimeHealthDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-runtime-health-test-"));
+  try {
+    const runtimeHealthFile = path.join(runtimeHealthDir, "runtime-health.json");
+    const runtimeHealthCfg = {
+      ...bot1ExactScoreAutoCfg,
+      runtimeHealthFile,
+      dryRun: false,
+      execute: true,
+      autoSellEnabled: true,
+      autoSellStrategy: "pre_start_exit"
+    };
+    const runtimeHealth = createRuntimeHealthState(runtimeHealthCfg);
+    const healthRuntime = {
+      health: runtimeHealth,
+      pendingBuyRecords: new Map([["market", { preparedPlan: { market: "test" } }]]),
+      txLock: { owner: null, since: null }
+    };
+    refreshRuntimeHealthSnapshot(healthRuntime, Date.parse("2026-07-11T00:00:00.000Z"));
+    markAutoSellHealthStarted(healthRuntime, "2026-07-11T00:00:01.000Z");
+    markAutoSellHealthCompleted(healthRuntime, { checked: 3, triggered: 1, executed: 1, errors: [] }, "2026-07-11T00:00:02.000Z");
+    markAutoSellHealthCompleted(healthRuntime, {
+      checked: 0,
+      triggered: 0,
+      executed: 0,
+      errors: [],
+      skippedReason: "open-buy-window",
+      pause: { until: "2026-07-11T00:01:00.000Z" }
+    }, "2026-07-11T00:00:03.000Z");
+    saveRuntimeHealth(runtimeHealthFile, healthRuntime.health);
+    const savedHealth = JSON.parse(fs.readFileSync(runtimeHealthFile, "utf8"));
+    assertSelfTest(savedHealth.buy.policy === "fifa_exact_score_lowest_price_tier", "runtime health should expose exact-score buy policy");
+    assertSelfTest(savedHealth.buy.pendingCount === 1 && savedHealth.buy.preparedCount === 1, "runtime health should expose pending/prepared counts");
+    assertSelfTest(savedHealth.sell.checked === 3 && savedHealth.sell.executed === 1, "runtime health should expose auto-sell scan evidence");
+    assertSelfTest(savedHealth.sell.state === "guarded" && savedHealth.sell.guardUntil, "runtime health should expose temporary buy protection without erasing scan evidence");
+    passed.push("runtime health records automatic buy heartbeat and automatic sell scan evidence");
+  } finally {
+    fs.rmSync(runtimeHealthDir, { recursive: true, force: true });
+  }
 
   const plannedBuyDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-planned-buy-test-"));
   try {
@@ -1916,6 +2173,21 @@ async function selfTest(cfg) {
         { tokenId: "4", name: "$300M - $450M" }
       ]
     });
+    const pricePlannedMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000001149",
+      question: "Micron Technology (MU) price range, end of July 15th?",
+      categories: ["Finance"],
+      subcategories: ["Prices"],
+      tags: ["Normal"],
+      startDate: new Date(Date.now() + 120000).toISOString(),
+      outcomes: [
+        { tokenId: "1", name: "< $850" },
+        { tokenId: "2", name: "$850 - $900" },
+        { tokenId: "4", name: "$900 - $950" },
+        { tokenId: "8", name: "$950 - $1000" },
+        { tokenId: "16", name: "$1000 - $1050" }
+      ]
+    });
     const plannedOverridesAutoMarket = mockEventMarket({
       address: "0x0000000000000000000000000000000000001151",
       question: "Ecuador vs Curacao",
@@ -1933,10 +2205,15 @@ async function selfTest(cfg) {
         {
           market: plannedMarket.address,
           outcomes: ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW"],
-          stakePerOutcomeUsdt: 10
+          stakePerOutcomeUsdt: 10,
+          stakeByOutcomeUsdt: {
+            "ECU 1-0 CUW": 20
+          }
         },
         {
           market: holdMarket.address,
+          enabled: false,
+          preserveAutoSellAfterDisable: true,
           outcomes: ["HOLD 1"],
           stakePerOutcomeUsdt: 2,
           autoSell: {
@@ -1952,6 +2229,22 @@ async function selfTest(cfg) {
           openBroadcastDelayMs: 20000,
           gasPriceGwei: "0.15",
           broadcastRpcUrls: ["https://rpc-a.example", "https://rpc-b.example"],
+          builderBundle: {
+            enabled: true,
+            mode: "builder_then_fanout",
+            tipBnb: "0.005",
+            tipGasPriceGwei: "1",
+            maxBlocks: 4,
+            maxTimestampOffsetSeconds: 12,
+            fanoutDelayMs: 120,
+            timingMode: "first_20s_block",
+            prepositionLeadMs: 300,
+            fallbackSafetyMs: 100,
+            earlySubmitLeadMs: 900,
+            minTimestampOffsetMs: 20000,
+            positionFirst: true,
+            timeoutMs: 750
+          },
           autoSell: {
             strategy: "pre_start_exit",
             beforeMarketStartSeconds: 36000,
@@ -1980,6 +2273,11 @@ async function selfTest(cfg) {
           gasPriceGwei: "0.15"
         },
         {
+          market: pricePlannedMarket.address,
+          outcomes: ["$900 - $950", "$950 - $1000", "$1000 - $1050"],
+          stakePerOutcomeUsdt: 10
+        },
+        {
           market: plannedOverridesAutoMarket.address,
           outcomes: ["ECU 0-1 CUW", "ECU 0-2 CUW", "ECU 1-2 CUW"],
           stakePerOutcomeUsdt: 2
@@ -2001,15 +2299,52 @@ async function selfTest(cfg) {
     const plannedBuyCfg = plannedBuyConfigForMarket(plannedCfg, plannedMarket);
     const plannedPlan = annotatePlannedBuyPlan(buildDirectBuyAllOutcomesPlan(plannedMarket, plannedBuyCfg), plannedBuyCfg);
     const plannedExecutionCfg = executionConfigForPlan(plannedCfg, plannedPlan);
+    const bot2PlannedCfg = eventBuyConfigForMarket({
+      ...plannedCfg,
+      botName: "Bot2 Console",
+      memeRangeSelectionEnabled: true
+    }, {
+      ...plannedMarket,
+      categories: ["Crypto", "Meme"],
+      memeRangeSelection: bot2MemeMarket.memeRangeSelection
+    });
+    const bot5PlannedCfg = eventBuyConfigForMarket({
+      ...plannedCfg,
+      botName: "42space-5",
+      memeRangeSelectionEnabled: true
+    }, {
+      ...plannedMarket,
+      categories: ["Crypto", "Meme"],
+      memeRangeSelection: bot2MemeMarket.memeRangeSelection
+    });
     assertArrayEqual(
       plannedPlan.outcomes.map((outcome) => outcome.name),
       ["ECU 1-0 CUW", "ECU 2-0 CUW", "ECU 3-0 CUW"],
       "planned buy outcome selection"
     );
     assertSelfTest(plannedPlan.selection?.plannedBuy, "planned buy plan should be marked");
-    assertSelfTest(plannedPlan.totalStakeUsdt === 30, `expected planned buy total 30U, got ${plannedPlan.totalStakeUsdt}`);
-    assertSelfTest(plannedBuyCfg.maxStakeUsdt === 10, `expected planned config maxStakeUsdt 10U, got ${plannedBuyCfg.maxStakeUsdt}`);
-    assertSelfTest(plannedExecutionCfg.maxStakeUsdt === 10, `expected planned execution maxStakeUsdt 10U, got ${plannedExecutionCfg.maxStakeUsdt}`);
+    assertArrayEqual(
+      plannedPlan.outcomes.map((outcome) => outcome.stakeUsdt),
+      [20, 10, 10],
+      "planned buy outcome-specific stakes"
+    );
+    assertSelfTest(plannedPlan.totalStakeUsdt === 40, `expected planned buy total 40U, got ${plannedPlan.totalStakeUsdt}`);
+    assertSelfTest(selectedStakeUsdt(plannedMarket, plannedCfg) === 40, "planned funding should use outcome-specific total stake");
+    assertSelfTest(plannedBuyCfg.maxStakeUsdt === 20, `expected planned config maxStakeUsdt 20U, got ${plannedBuyCfg.maxStakeUsdt}`);
+    assertSelfTest(plannedExecutionCfg.maxStakeUsdt === 20, `expected planned execution maxStakeUsdt 20U, got ${plannedExecutionCfg.maxStakeUsdt}`);
+    assertArrayEqual(
+      gasAllocationsFromEventPlan(plannedPlan).map((allocation) => allocation.amountUsdt),
+      [20, 10, 10],
+      "planned buy gas allocation uses outcome-specific stakes"
+    );
+    assertSelfTest(
+      bot2PlannedCfg.plannedBuy?.id && bot2PlannedCfg.eventOutcomeNames.includes("ECU 1-0 CUW"),
+      "planned buy must override Bot2 Meme range selection"
+    );
+    assertSelfTest(
+      bot5PlannedCfg.plannedBuy?.id && bot5PlannedCfg.eventOutcomeNames.includes("ECU 1-0 CUW"),
+      "planned buy must override Bot5 Meme range selection"
+    );
     const regexPlannedBuyCfg = plannedBuyConfigForMarket(plannedCfg, regexPlannedMarket);
     assertArrayEqual(
       buildDirectBuyAllOutcomesPlan(regexPlannedMarket, regexPlannedBuyCfg).outcomes.map((outcome) => outcome.name),
@@ -2020,6 +2355,11 @@ async function selfTest(cfg) {
     assertSelfTest(
       regexFunding.nextBatchMarkets?.[0]?.gasPriceGwei === "0.15",
       `funding summary should inherit regex planned buy gasPriceGwei, got ${regexFunding.nextBatchMarkets?.[0]?.gasPriceGwei}`
+    );
+    const pricePlannedDecision = marketFilterDecision(pricePlannedMarket, plannedCfg);
+    assertSelfTest(
+      pricePlannedDecision.eligible && pricePlannedDecision.reason === "planned-buy",
+      `planned buy should override Price strategy filter, got ${JSON.stringify(pricePlannedDecision)}`
     );
     const plannedAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
       marketAddress: plannedMarket.address,
@@ -2034,7 +2374,10 @@ async function selfTest(cfg) {
       holdAutoSellCfg.autoSellEnabled === false && holdAutoSellCfg.autoSellStrategy === "hold_to_settlement",
       `hold planned buy should normalize auto-sell disabled, got ${JSON.stringify(holdAutoSellCfg.plannedAutoSellOverride)}`
     );
-    assertSelfTest(!isAutoSellEnabledForPosition(holdAutoSellCfg), "hold-to-settlement planned buy should skip auto-sell");
+    assertSelfTest(
+      !plannedBuyForMarket(plannedCfg, holdMarket) && !isAutoSellEnabledForPosition(holdAutoSellCfg),
+      "disabled executed plan should preserve hold-to-settlement without remaining buy-eligible"
+    );
     const preStartBuyCfg = plannedBuyConfigForMarket(plannedCfg, preStartMarket);
     assertSelfTest(
       preStartBuyCfg.plannedBuy?.openBroadcastDelayMs === 20000,
@@ -2076,18 +2419,58 @@ async function selfTest(cfg) {
       `planned buy should carry per-record broadcastRpcUrls, got cfg=${preStartBuyCfg.broadcastRpcUrls?.length ?? 0} plan=${preStartBuyCfg.plannedBuy?.broadcastRpcUrls?.length ?? 0}`
     );
     assertSelfTest(
+      preStartBuyCfg.builderBundleEnabled === true &&
+        preStartBuyCfg.builderBundleMode === "builder_then_fanout" &&
+        preStartBuyCfg.builderBundleTipBnb === "0.005" &&
+        preStartBuyCfg.builderBundleMaxBlocks === 4 &&
+        preStartBuyCfg.builderBundleFanoutDelayMs === 120 &&
+        preStartBuyCfg.builderBundleTimingMode === "first_20s_block" &&
+        preStartBuyCfg.builderBundleEarlySubmitLeadMs === 300 &&
+        preStartBuyCfg.builderBundleMinTimestampOffsetMs === 0 &&
+        preStartBuyCfg.builderBundleMaxTimestampOffsetMs === 20000 &&
+        preStartBuyCfg.builderBundlePositionFirst === true &&
+        preStartBuyCfg.plannedBuy?.builderBundle?.builderBundleTipBnb === "0.005",
+      `planned buy should carry per-record builder bundle override, got ${JSON.stringify(preStartBuyCfg.plannedBuy?.builderBundle ?? null)}`
+    );
+    const preStartExecutionCfg = executionConfigForPlan(
+      plannedCfg,
+      annotatePlannedBuyPlan(buildDirectBuyAllOutcomesPlan(preStartMarket, preStartBuyCfg), preStartBuyCfg)
+    );
+    assertSelfTest(
       executionConfigForPlan(plannedCfg, annotatePlannedBuyPlan(buildDirectBuyAllOutcomesPlan(preStartMarket, preStartBuyCfg), preStartBuyCfg)).broadcastRpcUrls?.length === 2,
       "planned execution config should inherit per-record broadcastRpcUrls"
     );
-    const plannedGasReserve = calculateFastGasReserve(plannedCfg, fundingForMarketSummaries(plannedCfg, [{
+    assertSelfTest(
+      preStartExecutionCfg.builderBundleTipBnb === "0.005",
+      "planned execution config should inherit per-record builder bundle tip"
+    );
+    assertSelfTest(
+      preStartExecutionCfg.builderBundleMode === "builder_then_fanout",
+      "planned execution config should inherit per-record builder bundle mode"
+    );
+    assertSelfTest(
+      preStartExecutionCfg.builderBundleFanoutDelayMs === 120,
+      "planned execution config should inherit per-record builder fanout delay"
+    );
+    assertSelfTest(
+      preStartExecutionCfg.builderBundleEnabled === true &&
+        preStartExecutionCfg.builderBundleEarlySubmitOffsetMs === 19700 &&
+        preStartExecutionCfg.builderBundleTargetBoundaryLeadMs === 300 &&
+        preStartExecutionCfg.builderBundlePublicFallbackLeadMs === 300 &&
+        preStartExecutionCfg.builderBundleMaxTimestampOffsetMs === 20000,
+      `planned targeted builder request should use a 300ms target-boundary lead, got ${JSON.stringify(preStartExecutionCfg.builderBundleTimingResolved)}`
+    );
+    const plannedGasReserve = calculateFundingGasReserve(plannedCfg, fundingForMarketSummaries(plannedCfg, [{
       ...preStartMarket,
       totalStakeUsdt: 10,
       outcomeCount: 1,
       gasPriceGwei: "0.15"
     }]));
     assertSelfTest(
-      plannedGasReserve.gasPriceGwei === "0.15",
-      `planned funding reserve should use per-record gasPriceGwei, got ${plannedGasReserve.gasPriceGwei}`
+      plannedGasReserve.gasPriceGwei === "0.15" &&
+        plannedGasReserve.builderBundleTipBnb === "0.005" &&
+        Number(plannedGasReserve.requiredBnb) > Number(plannedGasReserve.buyGasRequiredBnb),
+      `planned funding reserve should use per-record gas and Builder costs, got ${JSON.stringify(plannedGasReserve)}`
     );
     const preStartAutoSellCfg = autoSellConfigForPosition(plannedCfg, {
       marketAddress: preStartMarket.address,
@@ -2417,6 +2800,63 @@ async function selfTest(cfg) {
   assertSelfTest(!runtimeTransactionBusy(waitRuntime), "runtime transaction idle wait did not observe lock release");
   passed.push("transaction lock and auto-sell pause protect hot buy window");
 
+  const fastExitLaneCfg = {
+    ...testCfg,
+    autoSellEnabled: true,
+    autoSellStrategy: "open_timed_exit",
+    autoSellFastOpenExitEnabled: true,
+    openBroadcastDelayMs: 19850
+  };
+  assertSelfTest(fastOpenExitNonceLaneEnabled(fastExitLaneCfg), "fast open exit nonce lane should be enabled");
+  const reservedBuyRuntime = {
+    pendingBuyRecords: new Map([["next", { preSignedFastTransaction: { nonce: 44 } }]])
+  };
+  assertSelfTest(runtimeHasPreSignedBuy(reservedBuyRuntime), "reserved future buy nonce should be detected");
+  const currentFastExitMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000001191",
+    question: "Current fast exit market"
+  });
+  const earlierBuyTargetMs = Date.now() + 2000;
+  const earlierBuyMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000001192",
+    question: "Earlier pending buy",
+    startDate: new Date(earlierBuyTargetMs - fastExitLaneCfg.openBroadcastDelayMs).toISOString()
+  });
+  const pendingBuyRuntime = {
+    pendingBuyRecords: new Map([
+      ["current", { market: currentFastExitMarket }],
+      ["next", { market: earlierBuyMarket }]
+    ])
+  };
+  const pendingBeforeExit = pendingBuyBeforeFastOpenExit(
+    fastExitLaneCfg,
+    pendingBuyRuntime,
+    currentFastExitMarket,
+    Date.now() + 5000
+  );
+  assertSelfTest(
+    pendingBeforeExit?.market === earlierBuyMarket.address,
+    `earlier pending buy should suppress conflicting fast exit, got ${JSON.stringify(pendingBeforeExit)}`
+  );
+  const fastExitGateRuntime = { fastOpenExitPreSignGate: { key: "market:tx" } };
+  releaseFastOpenExitPreSignGate(fastExitGateRuntime, "other:tx");
+  assertSelfTest(fastExitGateRuntime.fastOpenExitPreSignGate, "unrelated fast exit gate should remain active");
+  releaseFastOpenExitPreSignGate(fastExitGateRuntime, "market:tx");
+  assertSelfTest(!fastExitGateRuntime.fastOpenExitPreSignGate, "matching fast exit gate should release");
+  let postBuyApprovalError = "";
+  try {
+    await ensureFastOpenExitOperatorApproval(fastExitLaneCfg, {}, currentFastExitMarket.address, [
+      { operatorApproved: false }
+    ]);
+  } catch (error) {
+    postBuyApprovalError = errorMessage(error);
+  }
+  assertSelfTest(
+    postBuyApprovalError.includes("refusing a nonce-consuming approval after buy"),
+    `fast exit must not spend a reserved nonce on post-buy approval, got ${postBuyApprovalError || "no error"}`
+  );
+  passed.push("fast open exit preapproval and serial nonce lane protect later buys");
+
   const sellQuoteCfg = { ...testCfg, dryRun: false, execute: true };
   configureSellMode(sellQuoteCfg, {});
   assertSelfTest(sellQuoteCfg.dryRun && !sellQuoteCfg.execute, "sell quote should force dry-run without --execute");
@@ -2504,6 +2944,54 @@ async function selfTest(cfg) {
     completed: false,
     stopLossSold: false
   };
+  const operatorHintRuntime = {
+    autoSellOperatorReadyMarkets: new Set([quoteGuardPosition.marketAddress.toLowerCase()])
+  };
+  assertSelfTest(
+    autoSellOperatorApprovalHint(operatorHintRuntime, quoteGuardPosition.marketAddress) === true &&
+      autoSellOperatorApprovalHint(operatorHintRuntime, "0x0000000000000000000000000000000000000a52") === undefined,
+    "auto-sell should reuse only positively confirmed operator approvals"
+  );
+  let cachedApprovalBalanceReads = 0;
+  let cachedApprovalOperatorReads = 0;
+  let cachedApprovalSimulations = 0;
+  const cachedApprovalClient = {
+    readContract: async ({ functionName }) => {
+      if (functionName === "balanceOf") {
+        cachedApprovalBalanceReads += 1;
+        return parseUnits("1", 18);
+      }
+      if (functionName === "isOperator") {
+        cachedApprovalOperatorReads += 1;
+        throw new Error("confirmed operator approval should not be re-read");
+      }
+      throw new Error(`unexpected cached approval readContract ${functionName}`);
+    },
+    simulateContract: async () => {
+      cachedApprovalSimulations += 1;
+      return { result: parseUnits("0.9", 18) };
+    }
+  };
+  const cachedApprovalQuote = await quoteAutoSellReturnState(
+    testCfg,
+    cachedApprovalClient,
+    PUBLIC_TEST_RECEIVER,
+    quoteGuardPosition,
+    quoteGuardEntry,
+    true
+  );
+  assertSelfTest(
+    cachedApprovalQuote.quote?.operatorApproved === true &&
+      cachedApprovalBalanceReads === 1 &&
+      cachedApprovalOperatorReads === 0 &&
+      cachedApprovalSimulations === 1,
+    `confirmed operator approval should keep balance/simulation and skip only isOperator, got ${JSON.stringify({
+      balanceReads: cachedApprovalBalanceReads,
+      operatorReads: cachedApprovalOperatorReads,
+      simulations: cachedApprovalSimulations
+    })}`
+  );
+  passed.push("auto-sell reuses confirmed operator approval without reducing quote cadence");
   let quoteGuardCalls = 0;
   const quoteGuardClient = {
     readContract: async () => {
@@ -2551,7 +3039,186 @@ async function selfTest(cfg) {
     ladderProfitGateAction === null && quoteGuardCalls > 0,
     "ladder should still quote at due time when a profit gate is configured"
   );
-  passed.push("auto-sell skips return quotes unless stop-loss or a profit gate needs them");
+  const beforeOpenTimedNoProfitGateCalls = quoteGuardCalls;
+  const openTimedNoProfitGateAction = await buildOpenTimedExitAutoSellAction({
+    ...testCfg,
+    autoSellStrategy: "open_timed_exit",
+    autoSellOpenExitDelaySeconds: 39600,
+    autoSellLadderProfitPercent: 0,
+    autoSellStopLossEnabled: false
+  }, quoteGuardClient, PUBLIC_TEST_RECEIVER, quoteGuardPosition, ladderProfitGateEntry, Date.now());
+  assertSelfTest(
+    openTimedNoProfitGateAction === null && quoteGuardCalls === beforeOpenTimedNoProfitGateCalls,
+    `open timed exit should not quote before due without a profit gate, calls=${quoteGuardCalls}`
+  );
+  const beforeOpenTimedProfitGateCalls = quoteGuardCalls;
+  const openTimedProfitGateAction = await buildOpenTimedExitAutoSellAction({
+    ...testCfg,
+    autoSellStrategy: "open_timed_exit",
+    autoSellStartDelaySeconds: 0,
+    autoSellOpenExitDelaySeconds: 39600,
+    autoSellChunkPercent: 100,
+    autoSellTakeProfitSteps: 1,
+    autoSellLadderProfitPercent: 70,
+    autoSellStopLossEnabled: false
+  }, quoteGuardClient, PUBLIC_TEST_RECEIVER, quoteGuardPosition, ladderProfitGateEntry, Date.now());
+  assertSelfTest(
+    openTimedProfitGateAction === null && quoteGuardCalls > beforeOpenTimedProfitGateCalls,
+    "open timed exit should quote before the timed exit when a profit gate is configured"
+  );
+  const profitableOpenTimedClient = {
+    readContract: async ({ functionName }) => {
+      if (functionName === "balanceOf") return parseUnits("100", 18);
+      if (functionName === "isOperator") return true;
+      throw new Error(`unexpected readContract ${functionName}`);
+    },
+    simulateContract: async () => ({ result: parseUnits("20", 18) })
+  };
+  const profitableOpenTimedAction = await buildOpenTimedExitAutoSellAction({
+    ...testCfg,
+    autoSellStrategy: "open_timed_exit",
+    autoSellStartDelaySeconds: 0,
+    autoSellOpenExitDelaySeconds: 39600,
+    autoSellChunkPercent: 100,
+    autoSellTakeProfitSteps: 1,
+    autoSellLadderProfitPercent: 70,
+    autoSellStopLossEnabled: false
+  }, profitableOpenTimedClient, PUBLIC_TEST_RECEIVER, {
+    ...quoteGuardPosition,
+    costBasis: "10",
+    size: "100"
+  }, {
+    ...ladderProfitGateEntry,
+    initialSize: "100",
+    remainingSize: "100",
+    initialCostBasisUsdt: "10"
+  }, Date.now());
+  assertSelfTest(
+    profitableOpenTimedAction?.trigger === "ladder_step" &&
+      profitableOpenTimedAction.percent === 100 &&
+      profitableOpenTimedAction.profitPercent >= 70,
+    `open timed exit should sell 100% at the profit gate before timed exit, got ${JSON.stringify({
+      trigger: profitableOpenTimedAction?.trigger,
+      percent: profitableOpenTimedAction?.percent,
+      profitPercent: profitableOpenTimedAction?.profitPercent
+    })}`
+  );
+  let priceTargetReadCalls = 0;
+  let priceTargetSimulateCalls = 0;
+  const priceTargetClient = {
+    readContract: async ({ functionName }) => {
+      priceTargetReadCalls += 1;
+      if (functionName === "balanceOf") return parseUnits("100", 18);
+      if (functionName === "isOperator") return true;
+      throw new Error(`unexpected price target readContract ${functionName}`);
+    },
+    simulateContract: async () => {
+      priceTargetSimulateCalls += 1;
+      throw new Error("price target must not request a full-exit quote");
+    }
+  };
+  const priceTargetCfg = {
+    ...testCfg,
+    autoSellStrategy: "open_timed_exit",
+    autoSellOpenExitDelaySeconds: 39600,
+    autoSellLadderProfitPercent: 70,
+    autoSellStopLossEnabled: false,
+    autoSellPriceTargets: [{ outcome: "DeepSeek V4 Flash", price: 0.0017, enabled: true }],
+    autoSellPriceSellPercent: 100
+  };
+  const priceTargetPosition = {
+    ...quoteGuardPosition,
+    outcome: { name: "DeepSeek V4 Flash" },
+    curPrice: "0.001699",
+    costBasis: "10",
+    size: "100"
+  };
+  const belowPriceTargetAction = await buildOpenTimedExitAutoSellAction(
+    priceTargetCfg,
+    priceTargetClient,
+    PUBLIC_TEST_RECEIVER,
+    priceTargetPosition,
+    ladderProfitGateEntry,
+    Date.now()
+  );
+  assertSelfTest(
+    belowPriceTargetAction === null && priceTargetReadCalls === 0 && priceTargetSimulateCalls === 0,
+    "REST price target should not use chain RPC below the configured price"
+  );
+  const reachedPriceTargetAction = await buildOpenTimedExitAutoSellAction(
+    priceTargetCfg,
+    priceTargetClient,
+    PUBLIC_TEST_RECEIVER,
+    { ...priceTargetPosition, curPrice: "0.0017" },
+    ladderProfitGateEntry,
+    Date.now()
+  );
+  assertSelfTest(
+    reachedPriceTargetAction?.trigger === "price_target" &&
+      reachedPriceTargetAction.currentPrice === 0.0017 &&
+      reachedPriceTargetAction.targetPrice === 0.0017 &&
+      reachedPriceTargetAction.percent === 100 &&
+      priceTargetReadCalls === 2 &&
+      priceTargetSimulateCalls === 0,
+    `REST price target should sell directly without a quote, got ${JSON.stringify({
+      trigger: reachedPriceTargetAction?.trigger,
+      currentPrice: reachedPriceTargetAction?.currentPrice,
+      targetPrice: reachedPriceTargetAction?.targetPrice,
+      percent: reachedPriceTargetAction?.percent,
+      readCalls: priceTargetReadCalls,
+      simulateCalls: priceTargetSimulateCalls
+    })}`
+  );
+  const priceTargetAppliedEntry = { initialSize: "100", remainingSize: "100", nextStep: 1, completed: false };
+  markAutoSellActionApplied(priceTargetCfg, priceTargetAppliedEntry, reachedPriceTargetAction);
+  assertSelfTest(
+    priceTargetAppliedEntry.completed && priceTargetAppliedEntry.priceTargetSold && priceTargetAppliedEntry.remainingSize === "0",
+    `price target should complete the outcome, got ${JSON.stringify(priceTargetAppliedEntry)}`
+  );
+  const futureOnlyTarget = autoSellPriceTargetForPosition({
+    ...priceTargetCfg,
+    autoSellPriceApplyAfterIso: new Date(Date.now() + 1000).toISOString()
+  }, { ...priceTargetPosition, curPrice: "0.002" }, ladderProfitGateEntry);
+  assertSelfTest(futureOnlyTarget === null, "price target cutover should exclude older positions");
+  passed.push("auto-sell uses REST price targets without full-exit quote RPC and keeps profit quotes strategy-gated");
+
+  const pricePollDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-price-poll-test-"));
+  try {
+    const plannedBuysFile = path.join(pricePollDir, "planned-buys.json");
+    const fillsFile = path.join(pricePollDir, "fills.jsonl");
+    const buyAt = Date.now() - 5000;
+    const marketAddress = "0x0000000000000000000000000000000000000b44";
+    fs.writeFileSync(plannedBuysFile, JSON.stringify({ plans: [{
+      id: "price-poll",
+      market: marketAddress,
+      outcomes: ["DeepSeek V4 Flash"],
+      stakePerOutcomeUsdt: 10,
+      autoSell: {
+        priceTargets: [{ outcome: "DeepSeek V4 Flash", price: 0.0017 }],
+        priceHotPollMs: 1000,
+        priceHotWindowSeconds: 600
+      }
+    }] }));
+    fs.writeFileSync(fillsFile, `${JSON.stringify({
+      at: new Date(buyAt).toISOString(),
+      plan: { market: { address: marketAddress, question: "Price poll" } },
+      result: { dryRun: false, status: "broadcast" }
+    })}\n`);
+    const pricePollCfg = {
+      ...testCfg,
+      eventPlannedBuysFile: plannedBuysFile,
+      fillsFile,
+      autoSellApplyAfterIso: null,
+      autoSellEligibleTailBytes: 1024 * 1024,
+      autoSellPollMs: 60000
+    };
+    assertSelfTest(autoSellMonitorSchedulerMs(pricePollCfg) === 1000, "price target monitor scheduler should wake every second");
+    assertSelfTest(autoSellMonitorDesiredPollMs(pricePollCfg, buyAt + 5000) === 1000, "price target hot window should poll every second");
+    assertSelfTest(autoSellMonitorDesiredPollMs(pricePollCfg, buyAt + 601000) === 60000, "price target monitor should restore normal polling after ten minutes");
+  } finally {
+    fs.rmSync(pricePollDir, { recursive: true, force: true });
+  }
+  passed.push("price target monitor polls at 1s for ten minutes then restores the profile interval");
   const oneStepEntry = {
     nextStep: 1,
     initialSize: "100",
@@ -2770,6 +3437,31 @@ async function selfTest(cfg) {
     assertSelfTest(
       fastOpenExitEntry.completed && fastOpenExitEntry.openTimedExitSold,
       "fast open timed exit should complete the position after one sell"
+    );
+    const sellBroadcastCfg = rpcOnlyAutoSellBroadcastConfig({
+      ...fastExitCfg,
+      builderBundleEnabled: true,
+      builderBundleRequestedEnabled: true,
+      builderBundleKillSwitch: false,
+      builderTimedBuyExecutorEnabled: true,
+      builderTimestampGuardEnabled: true
+    });
+    assertSelfTest(
+      !sellBroadcastCfg.builderBundleEnabled &&
+        !sellBroadcastCfg.builderBundleRequestedEnabled &&
+        sellBroadcastCfg.builderBundleKillSwitch &&
+        !sellBroadcastCfg.builderTimedBuyExecutorEnabled &&
+        !sellBroadcastCfg.builderTimestampGuardEnabled,
+      "fast auto-sell broadcasts must not inherit the buy-only Builder path"
+    );
+    const failedFastExitRuntime = {
+      autoSellPausedUntil: Date.now() + 45000,
+      autoSellPauseReason: "fast-open-exit-scheduled"
+    };
+    releaseFastOpenExitAutoSellPause(failedFastExitRuntime);
+    assertSelfTest(
+      !runtimeAutoSellPauseInfo(failedFastExitRuntime),
+      "failed fast open exit should immediately release its monitor pause"
     );
   } finally {
     fs.rmSync(kickoffPlanDir, { recursive: true, force: true });
@@ -3101,6 +3793,627 @@ async function selfTest(cfg) {
     BigInt(bundleGasReserve.gasLimit) >= 11700000n,
     `15-outcome bundle fast gas limit too low: ${bundleGasReserve.gasLimit}`
   );
+  const builderGasReserve = calculateFastGasReserve(
+    {
+      ...testCfg,
+      fastGasLimit: 8000000,
+      gasPriceGwei: "1",
+      builderBundleEnabled: true,
+      builderBundleTipBnb: "0.005",
+      builderBundleTipGasPriceGwei: "1"
+    },
+    { nextBatchOutcomeCount: 1 }
+  );
+  assertSelfTest(
+    builderGasReserve.builderBundleTipBnb === "0.005" &&
+      Number(builderGasReserve.requiredBnb) > Number(builderGasReserve.buyGasRequiredBnb),
+    `builder gas reserve should include BNB tip and tip transfer gas, got ${JSON.stringify(builderGasReserve)}`
+  );
+  const target19Timing = resolveBuilderBundleTimingPreset({
+    ...testCfg,
+    builderBundleEnabled: true,
+    builderBundleTimingMode: "auto",
+    builderBundleTimeoutMs: 800,
+    builderBundlePrepositionLeadMs: 300,
+    builderBundleFallbackSafetyMs: 100,
+    openBroadcastDelayMs: 18840
+  });
+  assertSelfTest(
+    target19Timing.eligible &&
+      target19Timing.targetSecond === 19 &&
+      target19Timing.earlySubmitOffsetMs === 18700 &&
+      target19Timing.targetBoundaryLeadMs === 300 &&
+      target19Timing.publicFallbackLeadMs === 140 &&
+      target19Timing.effectiveTimeoutMs === 800,
+    `T+19 targeted builder timing should submit at T+18.700 without shortening the request timeout, got ${JSON.stringify(target19Timing)}`
+  );
+  const target20Cfg = applyBuilderBundleTimingPreset({
+    ...testCfg,
+    builderBundleEnabled: true,
+    builderBundleTimingMode: "auto",
+    builderBundleMode: "builder_only",
+    builderBundleTimeoutMs: 700,
+    builderBundlePrepositionLeadMs: 300,
+    builderBundleFallbackSafetyMs: 100,
+    openBroadcastDelayMs: 19900
+  });
+  assertSelfTest(
+    target20Cfg.builderBundleEnabled &&
+      target20Cfg.builderBundleTargetSecond === 20 &&
+      target20Cfg.builderBundleEarlySubmitOffsetMs === 19700 &&
+      target20Cfg.builderBundleTargetBoundaryLeadMs === 300 &&
+      target20Cfg.builderBundlePublicFallbackLeadMs === 200 &&
+      target20Cfg.builderBundleMinTimestampOffsetMs === 0 &&
+      target20Cfg.builderBundleMaxTimestampOffsetMs === 20000 &&
+      target20Cfg.builderBundleMode === "builder_only" &&
+      target20Cfg.builderBundlePositionFirst,
+    `T+20 targeted builder-only timing should remain builder-only, got ${JSON.stringify(target20Cfg.builderBundleTimingResolved)}`
+  );
+  const offTargetCfg = applyBuilderBundleTimingPreset({
+    ...target20Cfg,
+    builderBundleEnabled: true,
+    builderBundleTimingMode: "auto",
+    openBroadcastDelayMs: 22000
+  });
+  assertSelfTest(
+    !offTargetCfg.builderBundleEnabled && offTargetCfg.builderBundleRequestedEnabled,
+    `non-19/20 fallback should stay RPC-only, got ${JSON.stringify(offTargetCfg.builderBundleTimingResolved)}`
+  );
+  const strictLaneStart = "2030-01-01T00:00:00.000Z";
+  const strictLane = splitRecordsByStrictBuilderLane({
+    ...testCfg,
+    builderBundleEnabled: true,
+    builderBundleTimingMode: "auto",
+    builderBundleTimeoutMs: 700,
+    builderBundlePrepositionLeadMs: 300,
+    builderBundleFallbackSafetyMs: 100,
+    openBroadcastDelayMs: 18840
+  }, [
+    { market: mockEventMarket({ address: "0x0000000000000000000000000000000000001191", startDate: strictLaneStart }) },
+    { market: mockEventMarket({ address: "0x0000000000000000000000000000000000001192", startDate: strictLaneStart }) }
+  ]);
+  assertSelfTest(
+    strictLane.selected.length === 1 && strictLane.skipped.length === 1,
+    `targeted builder wallet lane should admit one market per target second, got ${JSON.stringify({ selected: strictLane.selected.length, skipped: strictLane.skipped.length })}`
+  );
+  const builderDryRun = await buildBuilderBundleDryRun(
+    {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTipBnb: "0.005",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleMaxTimestampOffsetSeconds: 12,
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848"
+    },
+    {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMaxTimestamp: 12
+    },
+    { maxBlockNumber: 123, nowMs: 0 }
+  );
+  assertSelfTest(
+    builderDryRun.ready &&
+      builderDryRun.txCount === 2 &&
+      builderDryRun.tipNonce === 43 &&
+      builderDryRun.tipBnb === "0.005" &&
+      builderDryRun.minTimestamp === null &&
+      builderDryRun.maxTimestamp === 12,
+    `legacy builder dry-run should use documented maxTimestamp only, got ${JSON.stringify(builderDryRun)}`
+  );
+  const dualBuilderDryRun = await buildBuilderBundleDryRun(
+    {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      blockrazorBuilderEnabled: true,
+      blockrazorBuilderUrl: "https://rpc.blockrazor.builders",
+      blockrazorBuilderTipTo: "0x1266C6bE60392A8Ff346E8d5ECCd3E69dD9c5F20",
+      blockrazorBuilderAuthToken: "test-token"
+    },
+    {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMaxTimestamp: 12
+    },
+    { maxBlockNumber: null, nowMs: 0 }
+  );
+  assertSelfTest(
+    dualBuilderDryRun.ready &&
+      dualBuilderDryRun.targetCount === 2 &&
+      dualBuilderDryRun.targets.every((target) => target.txCount === 2 && target.tipNonce === 43) &&
+      new Set(dualBuilderDryRun.targets.map((target) => target.tipTo.toLowerCase())).size === 2,
+    `dual Builder dry-run should sign one same-nonce tip per Builder address, got ${JSON.stringify(dualBuilderDryRun)}`
+  );
+  const originalDualBuilderFetch = globalThis.fetch;
+  const dualBuilderRequests = [];
+  let dualBuilderSubmission = null;
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      dualBuilderRequests.push({
+        url: String(input),
+        headers: init.headers ?? {},
+        body: JSON.parse(String(init.body ?? "{}"))
+      });
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: `0x${"ab".repeat(32)}`
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    dualBuilderSubmission = await submitPreSignedBuilderBundle({
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderBundleNoMerge: true,
+      builderBundlePositionFirst: true,
+      builderBundle48spSign: "test-sign",
+      blockrazorBuilderEnabled: true,
+      blockrazorBuilderUrl: "https://rpc.blockrazor.builders",
+      blockrazorBuilderTipTo: "0x1266C6bE60392A8Ff346E8d5ECCd3E69dD9c5F20",
+      blockrazorBuilderAuthToken: "test-token"
+    }, {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMinTimestamp: 12,
+      builderBundleMaxTimestamp: 12
+    });
+  } finally {
+    globalThis.fetch = originalDualBuilderFetch;
+  }
+  const blockrazorRequest = dualBuilderRequests.find((request) => request.url.includes("blockrazor"));
+  const clubRequest = dualBuilderRequests.find((request) => request.url.includes("48.club"));
+  assertSelfTest(
+    dualBuilderSubmission?.submitted &&
+      dualBuilderSubmission.submittedTargetCount === 2 &&
+      dualBuilderRequests.length === 2 &&
+      blockrazorRequest?.headers?.Authorization === "test-token" &&
+      !Object.hasOwn(blockrazorRequest?.body?.params?.[0] ?? {}, "48spSign") &&
+      !Object.hasOwn(blockrazorRequest?.body?.params?.[0] ?? {}, "minTimestamp") &&
+      blockrazorRequest?.body?.params?.[0]?.maxTimestamp === 12 &&
+      blockrazorRequest?.body?.params?.[0]?.positionFirst === true &&
+      blockrazorRequest?.body?.params?.[0]?.noMerge === true &&
+      clubRequest?.body?.params?.[0]?.["48spSign"] === "test-sign" &&
+      clubRequest?.body?.params?.[0]?.minTimestamp === 12 &&
+      clubRequest?.body?.params?.[0]?.maxTimestamp === 12 &&
+      clubRequest?.body?.params?.[0]?.positionFirst === true &&
+      clubRequest?.body?.params?.[0]?.noMerge === true,
+    `dual Builder submission should preserve shared ordering fields while keeping 48spSign provider-specific, got ${JSON.stringify({ dualBuilderSubmission, dualBuilderRequests })}`
+  );
+  const originalBuilderSingleflightFetch = globalThis.fetch;
+  let builderSingleflightRequests = 0;
+  let builderSingleflightResults = [];
+  try {
+    globalThis.fetch = async (_input, init = {}) => {
+      builderSingleflightRequests += 1;
+      const payload = JSON.parse(String(init.body ?? "{}"));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: `0x${"cd".repeat(32)}`
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const sharedSigned = {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000"
+    };
+    const sharedCfg = {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleMode: "builder_only",
+      builderBundleTimingMode: "legacy",
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      blockrazorBuilderEnabled: false
+    };
+    builderSingleflightResults = await Promise.all([
+      broadcastPreSignedFastTransaction(sharedCfg, sharedSigned),
+      broadcastPreSignedFastTransaction(sharedCfg, sharedSigned)
+    ]);
+  } finally {
+    globalThis.fetch = originalBuilderSingleflightFetch;
+  }
+  assertSelfTest(
+    builderSingleflightRequests === 1 &&
+      builderSingleflightResults.every((result) => (
+        result?.mode === "presigned_builder_bundle_only" &&
+        result?.publicBroadcastSkipped === true
+      )),
+    `concurrent strict Builder callers should share one in-flight submission, got ${JSON.stringify({ builderSingleflightRequests, builderSingleflightResults })}`
+  );
+  const timedExecutorAddress = "0x1111111111111111111111111111111111111111";
+  const timedRouterData = "0x12345678";
+  const timedExecutorData = encodeTimedBuyExecutorCall(20, parseUnits("30", 18), timedRouterData);
+  const timedDecoded = decodeFunctionData({ abi: TIMED_BUY_EXECUTOR_ABI, data: timedExecutorData });
+  const timedBuilderDryRun = await buildBuilderBundleDryRun(
+    {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "first_20s_block",
+      builderBundlePrepositionLeadMs: 300,
+      openBroadcastDelayMs: 19900,
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderTimedBuyExecutorEnabled: true,
+      builderTimedBuyExecutorAddress: timedExecutorAddress
+    },
+    {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMinTimestamp: 20,
+      builderBundleMaxTimestamp: 20,
+      builderBundleTargetSecond: 20,
+      timedBuyExecutorEnabled: true,
+      timedBuyExecutorAddress: timedExecutorAddress,
+      timedBuyExecutorTargetTimestamp: 20
+    },
+    { maxBlockNumber: null, nowMs: 0 }
+  );
+  assertSelfTest(
+    timedDecoded.functionName === "executeAfter" &&
+      timedDecoded.args[0] === 20n &&
+      timedDecoded.args[1] === parseUnits("30", 18) &&
+      timedDecoded.args[2] === timedRouterData &&
+      timedBuilderDryRun.ready &&
+      timedBuilderDryRun.txCount === 2 &&
+      timedBuilderDryRun.minTimestamp === 20 &&
+      timedBuilderDryRun.maxTimestamp === 20 &&
+      timedBuilderDryRun.timedBuyExecutorEnabled,
+    `timed Builder dry-run should encode atomic executeAfter + tip at one target timestamp, got ${JSON.stringify(timedBuilderDryRun)}`
+  );
+  const exactTimedBuilderDryRun = await buildBuilderBundleDryRun(
+    {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "first_20s_block",
+      builderBundlePrepositionLeadMs: 700,
+      openBroadcastDelayMs: 19900,
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      blockrazorBuilderEnabled: true,
+      blockrazorBuilderUrl: "https://rpc.blockrazor.builders",
+      blockrazorBuilderTipTo: "0x1266C6bE60392A8Ff346E8d5ECCd3E69dD9c5F20",
+      builderTimedBuyExecutorEnabled: true,
+      builderTimedBuyExecutorExactSecond: true,
+      builderTimedBuyExecutorAddress: timedExecutorAddress
+    },
+    {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMinTimestamp: 20,
+      builderBundleMaxTimestamp: 21,
+      builderBundleTargetSecond: 20,
+      timedBuyExecutorEnabled: true,
+      timedBuyExecutorExactSecond: true,
+      timedBuyExecutorAddress: timedExecutorAddress,
+      timedBuyExecutorTargetTimestamp: 20
+    },
+    { maxBlockNumber: null, nowMs: 0 }
+  );
+  assertSelfTest(
+    exactTimedBuilderDryRun.ready &&
+      exactTimedBuilderDryRun.targetCount === 2 &&
+      exactTimedBuilderDryRun.targets.every((target) => (
+        target.minTimestamp === 20 && target.maxTimestamp === 21
+      )) &&
+      exactTimedBuilderDryRun.timedBuyExecutorExactSecond,
+    `exact-second Builder dry-run should expose a non-zero provider window while the executor pins T+20, got ${JSON.stringify(exactTimedBuilderDryRun)}`
+  );
+  const strictBuilderDryRun = await buildBuilderBundleDryRun(
+    {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "first_20s_block",
+      builderBundleMode: "builder_then_fanout",
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderBundleTimeoutMs: 700,
+      builderBundlePrepositionLeadMs: 300,
+      builderBundleFallbackSafetyMs: 100,
+      openBroadcastDelayMs: 19900
+    },
+    {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMaxTimestamp: 20,
+      builderBundleTargetSecond: 20,
+      builderBundleTargetBoundaryAtMs: 20000,
+      builderBundleTargetBoundaryLeadMs: 300,
+      builderBundlePublicFallbackLeadMs: 200,
+      builderBundleEarlySubmitAtMs: 19700
+    },
+    { maxBlockNumber: null, nowMs: 0 }
+  );
+  assertSelfTest(
+    strictBuilderDryRun.ready &&
+      strictBuilderDryRun.minTimestamp === null &&
+      strictBuilderDryRun.maxTimestamp === 20 &&
+      strictBuilderDryRun.targetSecond === 20 &&
+      strictBuilderDryRun.positionFirst,
+    `targeted builder dry-run should use maxTimestamp-only expiry at T+20, got ${JSON.stringify(strictBuilderDryRun)}`
+  );
+  const guardedBuilderDryRun = await buildBuilderBundleDryRun(
+    {
+      ...testCfg,
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "first_20s_block",
+      builderBundleMode: "builder_then_fanout",
+      builderBundleTipBnb: "0.001",
+      builderBundleTipGasPriceGwei: "1",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderBundleTimeoutMs: 700,
+      builderBundlePrepositionLeadMs: 500,
+      builderTimestampGuardEnabled: true,
+      builderTimestampGuardAddress: "0x376ba9bF428F62350256f9aD4f3B5eF48Ae81557",
+      openBroadcastDelayMs: 19900
+    },
+    {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 43,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMinTimestamp: 20,
+      builderBundleMaxTimestamp: 20,
+      builderBundleTargetSecond: 20,
+      preSignedTimestampGuardTransaction: {
+        txHash: "0x3333333333333333333333333333333333333333333333333333333333333333",
+        serializedTransaction: "0x5678",
+        nonce: 42,
+        to: "0x376ba9bF428F62350256f9aD4f3B5eF48Ae81557",
+        targetTimestamp: 20
+      }
+    },
+    { maxBlockNumber: null, nowMs: 0 }
+  );
+  assertSelfTest(
+    guardedBuilderDryRun.ready &&
+      guardedBuilderDryRun.txCount === 3 &&
+      guardedBuilderDryRun.minTimestamp === 20 &&
+      guardedBuilderDryRun.maxTimestamp === 20 &&
+      guardedBuilderDryRun.timestampGuardEnabled &&
+      guardedBuilderDryRun.timestampGuardNonce === 42 &&
+      guardedBuilderDryRun.buyNonce === 43 &&
+      guardedBuilderDryRun.tipNonce === 44,
+    `guarded Builder dry-run should enforce guard -> buy -> tip nonces at one target timestamp, got ${JSON.stringify(guardedBuilderDryRun)}`
+  );
+  const originalFetch = globalThis.fetch;
+  let publicFanoutCalls = 0;
+  let inFlightBroadcast;
+  let guardedPreSubmittedBroadcast;
+  let strictBuilderOnlyBroadcast;
+  try {
+    globalThis.fetch = async (_input, init = {}) => {
+      const payload = JSON.parse(String(init.body ?? "{}"));
+      if (payload.method !== "eth_sendRawTransaction") {
+        throw new Error(`unexpected self-test RPC method ${payload.method}`);
+      }
+      publicFanoutCalls += 1;
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: "0x1111111111111111111111111111111111111111111111111111111111111111"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    };
+    const inFlightBuilderResult = {
+      submitted: true,
+      provider: "builder.example",
+      acceptedAt: "2030-01-01T00:00:19.050Z",
+      requestStartedAt: "2030-01-01T00:00:18.700Z",
+      requestLatencyMs: 350,
+      latencyMs: 350,
+      buyTxHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      tipTxHash: "0x2222222222222222222222222222222222222222222222222222222222222222",
+      tipBnb: "0.001",
+      tipPreSigned: true,
+      maxTimestamp: 1893456019,
+      targetSecond: 19,
+      targetBoundaryAtMs: 1893456019000,
+      targetBoundaryLeadMs: 300,
+      publicFallbackLeadMs: 150,
+      earlySubmitAtMs: 1893456018700,
+      earlySubmitted: true,
+      earlySubmitStartedAt: "2030-01-01T00:00:18.700Z",
+      earlySubmitLeadMs: 300
+    };
+    inFlightBroadcast = await broadcastPreSignedFastTransaction({
+      ...testCfg,
+      fanoutBroadcast: true,
+      rpcUrl: "https://race-rpc-a.example",
+      broadcastRpcUrls: ["https://race-rpc-a.example", "https://race-rpc-b.example"],
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "auto",
+      builderBundleMode: "builder_then_fanout",
+      builderBundleTipBnb: "0.001",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderBundlePrepositionLeadMs: 300,
+      openBroadcastDelayMs: 18850
+    }, {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 42,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMaxTimestamp: 1893456019,
+      builderBundleTargetSecond: 19,
+      preSubmittedBuilderBundlePromise: Promise.resolve(inFlightBuilderResult)
+    });
+    guardedPreSubmittedBroadcast = await broadcastPreSignedFastTransaction({
+      ...testCfg,
+      fanoutBroadcast: true,
+      rpcUrl: "https://race-rpc-a.example",
+      broadcastRpcUrls: ["https://race-rpc-a.example", "https://race-rpc-b.example"],
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "auto",
+      builderBundleMode: "builder_then_fanout",
+      builderBundleTipBnb: "0.001",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderBundlePrepositionLeadMs: 500,
+      builderTimestampGuardEnabled: true,
+      builderTimestampGuardAddress: "0x376ba9bF428F62350256f9aD4f3B5eF48Ae81557",
+      openBroadcastDelayMs: 18850
+    }, {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 43,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMinTimestamp: 1893456019,
+      builderBundleMaxTimestamp: 1893456019,
+      builderBundleTargetSecond: 19,
+      preSignedTimestampGuardTransaction: {
+        txHash: "0x3333333333333333333333333333333333333333333333333333333333333333",
+        serializedTransaction: "0x5678",
+        nonce: 42,
+        to: "0x376ba9bF428F62350256f9aD4f3B5eF48Ae81557",
+        targetTimestamp: 1893456019
+      },
+      preSubmittedBuilderBundle: {
+        ...inFlightBuilderResult,
+        timestampGuardEnabled: true,
+        timestampGuardAddress: "0x376ba9bF428F62350256f9aD4f3B5eF48Ae81557",
+        timestampGuardTxHash: "0x3333333333333333333333333333333333333333333333333333333333333333",
+        timestampGuardNonce: 42,
+        timestampGuardTargetTimestamp: 1893456019
+      }
+    });
+    strictBuilderOnlyBroadcast = await broadcastPreSignedFastTransaction({
+      ...testCfg,
+      fanoutBroadcast: true,
+      rpcUrl: "https://race-rpc-a.example",
+      broadcastRpcUrls: ["https://race-rpc-a.example", "https://race-rpc-b.example"],
+      builderBundleEnabled: true,
+      builderBundleTimingMode: "auto",
+      builderBundleMode: "builder_only",
+      builderBundleTipBnb: "0.001",
+      builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848",
+      builderBundlePrepositionLeadMs: 500,
+      openBroadcastDelayMs: 18850
+    }, {
+      txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+      serializedTransaction: "0x1234",
+      nonce: 44,
+      gas: "21000",
+      gasPrice: "1000000000",
+      builderBundleMinTimestamp: 1893456019,
+      builderBundleMaxTimestamp: 1893456019,
+      builderBundleTargetSecond: 19,
+      preSubmittedBuilderBundle: inFlightBuilderResult
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assertSelfTest(
+    publicFanoutCalls === 4 &&
+      inFlightBroadcast?.mode === "presigned_builder_then_fanout_raw" &&
+      inFlightBroadcast?.builderBundlePublicFanoutWhileInFlight === true &&
+      inFlightBroadcast?.builderBundleSubmitted === true &&
+      Boolean(inFlightBroadcast?.publicBroadcastStartedAt) &&
+      guardedPreSubmittedBroadcast?.mode === "presigned_builder_then_fanout_raw" &&
+      guardedPreSubmittedBroadcast?.builderTimestampGuardEnabled === true &&
+      Boolean(guardedPreSubmittedBroadcast?.publicBroadcastStartedAt) &&
+      strictBuilderOnlyBroadcast?.mode === "presigned_builder_bundle_only" &&
+      strictBuilderOnlyBroadcast?.publicBroadcastSkipped === true,
+    `Builder races should preserve hybrid fallback but never fan out strict builder-only buys, got ${JSON.stringify({ publicFanoutCalls, inFlightBroadcast, guardedPreSubmittedBroadcast, strictBuilderOnlyBroadcast })}`
+  );
+  const killSwitchDryRun = await buildBuilderBundleDryRun({
+    ...testCfg,
+    builderBundleKillSwitch: true,
+    builderBundleEnabled: true,
+    builderBundleTimingMode: "legacy",
+    builderBundleTipBnb: "0.001",
+    builderBundleTipTo: "0x4848489f0b2BEdd788c696e2D79b6b69D7484848"
+  }, {
+    txHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
+    serializedTransaction: "0x1234",
+    nonce: 42,
+    gas: "21000",
+    gasPrice: "1000000000"
+  });
+  assertSelfTest(
+    !killSwitchDryRun.ready && killSwitchDryRun.reason === "kill-switch",
+    `builder kill switch must override explicit plan enablement, got ${JSON.stringify(killSwitchDryRun)}`
+  );
+  const nonceSourceRecord = { market: mockEventMarket({ address: "0x0000000000000000000000000000000000001181" }) };
+  const nonceLaterRecord = {
+    market: mockEventMarket({ address: "0x0000000000000000000000000000000000001182" }),
+    preSignedFastTransaction: { txHash: "0xlater", nonce: 45 }
+  };
+  const nonceRuntime = { nextNonce: 46, lastNonceSyncAt: Date.now() };
+  releaseBuilderTipNonceReservationAfterEarlyFailure(
+    { ...testCfg, dryRun: false, execute: true },
+    new Map([["source", nonceSourceRecord], ["later", nonceLaterRecord]]),
+    nonceRuntime,
+    nonceSourceRecord,
+    { txHash: "0xbuy", nonce: 42 }
+  );
+  assertSelfTest(
+    nonceRuntime.nextNonce === 43 && !nonceLaterRecord.preSignedFastTransaction,
+    `failed early builder submission should release tip nonce and discard later pre-sign, got nonce=${nonceRuntime.nextNonce}`
+  );
+  const guardedNonceRuntime = { nextNonce: 46, lastNonceSyncAt: Date.now() };
+  const guardedLaterRecord = {
+    market: mockEventMarket({ address: "0x0000000000000000000000000000000000001183" }),
+    preSignedFastTransaction: { txHash: "0xguarded-later", nonce: 45 }
+  };
+  releaseBuilderTipNonceReservationAfterEarlyFailure(
+    { ...testCfg, dryRun: false, execute: true },
+    new Map([["source", nonceSourceRecord], ["later", guardedLaterRecord]]),
+    guardedNonceRuntime,
+    nonceSourceRecord,
+    {
+      txHash: "0xguarded-buy",
+      nonce: 43,
+      preSignedTimestampGuardTransaction: { txHash: "0xguard", nonce: 42 }
+    }
+  );
+  assertSelfTest(
+    guardedNonceRuntime.nextNonce === 46 && guardedLaterRecord.preSignedFastTransaction,
+    "guarded early submission failure must retain guard/buy/tip nonces for the chain-gated public fallback"
+  );
+  const droppedSourceRecord = { preSignedFastTransaction: { txHash: "0xdropped", nonce: 42 } };
+  const droppedLaterRecord = { preSignedFastTransaction: { txHash: "0xdropped-later", nonce: 44 } };
+  const droppedRuntime = {
+    pendingBuyRecords: new Map([["source", droppedSourceRecord], ["later", droppedLaterRecord]])
+  };
+  const droppedCleared = clearRuntimePreSignedTransactionsAtOrAfterNonce(droppedRuntime, 42, "self-test-target-missed");
+  assertSelfTest(
+    droppedCleared === 2 && !droppedSourceRecord.preSignedFastTransaction && !droppedLaterRecord.preSignedFastTransaction,
+    `target-missed nonce recovery should discard current and later pre-signs, got ${droppedCleared}`
+  );
   const staggeredGasReserve = calculateFundingGasReserve(
     { ...testCfg, fastGasLimit: 8000000, bundleDueMarkets: false, gasPriceGwei: "3" },
     fundingForMarketSummaries(testCfg, [
@@ -3117,6 +4430,7 @@ async function selfTest(cfg) {
       Number(staggeredGasReserve.requiredBnb) < Number(combinedSingleReserve.requiredBnb),
     `staggered gas reserve should sum per-market gas instead of overestimating as one 5-outcome tx, got ${JSON.stringify(staggeredGasReserve)} vs ${JSON.stringify(combinedSingleReserve)}`
   );
+  passed.push("builder targeting, legacy guard, dual-Builder atomic timing, kill switch, and nonce ownership are enforced");
   passed.push("staggered non-bundle gas reserve sums per-market gas");
   const walletBudgetGasLimit = resolveWalletBudgetGasLimit(
     {
@@ -3137,6 +4451,33 @@ async function selfTest(cfg) {
     walletBudgetGasLimit === 16_777_216n,
     `wallet-budget gas limit should cap to BSC tx max, got ${walletBudgetGasLimit}`
   );
+  const guardedBuilderReserveWei = 2_126_000_000_000_000n;
+  const guardedBuilderWalletBalance = 22_828_163_752_684_928n;
+  const guardedBuilderGasPrice = 2_100_000_000n;
+  const guardedBuilderGasLimit = resolveWalletBudgetGasLimit(
+    {
+      ...testCfg,
+      fastGasWalletBudget: true,
+      fastGasWalletBudgetBps: 10000,
+      fastGasBlockLimitBps: 10000,
+      fastGasTxLimit: 16777216
+    },
+    {
+      desiredGasLimit: 5_200_000n,
+      walletBalance: guardedBuilderWalletBalance,
+      gasPrice: guardedBuilderGasPrice,
+      blockGasLimit: 140_000_000n,
+      reservedWei: guardedBuilderReserveWei
+    }
+  );
+  assertSelfTest(
+    guardedBuilderGasLimit * guardedBuilderGasPrice + guardedBuilderReserveWei <= guardedBuilderWalletBalance,
+    "guarded Builder wallet budget should reserve guard gas, tip value, and tip transfer gas"
+  );
+  assertSelfTest(
+    guardedBuilderGasLimit >= 5_200_000n && guardedBuilderGasLimit < 10_870_554n,
+    `guarded Builder buy gas should keep the desired margin without consuming reserved BNB, got ${guardedBuilderGasLimit}`
+  );
   const fixedGasLimit = resolveWalletBudgetGasLimit(
     { ...testCfg, fastGasWalletBudget: false, fastGasTxLimit: 16777216 },
     { desiredGasLimit: 20_000_000n }
@@ -3145,7 +4486,7 @@ async function selfTest(cfg) {
     fixedGasLimit === 16_777_216n,
     `fixed fast gas limit should cap to BSC tx max, got ${fixedGasLimit}`
   );
-  passed.push("fast gas limit uses wallet BNB budget capped by BSC tx max");
+  passed.push("fast gas limit uses wallet BNB budget capped by BSC tx max and reserves guarded Builder costs");
 
   const priceMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000044",
@@ -3730,6 +5071,67 @@ async function selfTest(cfg) {
   );
   passed.push("partial funding buys highest-priority complete markets first");
 
+  const executionTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "42space-execution-isolation-self-test-"));
+  try {
+    const isolatedCfg = isolatedExecutionTestConfig({
+      ...testCfg,
+      feishuAlertsEnabled: true,
+      feishuWebhook: "https://example.invalid/production-webhook"
+    }, executionTestRoot);
+    const isolatedFiles = [
+      isolatedCfg.stateFile,
+      isolatedCfg.fillsFile,
+      isolatedCfg.gasLedgerFile,
+      isolatedCfg.decisionFile,
+      isolatedCfg.alertStateFile,
+      isolatedCfg.runtimeHealthFile,
+      isolatedCfg.autoSellStateFile,
+      isolatedCfg.autoSellPositionStateFile,
+      isolatedCfg.autoSellCircuitStateFile
+    ];
+    assertSelfTest(isolatedCfg.executionTestMode, "execution tests should carry an explicit side-effect guard");
+    assertSelfTest(!isolatedCfg.feishuAlertsEnabled && !isolatedCfg.feishuWebhook, "execution tests must disable Feishu");
+    assertSelfTest(
+      isolatedFiles.every((file) => path.dirname(file) === executionTestRoot),
+      "execution test writes must stay inside the isolated temporary directory"
+    );
+  } finally {
+    fs.rmSync(executionTestRoot, { recursive: true, force: true });
+  }
+  passed.push("execution tests isolate files and cannot send production Feishu alerts");
+
+  const dedicatedTimerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "42space-dedicated-timer-self-test-"));
+  try {
+    const timerCfg = {
+      ...isolatedExecutionTestConfig(testCfg, dedicatedTimerRoot),
+      allowLateBuy: false,
+      eventOpenWindowSeconds: 20
+    };
+    const timerMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000000050",
+      question: "Dedicated timer expiry race",
+      startDate: new Date(Date.now() - 30000).toISOString()
+    });
+    const timerKey = eventSeenKey(timerMarket, timerCfg);
+    const timerRecord = { market: timerMarket, dedicatedOpenTimer: true };
+    const timerPending = new Map([[timerKey, timerRecord]]);
+    const timerSeen = new Set();
+    skipExpiredPendingMarkets(timerCfg, timerSeen, timerPending, "self-test-dedicated-timer");
+    assertSelfTest(
+      timerPending.has(timerKey) && !timerSeen.has(timerKey),
+      "an active dedicated open timer must not be marked expired by the generic drain loop"
+    );
+    timerRecord.dedicatedOpenTimer = false;
+    skipExpiredPendingMarkets(timerCfg, timerSeen, timerPending, "self-test-dedicated-timer-finished");
+    assertSelfTest(
+      !timerPending.has(timerKey) && timerSeen.has(timerKey),
+      "an expired record should be skipped after its dedicated timer finishes"
+    );
+  } finally {
+    fs.rmSync(dedicatedTimerRoot, { recursive: true, force: true });
+  }
+  passed.push("dedicated open timers are protected from the generic expiry race");
+
   const preSignedBundleTx = { txHash: "0xpresigned", nonce: 1000 };
   const originalBundle = {
     markets: [
@@ -3914,10 +5316,14 @@ function mockFifaExactScoreOutcomes({ homePrice, awayPrice, drawPrice }) {
     ["ECU 2-2 CUW", drawPrice],
     ["ECU 1-0 CUW", homePrice],
     ["ECU 2-0 CUW", homePrice],
+    ["ECU 3-0 CUW", homePrice],
     ["ECU 2-1 CUW", homePrice],
+    ["ECU 3-1 CUW", homePrice],
     ["ECU 0-1 CUW", awayPrice],
     ["ECU 0-2 CUW", awayPrice],
-    ["ECU 1-2 CUW", awayPrice]
+    ["ECU 0-3 CUW", awayPrice],
+    ["ECU 1-2 CUW", awayPrice],
+    ["ECU 1-3 CUW", awayPrice]
   ];
   return rows.map(([name, price], index) => ({
     tokenId: (1n << BigInt(index)).toString(),
@@ -3960,9 +5366,15 @@ async function buildPresignTestRecords(cfg, args) {
   const startDate = args.startDate ?? futureMarkets[0]?.startDate;
   if (!startDate) throw new Error("No future Event Market found for pre-sign test");
   const startMs = new Date(startDate).getTime();
+  const useProfileSigner = args.profileSigner === true;
+  if (useProfileSigner && !cfg.privateKey) {
+    throw new Error("--profile-signer requires PRIVATE_KEY from the loaded profile");
+  }
+  const signerMode = useProfileSigner ? "profile" : "public_test";
+  const isolatedCfg = isolatedExecutionTestConfig(cfg);
   const testCfg = {
-    ...cfg,
-    privateKey: PUBLIC_TEST_PRIVATE_KEY,
+    ...isolatedCfg,
+    privateKey: useProfileSigner ? cfg.privateKey : PUBLIC_TEST_PRIVATE_KEY,
     dryRun: false,
     execute: true,
     riskAck: "YES",
@@ -3978,7 +5390,11 @@ async function buildPresignTestRecords(cfg, args) {
       `No same-start Event Market fits MAX_BATCH_STAKE_USDT ${testCfg.maxBatchStakeUsdt} for pre-sign test at ${startDate}`
     );
   }
-  const runtime = { receiverAddress: PUBLIC_TEST_RECEIVER, nextNonce: 1000 };
+  const testAccount = makeClients(testCfg).account;
+  const runtime = {
+    receiverAddress: testAccount?.address ?? PUBLIC_TEST_RECEIVER,
+    nextNonce: 1000
+  };
   const records = await Promise.all(batch.map((market) => preparePendingRecord(testCfg, market, runtime)));
   const prepareErrors = records.filter((record) => record.prepareError).map((record) => ({
     market: pendingMarket(record).address,
@@ -3987,7 +5403,25 @@ async function buildPresignTestRecords(cfg, args) {
   if (prepareErrors.length > 0) {
     throw new Error(`Pre-sign test prepare failed: ${JSON.stringify(prepareErrors)}`);
   }
-  return { chain, batch, startDate, testCfg, runtime, records };
+  return { chain, batch, startDate, testCfg, runtime, records, signerMode };
+}
+
+function isolatedExecutionTestConfig(cfg, root = fs.mkdtempSync(path.join(os.tmpdir(), "42space-execution-test-"))) {
+  return {
+    ...cfg,
+    executionTestMode: true,
+    feishuAlertsEnabled: false,
+    feishuWebhook: "",
+    stateFile: path.join(root, "seen-markets.json"),
+    fillsFile: path.join(root, "fills.jsonl"),
+    gasLedgerFile: path.join(root, "gas-ledger.jsonl"),
+    decisionFile: path.join(root, "market-decisions.jsonl"),
+    alertStateFile: path.join(root, "alert-state.json"),
+    runtimeHealthFile: path.join(root, "runtime-health.json"),
+    autoSellStateFile: path.join(root, "auto-sell-seen.json"),
+    autoSellPositionStateFile: path.join(root, "auto-sell-positions.json"),
+    autoSellCircuitStateFile: path.join(root, "auto-sell-circuit.json")
+  };
 }
 
 function selectBatchWithinStakeCap(markets, cfg) {
@@ -4123,6 +5557,7 @@ async function arm(cfg, args) {
     waitForReceipt: cfg.waitForReceipt,
     fanoutBroadcast: cfg.fanoutBroadcast,
     broadcastRpcCount: cfg.broadcastRpcUrls.length,
+    builderBundle: builderBundleConfigSummary(cfg),
     executionRetryMs: cfg.executionRetryMs,
     eventOpenWindowSeconds: cfg.eventOpenWindowSeconds,
     preSignFastTx: cfg.preSignFastTx,
@@ -4152,6 +5587,8 @@ async function arm(cfg, args) {
     autoSellStartDelaySeconds: cfg.autoSellStartDelaySeconds,
     autoSellIntervalSeconds: cfg.autoSellIntervalSeconds,
     autoSellChunkPercent: cfg.autoSellChunkPercent,
+    autoSellLadderProfitPercent: cfg.autoSellLadderProfitPercent,
+    autoSellTakeProfitSteps: cfg.autoSellTakeProfitSteps,
     autoSellApplyAfterIso: cfg.autoSellApplyAfterIso,
     autoSellStopLossEnabled: cfg.autoSellStopLossEnabled,
     autoSellStopLossPercent: cfg.autoSellStopLossPercent,
@@ -4170,9 +5607,11 @@ async function arm(cfg, args) {
 
   let runtime = null;
   let autoSellMonitor;
+  let runtimeHealthMonitor;
   let autoSellStartedBeforeFunding = false;
   if (shouldStartAutoSellBeforeFunding(cfg)) {
     runtime = await createRuntime(cfg);
+    runtimeHealthMonitor = startRuntimeHealthMonitor(cfg, runtime);
     autoSellMonitor = startAutoSellMonitor(cfg, runtime);
     autoSellStartedBeforeFunding = Boolean(autoSellMonitor);
     console.log(JSON.stringify({
@@ -4214,6 +5653,7 @@ async function arm(cfg, args) {
   await watch(cfg, {
     fundingRecovery,
     ...(runtime !== null ? { runtime } : {}),
+    ...(runtimeHealthMonitor !== undefined ? { runtimeHealthMonitor } : {}),
     ...(autoSellMonitor !== undefined ? { autoSellMonitor, autoSellStartedBeforeFunding } : {})
   });
 }
@@ -4314,6 +5754,7 @@ async function doctor(cfg, args = {}) {
       fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
       fanoutBroadcast: cfg.fanoutBroadcast,
       broadcastRpcCount: cfg.broadcastRpcUrls.length,
+      builderBundle: builderBundleConfigSummary(cfg),
       preSignFastTx: cfg.preSignFastTx,
       preSignWindowMs: cfg.preSignWindowMs,
       preSignRetryMs: cfg.preSignRetryMs,
@@ -4487,6 +5928,7 @@ async function createRuntime(cfg) {
     pendingBuyRecords: null,
     openBroadcastBlockClock: null,
     autoSellOperatorReadyMarkets: new Set(),
+    health: createRuntimeHealthState(cfg),
     txLock: {
       owner: null,
       since: null
@@ -4499,6 +5941,147 @@ async function createRuntime(cfg) {
     });
   }
   return runtime;
+}
+
+function createRuntimeHealthState(cfg) {
+  const startedAt = new Date().toISOString();
+  return {
+    version: 1,
+    profile: cfg.botName || "42space",
+    pid: process.pid,
+    startedAt,
+    updatedAt: null,
+    buy: {
+      enabled: Boolean(!cfg.dryRun && cfg.execute),
+      policy: runtimeBuyPolicy(cfg),
+      state: "starting",
+      lastHeartbeatAt: null,
+      pendingCount: 0,
+      preparedCount: 0,
+      transactionLock: null
+    },
+    sell: {
+      enabled: Boolean(cfg.autoSellEnabled),
+      strategy: cfg.autoSellStrategy,
+      state: cfg.autoSellEnabled ? "starting" : "disabled",
+      lastTickStartedAt: null,
+      lastTickCompletedAt: null,
+      lastSuccessfulScanAt: null,
+      checked: 0,
+      triggered: 0,
+      executed: 0,
+      errors: 0,
+      skippedReason: null,
+      guardUntil: null,
+      lastErrorAt: null,
+      lastError: null
+    }
+  };
+}
+
+function runtimeBuyPolicy(cfg) {
+  if (bot3FifaExactScoreAutoBuyActive(cfg)) return "fifa_exact_score_lowest_price_tier";
+  if (String(cfg.eventIntelBuyFilter ?? "").trim().toLowerCase() === "strong") return "meme_binance_strong";
+  return "planned_or_manual_follow";
+}
+
+function startRuntimeHealthMonitor(cfg, runtime) {
+  if (!runtime?.health || !cfg.runtimeHealthFile) return null;
+  const write = () => {
+    refreshRuntimeHealthSnapshot(runtime);
+    try {
+      saveRuntimeHealth(cfg.runtimeHealthFile, runtime.health);
+    } catch (error) {
+      const now = Date.now();
+      if (now - runtimeHealthWriteWarningAt >= 60000) {
+        runtimeHealthWriteWarningAt = now;
+        console.error(JSON.stringify({
+          level: "warn",
+          source: "runtime-health",
+          message: errorMessage(error),
+          at: new Date(now).toISOString()
+        }));
+      }
+    }
+  };
+  write();
+  const timer = setInterval(write, RUNTIME_HEALTH_INTERVAL_MS);
+  timer.unref?.();
+  return timer;
+}
+
+function refreshRuntimeHealthSnapshot(runtime, now = Date.now()) {
+  if (!runtime?.health) return null;
+  const at = new Date(now).toISOString();
+  const pending = runtime.pendingBuyRecords instanceof Map ? [...runtime.pendingBuyRecords.values()] : [];
+  const lock = runtimeTransactionLockInfo(runtime);
+  const buyBusy = Boolean(lock?.owner && /buy|bundle|open|broadcast/iu.test(lock.owner));
+  runtime.health.updatedAt = at;
+  runtime.health.pid = process.pid;
+  runtime.health.buy = {
+    ...runtime.health.buy,
+    state: buyBusy ? "executing" : (pending.length > 0 ? "armed" : "watching"),
+    lastHeartbeatAt: at,
+    pendingCount: pending.length,
+    preparedCount: pending.filter((record) => Boolean(record?.preparedPlan)).length,
+    transactionLock: lock
+  };
+  if (!runtime.health.sell.enabled) runtime.health.sell.state = "disabled";
+  return runtime.health;
+}
+
+function saveRuntimeHealth(file, state) {
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
+}
+
+function markAutoSellHealthStarted(runtime, at = new Date().toISOString()) {
+  if (!runtime?.health?.sell) return;
+  runtime.health.sell = {
+    ...runtime.health.sell,
+    enabled: true,
+    state: "checking",
+    lastTickStartedAt: at
+  };
+}
+
+function markAutoSellHealthCompleted(runtime, result, at = new Date().toISOString()) {
+  if (!runtime?.health?.sell) return;
+  const circuitOpen = result?.circuitBreaker?.status === "open";
+  const guarded = ["open-buy-window", "buy-hot-window", "transaction-busy"].includes(result?.skippedReason);
+  const successfulScan = !circuitOpen && !guarded && !result?.transientPositionsError;
+  runtime.health.sell = {
+    ...runtime.health.sell,
+    state: circuitOpen ? "paused" : (guarded ? "guarded" : (result?.transientPositionsError ? "degraded" : "watching")),
+    lastTickCompletedAt: at,
+    lastSuccessfulScanAt: successfulScan ? at : runtime.health.sell.lastSuccessfulScanAt,
+    checked: successfulScan ? Number(result?.checked ?? 0) : runtime.health.sell.checked,
+    triggered: successfulScan ? Number(result?.triggered ?? 0) : runtime.health.sell.triggered,
+    executed: successfulScan ? Number(result?.executed ?? 0) : runtime.health.sell.executed,
+    errors: successfulScan ? (Array.isArray(result?.errors) ? result.errors.length : 0) : runtime.health.sell.errors,
+    skippedReason: result?.skippedReason ?? null,
+    guardUntil: guarded
+      ? (result?.pause?.until ?? result?.hotWindow?.startsAt ?? null)
+      : null,
+    lastErrorAt: result?.transientPositionsError ? at : runtime.health.sell.lastErrorAt,
+    lastError: result?.transientPositionsError?.message ?? runtime.health.sell.lastError
+  };
+}
+
+function markAutoSellHealthError(runtime, error, at = new Date().toISOString()) {
+  if (!runtime?.health?.sell) return;
+  runtime.health.sell = {
+    ...runtime.health.sell,
+    state: "error",
+    lastTickCompletedAt: at,
+    lastErrorAt: at,
+    lastError: String(error ?? "auto-sell monitor error")
+  };
 }
 
 function runtimeTransactionBusy(runtime) {
@@ -4539,11 +6122,12 @@ function pauseRuntimeAutoSell(runtime, cfg, reason) {
 
 function autoSellPresignPauseHoldMs(cfg) {
   if (cfg.autoSellStrategy === "open_timed_exit") {
+    const monitorPollMs = autoSellMonitorSchedulerMs(cfg);
     return Math.max(
-      cfg.autoSellPollMs,
+      monitorPollMs,
       Number(cfg.preSignWindowMs ?? 0) +
         Number(cfg.openBroadcastDelayMs ?? eventOpenWindowMs(cfg)) +
-        Math.max(1000, Number(cfg.autoSellPollMs ?? 0))
+        Math.max(1000, monitorPollMs)
     );
   }
   return Math.max(
@@ -4619,6 +6203,7 @@ function runtimeAutoSellBlockInfo(cfg, runtime) {
 }
 
 async function withRuntimeTransactionLock(runtime, owner, fn) {
+  await waitForRuntimeBuilderNonceRecovery(runtime);
   if (!runtime?.txLock) return fn();
   if (runtime.txLock.owner) {
     const error = new Error(`transaction lock busy: ${runtime.txLock.owner}`);
@@ -4632,6 +6217,14 @@ async function withRuntimeTransactionLock(runtime, owner, fn) {
   } finally {
     runtime.txLock.owner = null;
     runtime.txLock.since = null;
+  }
+}
+
+async function waitForRuntimeBuilderNonceRecovery(runtime) {
+  const recovery = runtime?.builderNonceRecoveryPromise;
+  if (recovery) await recovery;
+  if (runtime?.builderNonceRecoveryError) {
+    throw new Error(`strict Builder nonce recovery blocked: ${runtime.builderNonceRecoveryError}`);
   }
 }
 
@@ -4667,6 +6260,9 @@ async function watch(cfg, options = {}) {
   const autoSellMonitor = autoSellMonitorPrestarted
     ? options.autoSellMonitor
     : startAutoSellMonitor(cfg, runtime);
+  const runtimeHealthMonitor = Object.prototype.hasOwnProperty.call(options, "runtimeHealthMonitor")
+    ? options.runtimeHealthMonitor
+    : startRuntimeHealthMonitor(cfg, runtime);
   const openBroadcastBlockClock = maybeStartOpenBroadcastBlockClock(cfg, runtime);
 
   console.log(
@@ -4701,6 +6297,7 @@ async function watch(cfg, options = {}) {
         bundleFastGasLimit: cfg.bundleFastGasLimit || null,
         logChunkBlocks: cfg.logChunkBlocks,
       bundleDueMarkets: cfg.bundleDueMarkets,
+      builderBundle: builderBundleConfigSummary(cfg),
       fastNonceManager: cfg.fastNonceManager,
       fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
       preSignFastTx: cfg.preSignFastTx,
@@ -4775,7 +6372,12 @@ async function watch(cfg, options = {}) {
               monitorSource: autoSellMonitorPrestarted ? "pre-funding" : "watch",
               startedBeforeFunding: Boolean(options.autoSellStartedBeforeFunding)
             }
-          : { enabled: false }
+          : { enabled: false },
+        runtimeHealth: {
+          enabled: Boolean(runtimeHealthMonitor),
+          file: cfg.runtimeHealthFile || null,
+          intervalMs: RUNTIME_HEALTH_INTERVAL_MS
+        }
       },
       null,
       2
@@ -4808,21 +6410,114 @@ async function maybeWarmBroadcastRpcs(cfg) {
   return warmBroadcastRpcClients(cfg);
 }
 
+function autoSellMonitorSchedulerMs(cfg) {
+  const configured = readPlannedBuys(cfg)
+    .filter((plan) => plan.enabled || plan.preserveAutoSellAfterDisable)
+    .map((plan) => plan.autoSell)
+    .filter((autoSell) => autoSellPriceTargetsEnabled(autoSell))
+    .map((autoSell) => Number(autoSell.autoSellPriceHotPollMs ?? 1000))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return Math.max(250, Math.min(Number(cfg.autoSellPollMs ?? 60000), ...configured));
+}
+
+function autoSellMonitorDesiredPollMs(cfg, now = Date.now()) {
+  const hotWindow = activeAutoSellPriceHotWindow(cfg, now);
+  return hotWindow?.pollMs ?? Number(cfg.autoSellPollMs ?? 60000);
+}
+
+function activeAutoSellPriceHotWindow(cfg, now = Date.now()) {
+  for (const record of loadAutoSellBuyRecords(cfg)) {
+    const plan = plannedBuyAutoSellForMarket(cfg, record);
+    const autoSell = plan?.autoSell;
+    if (!autoSellPriceTargetsEnabled(autoSell)) continue;
+    const buyAtMs = Date.parse(record.buyAt ?? "");
+    if (!Number.isFinite(buyAtMs) || now < buyAtMs) continue;
+    const applyAfterMs = Date.parse(autoSell.autoSellPriceApplyAfterIso ?? "");
+    if (Number.isFinite(applyAfterMs) && buyAtMs < applyAfterMs) continue;
+    const windowMs = Number(autoSell.autoSellPriceHotWindowSeconds ?? 600) * 1000;
+    if (!(windowMs > 0) || now >= buyAtMs + windowMs) continue;
+    return {
+      market: record.address,
+      question: record.question,
+      buyAt: record.buyAt,
+      until: new Date(buyAtMs + windowMs).toISOString(),
+      pollMs: Math.max(250, Number(autoSell.autoSellPriceHotPollMs ?? 1000))
+    };
+  }
+  return null;
+}
+
+function loadAutoSellBuyRecords(cfg) {
+  const file = cfg?.fillsFile;
+  if (!file || !fs.existsSync(file)) return [];
+  const stat = fs.statSync(file);
+  const cacheKey = `${stat.mtimeMs}:${stat.size}:${cfg.autoSellEligibleTailBytes}`;
+  const cached = autoSellBuyRecordsCache.get(file);
+  if (cached?.cacheKey === cacheKey) return cached.records;
+
+  const applyAfterMs = cfg.autoSellApplyAfterIso ? Date.parse(cfg.autoSellApplyAfterIso) : 0;
+  const recordsByMarket = new Map();
+  for (const row of readJsonlTailRows(file, cfg.autoSellEligibleTailBytes)) {
+    const buyAtMs = Date.parse(row?.at ?? "");
+    if (!Number.isFinite(buyAtMs) || buyAtMs < applyAfterMs || !isSuccessfulBuyFill(row)) continue;
+    for (const record of boughtMarketRecordsFromFill(row)) {
+      const key = String(record.address ?? "").toLowerCase();
+      if (!key) continue;
+      const existing = recordsByMarket.get(key);
+      if (!existing || Date.parse(existing.buyAt) < buyAtMs) {
+        recordsByMarket.set(key, { ...record, buyAt: new Date(buyAtMs).toISOString() });
+      }
+    }
+  }
+  const records = [...recordsByMarket.values()];
+  autoSellBuyRecordsCache.set(file, { cacheKey, records });
+  return records;
+}
+
+function boughtMarketRecordsFromFill(row) {
+  if (row?.plan?.market?.address) {
+    return [{ address: row.plan.market.address, question: row.plan.market.question ?? null }];
+  }
+  if (Array.isArray(row?.bundle?.markets)) {
+    return row.bundle.markets
+      .map((market) => ({ address: market?.address, question: market?.question ?? null }))
+      .filter((market) => market.address);
+  }
+  if (row?.context?.market) {
+    return [{ address: row.context.market, question: row.context.question ?? null }];
+  }
+  if (Array.isArray(row?.context?.markets)) {
+    return row.context.markets
+      .map((market) => typeof market === "string"
+        ? { address: market, question: row.context.question ?? null }
+        : { address: market?.address, question: market?.question ?? row.context.question ?? null })
+      .filter((market) => market.address);
+  }
+  return [];
+}
+
 function startAutoSellMonitor(cfg, runtime = null) {
   if (!cfg.autoSellEnabled) return null;
   const seen = loadSeen(cfg.autoSellStateFile);
   let running = false;
+  let lastTickStartedAt = 0;
   let consecutiveTransientPositionsErrors = 0;
 
-  const tick = async () => {
+  const tick = async ({ force = false } = {}) => {
     if (running) return;
+    const now = Date.now();
+    const desiredPollMs = autoSellMonitorDesiredPollMs(cfg, now);
+    if (!force && lastTickStartedAt > 0 && now - lastTickStartedAt < desiredPollMs) return;
     running = true;
+    lastTickStartedAt = now;
+    markAutoSellHealthStarted(runtime, new Date(now).toISOString());
     try {
       const result = await runAutoSellOnce(cfg, {
         seen,
         runtime,
         source: "monitor"
       });
+      markAutoSellHealthCompleted(runtime, result);
       if (result.transientPositionsError) {
         consecutiveTransientPositionsErrors += 1;
         console.warn(JSON.stringify({
@@ -4893,6 +6588,7 @@ function startAutoSellMonitor(cfg, runtime = null) {
       }
     } catch (error) {
       const message = autoSellErrorMessage(cfg, error);
+      markAutoSellHealthError(runtime, message);
       console.error(JSON.stringify({
         level: "event-auto-sell-error",
         source: "monitor",
@@ -4913,8 +6609,8 @@ function startAutoSellMonitor(cfg, runtime = null) {
     }
   };
 
-  const timer = setInterval(tick, cfg.autoSellPollMs);
-  void tick();
+  const timer = setInterval(tick, autoSellMonitorSchedulerMs(cfg));
+  void tick({ force: true });
   return timer;
 }
 
@@ -5013,7 +6709,15 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         continue;
       }
 
-      const action = await buildAutoSellAction(autoSellCfg, publicClient, walletAddress, position, entry, now);
+      const action = await buildAutoSellAction(
+        autoSellCfg,
+        publicClient,
+        walletAddress,
+        position,
+        entry,
+        now,
+        autoSellOperatorApprovalHint(runtime, position.marketAddress)
+      );
       if (!action) continue;
 
       result.triggered += 1;
@@ -5467,7 +7171,7 @@ function marketsFromItems(items) {
 }
 
 function autoSellConfigForPosition(cfg, position) {
-  const planned = plannedBuyForMarket(cfg, {
+  const planned = plannedBuyAutoSellForMarket(cfg, {
     address: position?.marketAddress,
     question: position?.question?.title
   });
@@ -5504,28 +7208,83 @@ function autoSellExecutionConfigForItems(cfg, items) {
   };
 }
 
+function rpcOnlyAutoSellBroadcastConfig(cfg) {
+  return {
+    ...cfg,
+    builderBundleEnabled: false,
+    builderBundleRequestedEnabled: false,
+    builderBundleKillSwitch: true,
+    builderTimedBuyExecutorEnabled: false,
+    builderTimestampGuardEnabled: false
+  };
+}
+
 function isAutoSellEnabledForPosition(cfg) {
   if (cfg?.autoSellEnabled === false) return false;
   const strategy = String(cfg?.autoSellStrategy ?? "").trim().toLowerCase();
   return !["hold_to_settlement", "hold", "disabled", "off", "none"].includes(strategy);
 }
 
-async function buildAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
-  if (cfg.autoSellStrategy === "open_timed_exit") {
-    return buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
-  }
-  if (cfg.autoSellStrategy === "pre_start_exit") {
-    return buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
-  }
-  return buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now);
+function autoSellOperatorApprovalHint(runtime, marketAddress) {
+  const marketKey = String(marketAddress ?? "").toLowerCase();
+  if (!marketKey) return undefined;
+  return runtime?.autoSellOperatorReadyMarkets?.has(marketKey) ? true : undefined;
 }
 
-async function buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+async function buildAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved) {
+  if (cfg.autoSellStrategy === "open_timed_exit") {
+    return buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved);
+  }
+  if (cfg.autoSellStrategy === "pre_start_exit") {
+    return buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved);
+  }
+  return buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved);
+}
+
+async function buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved) {
   const dueAt = autoSellOpenExitDueAt(cfg, position);
   if (dueAt === null) return null;
   const due = now >= dueAt;
-  const quoteState = cfg.autoSellStopLossEnabled
-    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry)
+  const priceTarget = autoSellPriceTargetForPosition(cfg, position, entry);
+  if (!due && priceTarget?.reached) {
+    const percent = Number(cfg.autoSellPriceSellPercent ?? 100);
+    const plan = await buildDirectSellPlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      percent
+    });
+    return {
+      plan,
+      trigger: "price_target",
+      triggerLabel: "价格止盈",
+      percent,
+      step: entry.nextStep,
+      openTimedExitDueAt: new Date(dueAt).toISOString(),
+      sellAmountOt: formatUnits(plan.amount, 18),
+      marketAddress: position.marketAddress,
+      tokenId: String(position.tokenId),
+      question: position.question?.title ?? null,
+      outcome: position.outcome?.name ?? null,
+      currentPrice: priceTarget.currentPrice,
+      targetPrice: priceTarget.targetPrice,
+      priceSource: "42_rest_positions",
+      costBasisUsdt: roundUsd(Number(position?.costBasis ?? 0)),
+      remainingCostBasisUsdt: roundUsd(autoSellRemainingCostBasisUsdt(position, entry, Number(position?.costBasis ?? 0))),
+      fullExitValueUsdt: null,
+      profitPercent: null,
+      lossPercent: null,
+      minCollateralOutUsdt: "0.000000000000000001",
+      noPriceProtection: true,
+      quoteError: null,
+      txHash: null
+    };
+  }
+  const takeProfitDue = autoSellPriceTargetsEnabled(cfg)
+    ? false
+    : autoSellOpenTimedTakeProfitDue(cfg, entry, now, dueAt);
+  const quoteState = cfg.autoSellStopLossEnabled || takeProfitDue
+    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry, operatorApproved)
     : defaultAutoSellReturnState(position);
 
   if (
@@ -5558,6 +7317,42 @@ async function buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress
       profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
       lossPercent: roundUsd(quoteState.lossPercent),
       stopLossPercent: cfg.autoSellStopLossPercent,
+      minCollateralOutUsdt: "0.000000000000000001",
+      noPriceProtection: true,
+      quoteError: quoteState.quoteError,
+      txHash: null
+    };
+  }
+
+  if (takeProfitDue && isAutoSellLadderProfitReady(cfg, quoteState.profitPercent)) {
+    const amountOt = autoSellStepAmountOt(cfg, entry, position);
+    if (!amountOt) return null;
+    const plan = await buildDirectSellPlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      amountOt
+    });
+    return {
+      plan,
+      trigger: "ladder_step",
+      triggerLabel: "止盈",
+      percent: cfg.autoSellChunkPercent,
+      step: entry.nextStep,
+      totalSteps: autoSellTotalSteps(cfg),
+      dueAt: new Date(autoSellStepDueAt(cfg, entry)).toISOString(),
+      openTimedExitDueAt: new Date(dueAt).toISOString(),
+      sellAmountOt: formatUnits(plan.amount, 18),
+      marketAddress: position.marketAddress,
+      tokenId: String(position.tokenId),
+      question: position.question?.title ?? null,
+      outcome: position.outcome?.name ?? null,
+      costBasisUsdt: roundUsd(quoteState.costBasisUsdt),
+      remainingCostBasisUsdt: roundUsd(quoteState.remainingCostBasisUsdt),
+      fullExitValueUsdt: quoteState.fullExitValueUsdt === null ? null : roundUsd(quoteState.fullExitValueUsdt),
+      profitPercent: quoteState.profitPercent === null ? null : roundUsd(quoteState.profitPercent),
+      ladderProfitPercent: cfg.autoSellLadderProfitPercent,
+      lossPercent: quoteState.lossPercent === null ? null : roundUsd(quoteState.lossPercent),
       minCollateralOutUsdt: "0.000000000000000001",
       noPriceProtection: true,
       quoteError: quoteState.quoteError,
@@ -5600,6 +7395,39 @@ async function buildOpenTimedExitAutoSellAction(cfg, publicClient, walletAddress
   };
 }
 
+function autoSellPriceTargetsEnabled(cfg) {
+  return Array.isArray(cfg?.autoSellPriceTargets) && cfg.autoSellPriceTargets.some((target) => target?.enabled !== false);
+}
+
+function autoSellPriceTargetForPosition(cfg, position, entry) {
+  if (!autoSellPriceTargetsEnabled(cfg)) return null;
+  const buyAtMs = Date.parse(entry?.buyAt ?? "");
+  const applyAfterMs = Date.parse(cfg.autoSellPriceApplyAfterIso ?? "");
+  if (Number.isFinite(applyAfterMs) && (!Number.isFinite(buyAtMs) || buyAtMs < applyAfterMs)) return null;
+  const outcomeKey = normalizePlannedBuyOutcomeName(position?.outcome?.name);
+  const target = cfg.autoSellPriceTargets.find((item) => (
+    item?.enabled !== false && normalizePlannedBuyOutcomeName(item?.outcome) === outcomeKey
+  ));
+  if (!target) return null;
+  const currentPrice = Number(position?.curPrice);
+  const targetPrice = Number(target.price);
+  if (!Number.isFinite(currentPrice) || currentPrice <= 0 || !Number.isFinite(targetPrice) || targetPrice <= 0) return null;
+  return {
+    outcome: target.outcome,
+    currentPrice,
+    targetPrice,
+    reached: currentPrice >= targetPrice
+  };
+}
+
+function autoSellOpenTimedTakeProfitDue(cfg, entry, now, openExitDueAt) {
+  if (entry?.takeProfitCompleted) return false;
+  if (!autoSellLadderProfitGateEnabled(cfg)) return false;
+  if (Number(cfg.autoSellChunkPercent ?? 0) <= 0) return false;
+  if (openExitDueAt !== null && now >= openExitDueAt) return false;
+  return now >= autoSellStepDueAt(cfg, entry);
+}
+
 function retainedAutoSellFields(retained, plan = null) {
   const sellAmountOt = plan ? formatUnits(plan.amount, 18) : "0";
   return {
@@ -5615,12 +7443,12 @@ function retainedAutoSellFields(retained, plan = null) {
   };
 }
 
-async function buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+async function buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved) {
   const preStartDueAt = autoSellPreStartDueAt(cfg, position);
   const preStartDue = preStartDueAt !== null && now >= preStartDueAt;
   const retainedPosition = resolveAutoSellRetainedPosition(cfg, entry, position);
   const quoteState = cfg.autoSellStopLossEnabled
-    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry)
+    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry, operatorApproved)
     : defaultAutoSellReturnState(position);
   if (
     quoteState.quote &&
@@ -5811,7 +7639,7 @@ async function buildPreStartExitAutoSellAction(cfg, publicClient, walletAddress,
   };
 }
 
-async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now) {
+async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, position, entry, now, operatorApproved) {
   const dueAt = autoSellStepDueAt(cfg, entry);
   const due = now >= dueAt;
   const preStartDueAt = autoSellPreStartDueAt(cfg, position);
@@ -5819,7 +7647,7 @@ async function buildLadderAutoSellAction(cfg, publicClient, walletAddress, posit
   const retainedPosition = resolveAutoSellRetainedPosition(cfg, entry, position);
   const profitGateNeedsQuote = !entry.takeProfitCompleted && due && autoSellLadderProfitGateEnabled(cfg);
   const quoteState = cfg.autoSellStopLossEnabled || profitGateNeedsQuote
-    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry)
+    ? await quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry, operatorApproved)
     : defaultAutoSellReturnState(position);
   if (
     quoteState.quote &&
@@ -6097,6 +7925,8 @@ async function appendGasLedgerFromReceipt(cfg, publicClient, {
   source,
   wallet = "",
   allocations = [],
+  extraFeeWei = null,
+  extraFeeBnb = null,
   metadata = {}
 } = {}) {
   try {
@@ -6130,6 +7960,8 @@ async function appendGasLedgerFromReceipt(cfg, publicClient, {
       allocations,
       bnbUsdtPrice: priceInfo?.price ?? null,
       bnbUsdtSource: priceInfo?.source ?? "",
+      extraFeeWei,
+      extraFeeBnb,
       metadata: {
         ...metadata,
         priceError: priceInfo?.error ?? null
@@ -6213,16 +8045,19 @@ async function appendGasLedgerFromExecution(cfg, execution, {
 
 function gasAllocationsFromEventPlan(plan) {
   const market = plan?.market ?? {};
-  const stake = Number(plan?.stakePerOutcomeUsdt ?? 0);
-  return (plan?.outcomes ?? []).map((outcome) => ({
-    market: market.address,
-    question: market.question,
-    tokenId: outcome.tokenId,
-    outcome: outcome.name,
-    action: "buy",
-    amountUsdt: Number.isFinite(stake) && stake > 0 ? stake : null,
-    weight: Number.isFinite(stake) && stake > 0 ? stake : 1
-  }));
+  const fallbackStake = Number(plan?.stakePerOutcomeUsdt ?? 0);
+  return (plan?.outcomes ?? []).map((outcome) => {
+    const stake = Number(outcome?.stakeUsdt ?? fallbackStake);
+    return {
+      market: market.address,
+      question: market.question,
+      tokenId: outcome.tokenId,
+      outcome: outcome.name,
+      action: "buy",
+      amountUsdt: Number.isFinite(stake) && stake > 0 ? stake : null,
+      weight: Number.isFinite(stake) && stake > 0 ? stake : 1
+    };
+  });
 }
 
 function gasAllocationsFromBundle(bundle) {
@@ -6312,11 +8147,13 @@ function markAutoSellActionApplied(cfg, entry, item) {
   entry.lastSoldAt = appliedAt;
   if (
     item.trigger === "stop_loss" ||
+    item.trigger === "price_target" ||
     item.trigger === "pre_start_exit" ||
     item.trigger === "open_timed_exit" ||
     item.trigger === "fast_open_timed_exit"
   ) {
     if (item.trigger === "stop_loss") entry.stopLossSold = true;
+    if (item.trigger === "price_target") entry.priceTargetSold = true;
     if (item.trigger === "pre_start_exit") entry.preStartSold = true;
     if (item.trigger === "open_timed_exit" || item.trigger === "fast_open_timed_exit") entry.openTimedExitSold = true;
     entry.remainingSize = "0";
@@ -6352,6 +8189,7 @@ function ensureAutoSellPositionState(state, key, position, buyAt) {
       nextStep: 1,
       completed: false,
       stopLossSold: false,
+      priceTargetSold: false,
       takeProfitCompleted: false,
       preStartSold: false,
       openTimedExitSold: false,
@@ -6581,7 +8419,7 @@ function defaultAutoSellReturnState(position) {
   };
 }
 
-async function quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry) {
+async function quoteAutoSellReturnState(cfg, publicClient, walletAddress, position, entry, operatorApproved) {
   const state = defaultAutoSellReturnState(position);
   try {
     state.quote = await quoteSellOutcome(publicClient, {
@@ -6589,7 +8427,8 @@ async function quoteAutoSellReturnState(cfg, publicClient, walletAddress, positi
       tokenId: position.tokenId,
       owner: walletAddress,
       percent: 100,
-      slippageBps: cfg.slippageBps
+      slippageBps: cfg.slippageBps,
+      operatorApproved
     });
     state.fullExitValueUsdt = rawUsdt(state.quote.expectedCollateralToUser);
     const metrics = autoSellReturnMetrics(position, entry, state.fullExitValueUsdt);
@@ -7136,13 +8975,16 @@ function autoSellKey(walletAddress, position, cfg, trigger = null) {
 function autoSellSummaryText(cfg) {
   if (!cfg.autoSellEnabled) return "off";
   if (cfg.autoSellStrategy === "open_timed_exit") {
+    const takeProfit = Number(cfg.autoSellLadderProfitPercent ?? 0) > 0
+      ? `; 盈${cfg.autoSellLadderProfitPercent}%卖${cfg.autoSellChunkPercent}%`
+      : "";
     const stopLoss = cfg.autoSellStopLossEnabled
       ? `; 亏${cfg.autoSellStopLossPercent}%全卖`
       : "";
     const fast = cfg.autoSellFastOpenExitEnabled
       ? `; 快速随机T+${roundMs(cfg.autoSellFastOpenExitMinDelayMs / 1000)}-${roundMs(cfg.autoSellFastOpenExitMaxDelayMs / 1000)}s`
       : "";
-    return `开盘T+${cfg.autoSellOpenExitDelaySeconds}s卖${cfg.autoSellOpenExitPercent}%${fast}${stopLoss}`;
+    return `开盘T+${cfg.autoSellOpenExitDelaySeconds}s卖${cfg.autoSellOpenExitPercent}%${takeProfit}${fast}${stopLoss}`;
   }
   if (cfg.autoSellStrategy === "pre_start_exit") {
     const preStart = Number(cfg.autoSellBeforeMarketStartSeconds ?? 0) > 0
@@ -7548,6 +9390,8 @@ async function seedExistingRestMarkets(cfg, seen, pending, runtime = null, optio
         source: "startup-rest-seed",
         rankSource: record.preparedPlan?.selection?.rankSource ?? null,
         fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null,
+        selectedOutcomes: record.preparedPlan?.outcomes?.map((outcome) => outcome.name) ?? [],
+        memeRangeSelection: record.preparedPlan?.memeRangeSelection ?? null,
         message: record.prepareError ?? null
       });
     } else if (shouldCatchUpLiveMarket(cfg, market, options)) {
@@ -7605,6 +9449,8 @@ async function seedRecentChainMarkets(cfg, seen, pending, runtime = null, option
         decision,
         rankSource: record.preparedPlan?.selection?.rankSource ?? null,
         fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null,
+        selectedOutcomes: record.preparedPlan?.outcomes?.map((outcome) => outcome.name) ?? [],
+        memeRangeSelection: record.preparedPlan?.memeRangeSelection ?? null,
         message: record.prepareError ?? null
       });
     } else if (shouldCatchUpLiveMarket(cfg, market, options)) {
@@ -7664,6 +9510,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
   const wakeSignal = createWakeSignal();
   const restDiscovery = createRestDiscoveryState();
   const rpcKeepalive = createRpcKeepaliveState();
+  const builderKeepalive = createRpcKeepaliveState();
   const dueExecution = createDueExecutionState();
   let wsFailed = false;
   let consecutiveErrors = 0;
@@ -7710,6 +9557,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
       await preSignHotPendingMarkets(cfg, seen, pending, runtime);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       maybeStartBroadcastRpcKeepalive(cfg, pending, rpcKeepalive, runtime);
+      maybeStartBuilderBundleKeepalive(cfg, pending, builderKeepalive, runtime);
       await drainRestDiscoveryCandidates(cfg, seen, pending, runtime, restDiscovery);
       scheduleDuePendingMarkets(cfg, seen, pending, runtime, dueExecution);
       maybeStartRestDiscoveryPoll(cfg, seen, pending, restDiscovery, wakeSignal);
@@ -7751,6 +9599,7 @@ function createRpcKeepaliveState() {
 function createDueExecutionState() {
   return {
     timers: new Map(),
+    builderTimers: new Map(),
     running: false,
     rerun: false
   };
@@ -7877,6 +9726,7 @@ async function drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, sta
 
 function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = "due-scheduler") {
   if (!state?.timers || !pending) return;
+  if (!state.builderTimers) state.builderTimers = new Map();
   const now = Date.now();
   const scheduleAheadMs = Number(cfg.openBroadcastScheduleAheadMs ?? 0);
   const activeKeys = new Set();
@@ -7889,11 +9739,17 @@ function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = 
       if (seen.has(key)) continue;
     }
     const timing = openBroadcastTimingForRecord(record, cfg, runtime, now);
-    const targetMs = timing.targetMs;
-    if (!Number.isFinite(targetMs)) continue;
+    const nominalTargetMs = timing.targetMs;
+    if (!Number.isFinite(nominalTargetMs)) continue;
+    const retryTargetMs = Number(record?.executionRetryAfterMs ?? 0);
+    const targetMs = Number.isFinite(retryTargetMs)
+      ? Math.max(nominalTargetMs, retryTargetMs)
+      : nominalTargetMs;
     const waitMs = targetMs - now;
     if (waitMs < -eventOpenWindowMs(cfg)) continue;
     if (scheduleAheadMs > 0 && waitMs > scheduleAheadMs) continue;
+
+    scheduleEarlyBuilderSubmission(cfg, pending, runtime, state, key, record, nominalTargetMs, now);
 
     const existing = state.timers.get(key);
     if (existing?.targetMs === targetMs) continue;
@@ -7904,6 +9760,10 @@ function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = 
       void waitUntilBroadcastTarget(targetMs, Number(cfg.openBroadcastSpinMs ?? 0))
         .then(() => {
           if (!pending.has(key) || seen.has(key)) return false;
+          const current = pending.get(key);
+          if (current?.dedicatedOpenTimer && hasPreSignedSingle(current) && !hasPreSignedBundle(current)) {
+            return executeDedicatedScheduledSingle(cfg, seen, pending, runtime, key, current, targetMs);
+          }
           return drainDuePendingMarketsSerialized(cfg, seen, pending, runtime, state, "open-timer");
         })
         .catch((error) => {
@@ -7916,6 +9776,8 @@ function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = 
           }));
         })
         .finally(() => {
+          const current = pending.get(key);
+          if (current) current.dedicatedOpenTimer = false;
           state.timers.delete(key);
         });
     }, delayMs);
@@ -7941,6 +9803,258 @@ function scheduleDuePendingMarkets(cfg, seen, pending, runtime, state, source = 
     clearTimeout(scheduled.timer);
     state.timers.delete(key);
   }
+  for (const [key, scheduled] of [...state.builderTimers.entries()]) {
+    if (activeKeys.has(key) && !seen.has(key)) continue;
+    clearTimeout(scheduled.timer);
+    state.builderTimers.delete(key);
+  }
+}
+
+function scheduleEarlyBuilderSubmission(cfg, pending, runtime, state, key, record, targetMs, now = Date.now()) {
+  const existing = state.builderTimers.get(key);
+  const signed = record?.preSignedFastTransaction;
+  const executionCfg = executionConfigForPlan(cfg, record?.preparedPlan);
+  const configuredLeadMs = Number(executionCfg?.builderBundleEarlySubmitLeadMs ?? 0);
+  const absoluteEarlyTargetMs = Number(signed?.builderBundleEarlySubmitAtMs);
+  const earlyTargetMs = Number.isFinite(absoluteEarlyTargetMs) && absoluteEarlyTargetMs > 0
+    ? absoluteEarlyTargetMs
+    : targetMs - configuredLeadMs;
+  const targetBoundaryMs = Number(signed?.builderBundleTargetBoundaryAtMs);
+  const targetBoundaryLeadMs = Number.isFinite(targetBoundaryMs)
+    ? targetBoundaryMs - earlyTargetMs
+    : configuredLeadMs;
+  const publicFallbackLeadMs = targetMs - earlyTargetMs;
+  const strictTiming = Boolean(executionCfg?.builderBundleTimingResolved?.strict);
+  const validTimestampWindow = Boolean(
+    Number.isSafeInteger(Number(signed?.builderBundleMaxTimestamp)) &&
+    Number(signed.builderBundleMaxTimestamp) > 0
+  );
+  const configured = Boolean(
+    signed?.preSignedBuilderBundle &&
+    executionCfg?.builderBundleEnabled &&
+    ["builder_then_fanout", "builder_only"].includes(executionCfg?.builderBundleMode) &&
+    validTimestampWindow &&
+    earlyTargetMs < targetMs &&
+    Number.isFinite(publicFallbackLeadMs) &&
+    publicFallbackLeadMs > 0 &&
+    (!strictTiming || (Number.isFinite(targetBoundaryLeadMs) && targetBoundaryLeadMs > 0))
+  );
+  record.dedicatedOpenTimer = configured;
+  const eligible = configured && !signed.preSubmittedBuilderBundle;
+  if (!eligible) {
+    if (existing?.timer) clearTimeout(existing.timer);
+    state.builderTimers.delete(key);
+    return;
+  }
+  if (existing?.targetMs === earlyTargetMs && existing?.txHash === signed.txHash) return;
+  if (existing?.timer) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    const submissionPromise = submitEarlyBuilderBundleForRecord(cfg, pending, runtime, key, record, executionCfg, signed, {
+      targetMs,
+      earlyTargetMs,
+      targetBoundaryMs,
+      targetBoundaryLeadMs,
+      publicFallbackLeadMs
+    });
+    signed.preSubmittedBuilderBundlePromise = submissionPromise;
+    void submissionPromise.catch((error) => {
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "builder-bundle-early-submit",
+        market: pendingMarket(record)?.address,
+        question: pendingMarket(record)?.question,
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+    }).finally(() => {
+      if (signed.preSubmittedBuilderBundlePromise === submissionPromise) {
+        delete signed.preSubmittedBuilderBundlePromise;
+      }
+      state.builderTimers.delete(key);
+    });
+  }, Math.max(0, earlyTargetMs - now));
+  timer.unref?.();
+  state.builderTimers.set(key, { targetMs: earlyTargetMs, txHash: signed.txHash, timer });
+  console.log(JSON.stringify({
+    level: "builder-bundle-early-submit-scheduled",
+    market: pendingMarket(record)?.address,
+    question: pendingMarket(record)?.question,
+    txHash: signed.txHash,
+    targetAt: new Date(targetMs).toISOString(),
+    targetBoundaryAt: Number.isFinite(targetBoundaryMs) ? new Date(targetBoundaryMs).toISOString() : null,
+    earlySubmitAt: new Date(earlyTargetMs).toISOString(),
+    targetBoundaryLeadMs,
+    publicFallbackLeadMs,
+    minTimestamp: signed.builderBundleMinTimestamp ?? null,
+    maxTimestamp: signed.builderBundleMaxTimestamp ?? null,
+    timingMode: executionCfg.builderBundleTimingMode ?? "legacy",
+    targetSecond: signed.builderBundleTargetSecond ?? null,
+    at: new Date().toISOString()
+  }));
+}
+
+async function executeDedicatedScheduledSingle(cfg, seen, pending, runtime, key, record, targetMs) {
+  if (record.dedicatedOpenTimerInFlight) return false;
+  record.dedicatedOpenTimerInFlight = true;
+  const market = pendingMarket(record);
+  const reachedAtMs = Date.now();
+  console.log(JSON.stringify({
+    level: "open-broadcast-dedicated-timer",
+    market: market?.address,
+    question: market?.question,
+    targetAt: new Date(targetMs).toISOString(),
+    reachedAt: new Date(reachedAtMs).toISOString(),
+    latenessMs: Math.max(0, reachedAtMs - targetMs),
+    txHash: record.preSignedFastTransaction?.txHash ?? null,
+    at: new Date().toISOString()
+  }));
+  try {
+    const executed = await maybeExecuteMarket(cfg, seen, market, {
+      allowFuturePending: false,
+      runtime,
+      preparedPlan: record.preparedPlan,
+      preSignedFastTransaction: record.preSignedFastTransaction,
+      hydrateOdds: false,
+      hydrationSkipReason: "dedicated_open_timer",
+      retryRecord: record
+    });
+    if (executed || seen.has(key)) pending.delete(key);
+    return executed;
+  } finally {
+    record.dedicatedOpenTimerInFlight = false;
+  }
+}
+
+async function submitEarlyBuilderBundleForRecord(cfg, pending, runtime, key, record, executionCfg, signed, timing) {
+  const current = pending.get(key);
+  if (current !== record || current?.preSignedFastTransaction?.txHash !== signed.txHash) return null;
+  if (signed.preSubmittedBuilderBundle) return signed.preSubmittedBuilderBundle;
+  const inFlight = signed.preSubmittedBuilderBundlePromise ?? null;
+  if (inFlight) {
+    const sharedResult = await inFlight;
+    if (sharedResult?.submitted) {
+      signed.preSubmittedBuilderBundle = sharedResult;
+      return sharedResult;
+    }
+  }
+
+  const startedAtMs = Date.now();
+  const result = await submitPreSignedBuilderBundle(executionCfg, signed);
+  signed.preSubmittedBuilderBundle = result ?? {
+    submitted: false,
+    earlySubmitted: true,
+    earlySubmitStartedAt: new Date(startedAtMs).toISOString(),
+    earlySubmitLeadMs: timing.targetBoundaryLeadMs,
+    error: "builder early submission unavailable"
+  };
+  console.log(JSON.stringify({
+    level: "builder-bundle-early-submit-result",
+    market: pendingMarket(record)?.address,
+    question: pendingMarket(record)?.question,
+    txHash: signed.txHash,
+    submitted: Boolean(signed.preSubmittedBuilderBundle.submitted),
+    targetAt: new Date(timing.targetMs).toISOString(),
+    targetBoundaryAt: Number.isFinite(timing.targetBoundaryMs) ? new Date(timing.targetBoundaryMs).toISOString() : null,
+    earlySubmitAt: new Date(timing.earlyTargetMs).toISOString(),
+    startedAt: new Date(startedAtMs).toISOString(),
+    acceptedAt: signed.preSubmittedBuilderBundle.acceptedAt ?? null,
+    requestLatencyMs: signed.preSubmittedBuilderBundle.requestLatencyMs ?? null,
+    targetBoundaryLeadMs: timing.targetBoundaryLeadMs,
+    publicFallbackLeadMs: timing.publicFallbackLeadMs,
+    minTimestamp: signed.preSubmittedBuilderBundle.minTimestamp ?? signed.builderBundleMinTimestamp ?? null,
+    maxTimestamp: signed.preSubmittedBuilderBundle.maxTimestamp ?? signed.builderBundleMaxTimestamp ?? null,
+    timingMode: signed.preSubmittedBuilderBundle.timingMode ?? signed.builderBundleTimingMode ?? null,
+    targetSecond: signed.preSubmittedBuilderBundle.targetSecond ?? signed.builderBundleTargetSecond ?? null,
+    error: signed.preSubmittedBuilderBundle.error ?? null,
+    at: new Date().toISOString()
+  }));
+  if (!signed.preSubmittedBuilderBundle.submitted) {
+    releaseBuilderTipNonceReservationAfterEarlyFailure(cfg, pending, runtime, record, signed);
+  }
+  return signed.preSubmittedBuilderBundle;
+}
+
+function releaseBuilderTipNonceReservationAfterEarlyFailure(cfg, pending, runtime, sourceRecord, signed) {
+  if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
+  if (signed?.preSignedTimestampGuardTransaction) return;
+  if (signed?.builderBundleTipNonceRuntimeReleased) return;
+  const buyNonce = Number(signed?.nonce);
+  if (!Number.isSafeInteger(buyNonce) || buyNonce < 0) return;
+  if (signed?.timedBuyExecutorEnabled) {
+    if (signed.builderBundleNonceRecoveryDeferred) return;
+    signed.builderBundleNonceRecoveryDeferred = true;
+    scheduleStrictBuilderTargetExpiryWatch(
+      cfg,
+      strictBuilderExpiryResultFromSigned(signed),
+      {
+        type: "single",
+        market: pendingMarket(sourceRecord)?.address ?? null,
+        question: pendingMarket(sourceRecord)?.question ?? null,
+        marketDetails: [pendingMarket(sourceRecord)].filter(Boolean),
+        sourceRecord
+      },
+      runtime,
+      { allowUnsubmitted: true }
+    );
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "builder-early-submit-nonce-recovery-deferred",
+      buyTxHash: signed.txHash,
+      buyNonce,
+      targetTimestamp: signed.timedBuyExecutorTargetTimestamp ?? null,
+      reason: "timed Builder buy nonce remains reserved until the exact target second expires",
+      at: new Date().toISOString()
+    }));
+    return;
+  }
+  let cleared = 0;
+  for (const record of pending.values()) {
+    if (record === sourceRecord) continue;
+    const singleNonce = Number(record?.preSignedFastTransaction?.nonce);
+    if (Number.isSafeInteger(singleNonce) && singleNonce > buyNonce) {
+      clearPreSignedSingleRecord(record, "builder-early-submit-failed");
+      cleared += 1;
+    }
+    const bundleNonce = Number(record?.preSignedFastBundleTransaction?.nonce);
+    if (Number.isSafeInteger(bundleNonce) && bundleNonce > buyNonce) {
+      clearPreSignedBundleRecords([record], "builder-early-submit-failed");
+      cleared += 1;
+    }
+  }
+  const nextNonce = buyNonce + 1;
+  const previousNonce = runtime.nextNonce;
+  runtime.nextNonce = Math.min(previousNonce, nextNonce);
+  runtime.lastNonceSyncAt = 0;
+  signed.builderBundleTipNonceReleased = true;
+  signed.builderBundleTipNonceRuntimeReleased = true;
+  if (signed.preSubmittedBuilderBundle) signed.preSubmittedBuilderBundle.tipNonceReleased = true;
+  console.error(JSON.stringify({
+    level: "warn",
+    source: "builder-early-submit-nonce-release",
+    buyTxHash: signed.txHash,
+    buyNonce,
+    previousNonce,
+    nextNonce: runtime.nextNonce,
+    clearedPreSignedTransactions: cleared,
+    at: new Date().toISOString()
+  }));
+}
+
+function strictBuilderExpiryResultFromSigned(signed) {
+  const submitted = signed?.preSubmittedBuilderBundle ?? {};
+  return {
+    txHash: signed?.txHash ?? null,
+    nonce: signed?.nonce ?? null,
+    preSignedNonce: signed?.nonce ?? null,
+    builderBundleSubmitted: Boolean(submitted.submitted),
+    publicBroadcastSkipped: true,
+    builderBundleHash: submitted.bundleHash ?? null,
+    builderBundleTipTxHash: submitted.tipTxHash ?? signed?.preSignedBuilderBundleTipTransaction?.txHash ?? null,
+    builderBundleTargetSecond: signed?.builderBundleTargetSecond ?? null,
+    builderBundleMaxTimestamp: signed?.builderBundleMaxTimestamp ?? null,
+    builderTimedBuyExecutorTargetTimestamp: signed?.timedBuyExecutorTargetTimestamp ?? null,
+    builderTimedBuyExecutorExactSecond: Boolean(signed?.timedBuyExecutorExactSecond)
+  };
 }
 
 async function waitUntilBroadcastTarget(targetMs, spinMs) {
@@ -7962,20 +10076,22 @@ async function waitUntilBroadcastTarget(targetMs, spinMs) {
 function maybeStartBroadcastRpcKeepalive(cfg, pending, state, runtime = null) {
   const intervalMs = Number(cfg.rpcKeepaliveMs ?? 0);
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
-  if (!hasHotPendingMarket(cfg, pending, runtime)) return;
+  const configs = hotBroadcastRpcConfigs(cfg, pending, runtime);
+  if (configs.length === 0) return;
   const now = Date.now();
   if (state.running || now < state.nextRunAt) return;
 
   state.running = true;
-  void warmBroadcastRpcClients(cfg, { includeGasPrice: false })
-    .then((result) => {
-      const failed = result.results?.filter((item) => !item.ok) ?? [];
+  void Promise.all(configs.map((item) => warmBroadcastRpcClients(item, { includeGasPrice: false })))
+    .then((results) => {
+      const attempts = results.flatMap((result) => result.results ?? []);
+      const failed = attempts.filter((item) => !item.ok);
       if (failed.length > 0) {
         console.error(JSON.stringify({
           level: "warn",
           source: "broadcast-rpc-keepalive",
-          okCount: result.okCount,
-          rpcCount: result.rpcCount,
+          okCount: attempts.length - failed.length,
+          rpcCount: attempts.length,
           failed: failed.map((item) => ({ provider: item.provider, error: item.error })),
           at: new Date().toISOString()
         }));
@@ -7993,6 +10109,83 @@ function maybeStartBroadcastRpcKeepalive(cfg, pending, state, runtime = null) {
       state.nextRunAt = Date.now() + intervalMs;
       state.running = false;
     });
+}
+
+function hotBroadcastRpcConfigs(cfg, pending, runtime = null) {
+  if (!pending || pending.size === 0) return [];
+  const configs = new Map();
+  for (const record of pending.values()) {
+    const waitMs = msUntilRecordAction(record, cfg, runtime);
+    if (waitMs > cfg.preopenHotMs || waitMs < -eventOpenWindowMs(cfg)) continue;
+    const execCfg = record?.preparedPlan ? executionConfigForPlan(cfg, record.preparedPlan) : cfg;
+    const urls = execCfg.broadcastRpcUrls?.length ? execCfg.broadcastRpcUrls : [execCfg.rpcUrl];
+    const key = urls.filter(Boolean).join("|");
+    if (key && !configs.has(key)) configs.set(key, execCfg);
+  }
+  return [...configs.values()];
+}
+
+function maybeStartBuilderBundleKeepalive(cfg, pending, state, runtime = null) {
+  const intervalMs = Number(cfg.rpcKeepaliveMs ?? 0);
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+  const configs = hotBuilderBundleConfigs(cfg, pending, runtime);
+  if (configs.length === 0) return;
+  const now = Date.now();
+  if (state.running || now < state.nextRunAt) return;
+
+  state.running = true;
+  void Promise.all(configs.map((item) => warmBuilderBundleClient(item)))
+    .then((results) => {
+      const failed = results.filter((item) => !item.ok);
+      if (failed.length > 0) {
+        console.error(JSON.stringify({
+          level: "warn",
+          source: "builder-bundle-keepalive",
+          okCount: results.length - failed.length,
+          builderCount: results.length,
+          failed: failed.map((item) => ({
+            provider: item.provider,
+            reason: item.reason ?? null,
+            error: item.error ?? null
+          })),
+          at: new Date().toISOString()
+        }));
+      }
+    })
+    .catch((error) => {
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "builder-bundle-keepalive",
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+    })
+    .finally(() => {
+      state.nextRunAt = Date.now() + intervalMs;
+      state.running = false;
+    });
+}
+
+function hotBuilderBundleConfigs(cfg, pending, runtime = null) {
+  if (!pending || pending.size === 0) return [];
+  const configs = new Map();
+  for (const record of pending.values()) {
+    const waitMs = msUntilRecordAction(record, cfg, runtime);
+    if (waitMs > cfg.preopenHotMs || waitMs < -eventOpenWindowMs(cfg)) continue;
+    const execCfg = record?.preparedPlan ? executionConfigForPlan(cfg, record.preparedPlan) : cfg;
+    if (!execCfg.builderBundleEnabled) continue;
+    if (!execCfg.builderBundleUrl) continue;
+    const tipBnb = Number(execCfg.builderBundleTipBnb);
+    if (!Number.isFinite(tipBnb) || tipBnb <= 0) continue;
+    const key = [
+      execCfg.builderBundleUrl,
+      execCfg.builderBundleTimeoutMs,
+      execCfg.builderBundleMode,
+      execCfg.builderBundleTipBnb
+    ].join("|");
+    if (!configs.has(key)) configs.set(key, execCfg);
+  }
+  return [...configs.values()];
 }
 
 function hasHotPendingMarket(cfg, pending, runtime = null) {
@@ -8565,9 +10758,16 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
   skipExpiredPendingMarkets(cfg, seen, pending, "pending-open-window");
   await dropFollowBlockedPendingRecords(cfg, seen, pending, runtime, "pending-follow-blocked");
   const dueRecordsRaw = [...pending.values()].filter((record) => {
-    return msUntilRecordAction(record, cfg, runtime) <= 0;
+    return !record.dedicatedOpenTimer && msUntilRecordAction(record, cfg, runtime) <= 0;
   });
-  const dueLimit = splitRecordsByOpenLimit(cfg, dueRecordsRaw);
+  const preBlockedStrictBuilderRecords = dueRecordsRaw.filter((record) => record.strictBuilderLaneBlocked);
+  await markStrictBuilderLaneSkippedRecords(cfg, seen, pending, runtime, preBlockedStrictBuilderRecords, "pending-builder-wallet-lane");
+  const strictBuilderLane = splitRecordsByStrictBuilderLane(
+    cfg,
+    dueRecordsRaw.filter((record) => !record.strictBuilderLaneBlocked)
+  );
+  await markStrictBuilderLaneSkippedRecords(cfg, seen, pending, runtime, strictBuilderLane.skipped, "pending-builder-wallet-lane");
+  const dueLimit = splitRecordsByOpenLimit(cfg, strictBuilderLane.selected);
   await markOpenLimitSkippedRecords(cfg, seen, pending, runtime, dueLimit.skipped, "pending-open-market-limit");
   const dueRecords = dueLimit.selected;
   if (dueRecords.length === 0) return false;
@@ -8609,6 +10809,7 @@ async function drainDuePendingMarkets(cfg, seen, pending, runtime) {
 
   for (const record of [...pending.values()]) {
     const market = pendingMarket(record);
+    if (record.dedicatedOpenTimer) continue;
     if (fundingBlockedKeys.has(eventSeenKey(market, cfg))) continue;
     if (msUntilRecordAction(record, cfg, runtime) > 0) continue;
     if (hasPreSignedBundle(record)) continue;
@@ -8648,6 +10849,7 @@ function groupPreSignedBundleRecords(records) {
 }
 
 async function executeDueBundle(cfg, seen, pending, runtime, records) {
+  await waitForRuntimeBuilderNonceRecovery(runtime);
   const markets = records.map((record) => pendingMarket(record));
   const blockedRecords = records.filter((record) => isMarketFollowBlocked(pendingMarket(record), cfg));
   if (blockedRecords.length > 0) {
@@ -8770,9 +10972,13 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
 
 async function preSignHotPendingMarkets(cfg, seen, pending, runtime) {
   if (!shouldPreSignFastTransactions(cfg, runtime)) return;
+  await waitForRuntimeBuilderNonceRecovery(runtime);
   const now = Date.now();
   const fundingBlockedKeys = new Set();
   const openLimitKeys = recordKeysWithinOpenLimit(cfg, [...pending.values()]);
+  const strictBuilderLaneKeys = assignStrictBuilderLaneAdmission(cfg, [...pending.values()]);
+  const fastOpenExitNonceLane = fastOpenExitNonceLaneEnabled(cfg);
+  if (fastOpenExitNonceLane && (runtimeHasPreSignedBuy(runtime) || runtime?.fastOpenExitPreSignGate)) return;
   const recordAvailableForPreSign = (record, source) => {
     const market = pendingMarket(record);
     const key = eventSeenKey(market, cfg);
@@ -8781,10 +10987,11 @@ async function preSignHotPendingMarkets(cfg, seen, pending, runtime) {
     if (cleared) saveSeen(cfg.stateFile, seen);
     return !seen.has(key);
   };
-  if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
+  if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast" && !fastOpenExitNonceLane) {
     const grouped = groupRecordsByActionTime([...pending.values()].filter((record) => {
       if (!recordAvailableForPreSign(record, "pre-sign-bundle-future-buy")) return false;
       if (openLimitKeys && !openLimitKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
+      if (!strictBuilderLaneKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
       if (isMarketFollowBlocked(pendingMarket(record), cfg)) return false;
       if (
         !record.preparedPlan ||
@@ -8811,6 +11018,7 @@ async function preSignHotPendingMarkets(cfg, seen, pending, runtime) {
     .filter((record) => {
       if (!recordAvailableForPreSign(record, "pre-sign-single-future-buy")) return false;
       if (openLimitKeys && !openLimitKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
+      if (!strictBuilderLaneKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
       if (fundingBlockedKeys.has(eventSeenKey(pendingMarket(record), cfg))) return false;
       if (isMarketFollowBlocked(pendingMarket(record), cfg)) return false;
       if (
@@ -8824,10 +11032,114 @@ async function preSignHotPendingMarkets(cfg, seen, pending, runtime) {
     })
     .sort((a, b) => compareStartAsc(pendingMarket(a), pendingMarket(b)));
 
-  for (const record of records) {
+  if (fastOpenExitNonceLane) {
+    const preapprovalChangedNonce = await maybePreapproveFastOpenExitMarkets(cfg, records, runtime);
+    if (preapprovalChangedNonce) return;
+  }
+
+  const recordsToSign = fastOpenExitNonceLane ? records.slice(0, 1) : records;
+  for (const record of recordsToSign) {
     await syncRuntimeNonceBeforePreSign(cfg, runtime, { reason: "single" });
     await attachPreSignedFastTransaction(cfg, record, runtime);
   }
+}
+
+function fastOpenExitNonceLaneEnabled(cfg) {
+  return Boolean(
+    cfg.autoSellFastOpenExitEnabled &&
+    cfg.autoSellEnabled &&
+    String(cfg.autoSellStrategy ?? "").trim().toLowerCase() === "open_timed_exit"
+  );
+}
+
+function fastOpenExitEnabledForRecord(cfg, record) {
+  if (!fastOpenExitNonceLaneEnabled(cfg)) return false;
+  const market = pendingMarket(record);
+  const planned = plannedBuyForMarket(cfg, market);
+  const autoSellCfg = planned?.autoSell ? { ...cfg, ...planned.autoSell } : cfg;
+  return Boolean(
+    autoSellCfg.autoSellEnabled !== false &&
+    autoSellCfg.autoSellFastOpenExitEnabled !== false &&
+    String(autoSellCfg.autoSellStrategy ?? "").trim().toLowerCase() === "open_timed_exit"
+  );
+}
+
+function runtimeHasPreSignedBuy(runtime) {
+  const pending = runtime?.pendingBuyRecords;
+  if (!pending?.values) return false;
+  for (const record of pending.values()) {
+    if (record?.preSignedFastTransaction || record?.preSignedFastBundleTransaction) return true;
+  }
+  return false;
+}
+
+async function maybePreapproveFastOpenExitMarkets(cfg, records, runtime) {
+  if (!fastOpenExitNonceLaneEnabled(cfg) || runtimeHasPreSignedBuy(runtime) || runtime?.fastOpenExitPreSignGate) {
+    return false;
+  }
+  for (const record of records) {
+    if (!fastOpenExitEnabledForRecord(cfg, record)) continue;
+    const market = pendingMarket(record);
+    const marketKey = String(market?.address ?? "").toLowerCase();
+    if (!marketKey || runtime?.autoSellOperatorReadyMarkets?.has(marketKey)) continue;
+    if (record.fastOpenExitOperatorPreapprovalAttempted) continue;
+    if (msUntilRecordAction(record, cfg, runtime) <= 5000) {
+      record.fastOpenExitOperatorPreapprovalAttempted = true;
+      record.fastOpenExitOperatorPreapprovalError = "less than 5s remains before buy";
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "fast-open-exit-operator-preapproval",
+        market: market.address,
+        question: market.question,
+        status: "skipped",
+        reason: record.fastOpenExitOperatorPreapprovalError,
+        at: new Date().toISOString()
+      }));
+      continue;
+    }
+
+    record.fastOpenExitOperatorPreapprovalAttempted = true;
+    try {
+      const execution = await withRuntimeTransactionLock(runtime, "fast-open-exit-operator-preapproval", () =>
+        ensureMarketOperatorApproval(cfg, market.address)
+      );
+      if (execution.txHash) {
+        await syncRuntimeNonceAfterExternalTx(cfg, runtime, "fast-open-exit-operator-preapproval");
+      }
+      if (execution.operatorApproved) {
+        runtime?.autoSellOperatorReadyMarkets?.add(marketKey);
+      }
+      record.fastOpenExitOperatorPreapproval = execution;
+      const row = {
+        level: "event-operator-preapproval",
+        source: "fast-open-exit-before-buy",
+        wallet: runtime?.receiverAddress ?? cfg.walletAddress ?? null,
+        market: market.address,
+        execution,
+        at: new Date().toISOString()
+      };
+      appendJsonl(cfg.fillsFile, row);
+      await appendGasLedgerFromExecution(cfg, execution, {
+        action: "approval",
+        source: "fast-open-exit-before-buy",
+        allocations: [{ market: market.address, action: "approval", weight: 1 }]
+      });
+      console.log(JSON.stringify(row));
+      return Boolean(execution.txHash);
+    } catch (error) {
+      record.fastOpenExitOperatorPreapprovalError = errorMessage(error);
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "fast-open-exit-operator-preapproval",
+        market: market.address,
+        question: market.question,
+        status: "error",
+        message: record.fastOpenExitOperatorPreapprovalError,
+        at: new Date().toISOString()
+      }));
+    }
+  }
+  return false;
 }
 
 async function syncRuntimeNonceBeforePreSign(cfg, runtime, { reason }) {
@@ -9019,14 +11331,18 @@ async function resetRuntimeNonceToPending(cfg, runtime, reason) {
 async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, options = {}) {
   const immediateRecords = [];
   const source = options.source ?? "discovery";
-  for (const market of markets) {
+  for (const discoveredMarket of markets) {
+    const market = attachMemeRangeSelectionLock(cfg, discoveredMarket);
     const key = eventSeenKey(market, cfg);
     if (seen.has(key)) {
       const cleared = clearSeenForFutureEligibleBuy(cfg, seen, market, `${source}-future-buy`);
       if (cleared) saveSeen(cfg.stateFile, seen);
       if (seen.has(key)) continue;
     }
-    if (pending.has(key)) continue;
+    if (pending.has(key)) {
+      await maybeUpgradePendingMemeRangeSelection(cfg, pending, key, market, runtime, source);
+      continue;
+    }
     const decision = marketFilterDecision(market, cfg);
     if (!decision.eligible) {
       recordMarketDecision(cfg, market, "filtered", { source, decision });
@@ -9059,7 +11375,9 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
         source,
         decision,
         rankSource: record.preparedPlan?.selection?.rankSource ?? null,
-        fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null
+        fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null,
+        selectedOutcomes: record.preparedPlan?.outcomes?.map((outcome) => outcome.name) ?? [],
+        memeRangeSelection: record.preparedPlan?.memeRangeSelection ?? null
       });
       notifyWillBuyMarket(cfg, pendingMarket(record), record, {
         source,
@@ -9075,7 +11393,9 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
         source,
         decision,
         rankSource: record.preparedPlan?.selection?.rankSource ?? null,
-        fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null
+        fallbackReason: record.preparedPlan?.selection?.fallbackReason ?? null,
+        selectedOutcomes: record.preparedPlan?.outcomes?.map((outcome) => outcome.name) ?? [],
+        memeRangeSelection: record.preparedPlan?.memeRangeSelection ?? null
       });
       notifyWillBuyMarket(cfg, pendingMarket(record), record, {
         source,
@@ -9133,6 +11453,51 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
   }
 }
 
+async function maybeUpgradePendingMemeRangeSelection(cfg, pending, key, market, runtime, source) {
+  const existing = pending.get(key);
+  const lockedSelection = market.memeRangeSelection ?? readMemeRangeSelectionLock(cfg, market.address);
+  if (!existing || !lockedSelection?.locked) return false;
+  const currentSelection = existing.preparedPlan?.memeRangeSelection;
+  if (
+    currentSelection?.locked &&
+    currentSelection.lockedAt === lockedSelection.lockedAt &&
+    currentSelection.mode === lockedSelection.mode
+  ) {
+    return false;
+  }
+  if (hasPreSignedSingle(existing) || hasPreSignedBundle(existing) || existing.dedicatedOpenTimer) {
+    recordMarketDecision(cfg, pendingMarket(existing), "meme-selection-lock-late", {
+      source,
+      message: "locked Meme selection arrived after signing/timer ownership; existing prepared plan retained",
+      once: false
+    });
+    return false;
+  }
+  const mergedMarket = mergeKnownEventMarket(pendingMarket(existing), {
+    ...market,
+    memeRangeSelection: lockedSelection
+  });
+  const replacement = await preparePendingRecord(cfg, mergedMarket, runtime);
+  if (replacement.prepareError || !replacement.preparedPlan) {
+    recordMarketDecision(cfg, mergedMarket, "meme-selection-lock-error", {
+      source,
+      message: replacement.prepareError ?? "locked Meme selection did not produce a plan",
+      once: false
+    });
+    return false;
+  }
+  pending.set(key, replacement);
+  recordMarketDecision(cfg, replacement.market, "meme-selection-locked", {
+    source,
+    rankSource: replacement.preparedPlan.selection?.rankSource ?? null,
+    fallbackReason: replacement.preparedPlan.selection?.fallbackReason ?? null,
+    selectedOutcomes: replacement.preparedPlan.outcomes?.map((outcome) => outcome.name) ?? [],
+    memeRangeSelection: replacement.preparedPlan.memeRangeSelection ?? null,
+    once: false
+  });
+  return true;
+}
+
 function notifyWillBuyMarket(cfg, market, record, { source, state } = {}) {
   if (cfg.dryRun || !cfg.execute) return;
   if (!record?.preparedPlan) return;
@@ -9149,11 +11514,40 @@ function notifyWillBuyMarket(cfg, market, record, { source, state } = {}) {
       时长: formatDuration(market),
       买入: `${plan.outcomes?.length ?? selectedOutcomeCount(market, cfg)}档 / ${roundUsd(plan.totalStakeUsdt ?? selectedStakeUsdt(market, cfg))}U`,
       排序: plan.selection?.rankSource ?? "",
-      兜底: plan.selection?.fallbackReason ?? ""
+      兜底: plan.selection?.fallbackReason ?? "",
+      ...memeRangeSelectionAlertFields(plan.memeRangeSelection)
     },
     dedupeKey: `will-buy:${String(market.address).toLowerCase()}`,
     cooldownMs: WILL_BUY_ALERT_COOLDOWN_MS
   });
+}
+
+function memeRangeSelectionAlertFields(selection) {
+  if (!selection) return {};
+  if (selection.mode === "middle_fallback") {
+    return {
+      Meme选档: "中间三档兜底",
+      锁定原因: selection.reason ?? "行情或区间不可用",
+      锁定时间: selection.lockedAt ?? "首次监控"
+    };
+  }
+  return {
+    Meme选档: "当前档 + 上下相邻档",
+    命中档位: selection.matchedOutcomeName ?? "",
+    行情快照: `${String(selection.metric ?? "metric").toUpperCase()} ${formatMetricValue(selection.evidence?.computedValue)}`,
+    行情来源: selection.source?.provider ?? "",
+    锁定时间: selection.lockedAt ?? "首次监控"
+  };
+}
+
+function formatMetricValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  if (number >= 1e12) return `$${roundNumber(number / 1e12, 4)}T`;
+  if (number >= 1e9) return `$${roundNumber(number / 1e9, 4)}B`;
+  if (number >= 1e6) return `$${roundNumber(number / 1e6, 4)}M`;
+  if (number >= 1e3) return `$${roundNumber(number / 1e3, 4)}K`;
+  return `$${roundNumber(number, 8)}`;
 }
 
 function shouldNotifyWillBuySource(source) {
@@ -9301,16 +11695,34 @@ function plannedBuyForMarket(cfg, market) {
   if (!cfg?.eventPlannedBuysFile || !market) return null;
   const plans = readPlannedBuys(cfg);
   if (plans.length === 0) return null;
-  const marketAddress = normalizePlannedBuyAddress(market.address);
-  const marketQuestion = normalizePlannedBuyQuestion(market.question);
-  const marketQuestionText = String(market.question ?? "").trim().replace(/\s+/gu, " ");
   return plans.find((plan) => {
     if (!plan.enabled) return false;
-    if (plan.market && marketAddress && plan.market === marketAddress) return true;
-    if (plan.question && marketQuestion && plan.question === marketQuestion) return true;
-    if (plan.questionRegex && marketQuestionText && plannedBuyQuestionRegexMatches(plan.questionRegex, marketQuestionText)) return true;
-    return false;
+    return plannedBuyMatchesMarket(plan, market);
   }) ?? null;
+}
+
+function plannedBuyAutoSellForMarket(cfg, market) {
+  const active = plannedBuyForMarket(cfg, market);
+  if (active) return active;
+  return readPlannedBuys(cfg).find((plan) => (
+    !plan.enabled &&
+    plan.preserveAutoSellAfterDisable &&
+    plan.autoSell &&
+    plannedBuyMatchesMarket(plan, market)
+  )) ?? null;
+}
+
+function plannedBuyMatchesMarket(plan, market) {
+  const marketAddress = normalizePlannedBuyAddress(market?.address);
+  const marketQuestion = normalizePlannedBuyQuestion(market?.question);
+  const marketQuestionText = String(market?.question ?? "").trim().replace(/\s+/gu, " ");
+  if (plan.market && marketAddress && plan.market === marketAddress) return true;
+  if (plan.question && marketQuestion && plan.question === marketQuestion) return true;
+  return Boolean(
+    plan.questionRegex &&
+    marketQuestionText &&
+    plannedBuyQuestionRegexMatches(plan.questionRegex, marketQuestionText)
+  );
 }
 
 function readPlannedBuys(cfg) {
@@ -9352,14 +11764,20 @@ function normalizePlannedBuy(row) {
   const questionRegex = normalizePlannedBuyQuestionRegex(row.questionRegex ?? row.titleRegex);
   if (!market && !question && !questionRegex) return null;
   const stakePerOutcomeUsdt = Number(row.stakePerOutcomeUsdt ?? row.stake ?? row.stakeUsdt);
+  const stakeByOutcomeUsdt = normalizePlannedBuyStakeByOutcome(
+    firstDefinedValue(row, ["stakeByOutcomeUsdt", "outcomeStakesUsdt", "stakesByOutcome"]),
+    outcomes
+  );
   const kickoffAt = normalizePlannedBuyDate(row.kickoffAt ?? row.marketStartAt ?? row.matchStartAt);
   const autoSell = normalizePlannedBuyAutoSell(row.autoSell, outcomes);
   const openBroadcastDelayMs = normalizePlannedBuyOpenBroadcastDelayMs(row);
   const gasPriceGwei = normalizePlannedBuyGasPriceGwei(row);
   const broadcastRpcUrls = normalizePlannedBuyBroadcastRpcUrls(row);
+  const builderBundle = normalizePlannedBuyBuilderBundle(row);
   return {
     id: String(row.id ?? market ?? question ?? questionRegex),
     enabled: row.enabled !== false && row.disabled !== true,
+    preserveAutoSellAfterDisable: row.preserveAutoSellAfterDisable === true,
     market,
     question,
     questionRegex,
@@ -9367,10 +11785,12 @@ function normalizePlannedBuy(row) {
     stakePerOutcomeUsdt: Number.isFinite(stakePerOutcomeUsdt) && stakePerOutcomeUsdt > 0
       ? stakePerOutcomeUsdt
       : null,
+    stakeByOutcomeUsdt,
     kickoffAt,
     openBroadcastDelayMs,
     gasPriceGwei,
     broadcastRpcUrls,
+    builderBundle,
     autoSell,
     note: String(row.note ?? "").trim() || null
   };
@@ -9385,6 +11805,8 @@ function normalizePlannedBuyAutoSell(row, selectedOutcomes = []) {
     result.autoSellStrategy = strategy;
     if (strategy === "hold_to_settlement") result.autoSellEnabled = false;
   }
+  takeOptionalInteger(row, result, "autoSellStartDelaySeconds", ["startDelaySeconds", "startDelay"]);
+  takeOptionalInteger(row, result, "autoSellIntervalSeconds", ["intervalSeconds", "interval"]);
   takeOptionalNumber(row, result, "autoSellLadderProfitPercent", ["ladderProfitPercent", "profitPercent"]);
   takeOptionalNumber(row, result, "autoSellChunkPercent", ["chunkPercent"]);
   takeOptionalInteger(row, result, "autoSellTakeProfitSteps", ["takeProfitSteps"]);
@@ -9392,12 +11814,89 @@ function normalizePlannedBuyAutoSell(row, selectedOutcomes = []) {
   takeOptionalBoolean(row, result, "autoSellStopLossEnabled", ["stopLossEnabled"]);
   takeOptionalNumber(row, result, "autoSellStopLossPercent", ["stopLossPercent"]);
   takeOptionalNumber(row, result, "autoSellStopLossSellPercent", ["stopLossSellPercent"]);
+  const priceTargets = normalizePlannedBuyPriceTargets(
+    firstDefinedValue(row, ["priceTargets", "outcomePriceTargets", "sellPriceTargets"]),
+    selectedOutcomes
+  );
+  if (priceTargets.length > 0) {
+    result.autoSellPriceTargets = priceTargets;
+    result.autoSellPriceHotPollMs = normalizePlannedBuyPositiveInteger(
+      firstDefinedValue(row, ["priceHotPollMs", "hotPollMs"]),
+      1000,
+      "autoSell.priceHotPollMs"
+    );
+    result.autoSellPriceHotWindowSeconds = normalizePlannedBuyPositiveInteger(
+      firstDefinedValue(row, ["priceHotWindowSeconds", "hotWindowSeconds"]),
+      600,
+      "autoSell.priceHotWindowSeconds"
+    );
+    result.autoSellPriceSellPercent = normalizePlannedBuyPercent(
+      firstDefinedValue(row, ["priceSellPercent", "sellPercent"]),
+      100,
+      "autoSell.priceSellPercent"
+    );
+    const applyAfterIso = normalizePlannedBuyDate(
+      firstDefinedValue(row, ["priceApplyAfterIso", "priceApplyAfter", "applyAfterIso"])
+    );
+    if (applyAfterIso) result.autoSellPriceApplyAfterIso = applyAfterIso;
+  }
   const retainPositions = normalizePlannedBuyRetainPositions(
     firstDefinedValue(row, ["retainPositions", "retainedPositions"]),
     selectedOutcomes
   );
   if (retainPositions.length > 0) result.autoSellRetainPositions = retainPositions;
   return Object.keys(result).length > 0 ? result : null;
+}
+
+function normalizePlannedBuyPriceTargets(rows, selectedOutcomes = []) {
+  if (rows === undefined || rows === null || rows === "") return [];
+  const entries = Array.isArray(rows)
+    ? rows
+    : Object.entries(rows).map(([outcome, value]) => (
+        value && typeof value === "object" && !Array.isArray(value)
+          ? { outcome, ...value }
+          : { outcome, price: value }
+      ));
+  const selectedByKey = new Map(selectedOutcomes.map((outcome) => [
+    normalizePlannedBuyOutcomeName(outcome),
+    String(outcome).trim()
+  ]));
+  const seen = new Set();
+  return entries.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`autoSell.priceTargets[${index}] must be an object`);
+    }
+    const requestedOutcome = String(firstDefinedValue(entry, ["outcome", "name", "outcomeName"]) ?? "").trim();
+    const key = normalizePlannedBuyOutcomeName(requestedOutcome);
+    if (!key) throw new Error(`autoSell.priceTargets[${index}].outcome is required`);
+    if (seen.has(key)) throw new Error(`duplicate price target outcome after normalization: ${requestedOutcome}`);
+    const selectedOutcome = selectedByKey.get(key);
+    if (!selectedOutcome) throw new Error(`price target outcome is not in the planned selected outcomes: ${requestedOutcome}`);
+    const price = Number(firstDefinedValue(entry, ["price", "threshold", "targetPrice", "sellPrice"]));
+    if (!Number.isFinite(price) || price <= 0 || price > 1) {
+      throw new Error(`invalid price target for outcome ${requestedOutcome}`);
+    }
+    seen.add(key);
+    return {
+      outcome: selectedOutcome,
+      price,
+      enabled: entry.enabled !== false
+    };
+  });
+}
+
+function normalizePlannedBuyPositiveInteger(value, fallback, label) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) throw new Error(`${label} must be a positive integer`);
+  return number;
+}
+
+function normalizePlannedBuyPercent(value, fallback, label) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0 || number > 100) throw new Error(`${label} must be > 0 and <= 100`);
+  return number;
 }
 
 function normalizePlannedBuyRetainPositions(rows, selectedOutcomes = []) {
@@ -9492,6 +11991,181 @@ function normalizePlannedBuyBroadcastRpcUrls(row) {
   return urls;
 }
 
+function normalizePlannedBuyBuilderBundle(row) {
+  const nested = row?.builderBundle && typeof row.builderBundle === "object" && !Array.isArray(row.builderBundle)
+    ? row.builderBundle
+    : null;
+  const source = nested ?? row;
+  const directKeys = [
+    "builderBundleEnabled",
+    "builderBundleUrl",
+    "builderBundleTipTo",
+    "builderBundleTipBnb",
+    "builderBundleTipGasPriceGwei",
+    "builderBundleMaxBlocks",
+    "builderBundleMaxBlockLookup",
+    "builderBundleMaxTimestampOffsetSeconds",
+    "builderBundleTimeoutMs",
+    "builderBundleMode",
+    "builderBundleFanoutDelayMs",
+    "builderBundleTimingMode",
+    "builderBundlePrepositionLeadMs",
+    "builderBundleFallbackSafetyMs",
+    "builderBundleEarlySubmitLeadMs",
+    "builderBundleMinTimestampOffsetMs",
+    "builderBundleNoMerge",
+    "builderBundlePositionFirst",
+    "builderBundle48spSign",
+    "builderTimestampGuardEnabled",
+    "builderTimestampGuardAddress",
+    "builderTimestampGuardGasLimit",
+    "builderTimestampGuardRetryIntervalMs",
+    "builderTimestampGuardRetryUntilLeadMs",
+    "builderTimestampGuardReleasePollMs"
+  ];
+  const nestedKeys = [
+    "enabled",
+    "url",
+    "tipTo",
+    "tipBnb",
+    "tipGasPriceGwei",
+    "maxBlocks",
+    "maxBlockLookup",
+    "maxTimestampOffsetSeconds",
+    "timeoutMs",
+    "mode",
+    "fanoutDelayMs",
+    "timingMode",
+    "prepositionLeadMs",
+    "fallbackSafetyMs",
+    "earlySubmitLeadMs",
+    "minTimestampOffsetMs",
+    "noMerge",
+    "positionFirst",
+    "48spSign",
+    "timestampGuardEnabled",
+    "timestampGuardAddress",
+    "timestampGuardGasLimit",
+    "timestampGuardRetryIntervalMs",
+    "timestampGuardRetryUntilLeadMs",
+    "timestampGuardReleasePollMs"
+  ];
+  const hasConfig = nested
+    ? nestedKeys.some((key) => Object.prototype.hasOwnProperty.call(source, key))
+    : directKeys.some((key) => Object.prototype.hasOwnProperty.call(source, key));
+  if (!hasConfig) return null;
+
+  const result = {};
+  const enabled = firstDefinedValue(source, nested ? ["enabled", "builderBundleEnabled"] : ["builderBundleEnabled"]);
+  if (enabled !== undefined && enabled !== null && enabled !== "") result.builderBundleEnabled = parseLooseBoolean(enabled);
+  const url = String(firstDefinedValue(source, nested ? ["url", "builderBundleUrl"] : ["builderBundleUrl"]) ?? "").trim();
+  if (url && /^https?:\/\//iu.test(url)) {
+    try {
+      new URL(url);
+      result.builderBundleUrl = url;
+    } catch {}
+  }
+  const tipTo = String(firstDefinedValue(source, nested ? ["tipTo", "builderBundleTipTo"] : ["builderBundleTipTo"]) ?? "").trim();
+  if (/^0x[a-fA-F0-9]{40}$/u.test(tipTo)) result.builderBundleTipTo = tipTo;
+  const tipBnb = firstDefinedValue(source, nested ? ["tipBnb", "tip", "tipAmountBnb", "builderBundleTipBnb"] : ["builderBundleTipBnb"]);
+  if (tipBnb !== undefined && tipBnb !== null && tipBnb !== "") {
+    const value = Number(tipBnb);
+    if (Number.isFinite(value) && value >= 0 && value <= 10) result.builderBundleTipBnb = String(tipBnb).trim();
+  }
+  const tipGas = firstDefinedValue(source, nested ? ["tipGasPriceGwei", "tipGasGwei", "builderBundleTipGasPriceGwei"] : ["builderBundleTipGasPriceGwei"]);
+  if (tipGas !== undefined && tipGas !== null && tipGas !== "") {
+    const value = Number(tipGas);
+    if (Number.isFinite(value) && value >= 0.01 && value <= 50) result.builderBundleTipGasPriceGwei = String(tipGas).trim();
+  }
+  takeOptionalInteger(source, result, "builderBundleMaxBlocks", nested ? ["maxBlocks"] : []);
+  const maxBlockLookup = firstDefinedValue(source, nested ? ["maxBlockLookup", "useMaxBlock", "builderBundleMaxBlockLookup"] : ["builderBundleMaxBlockLookup"]);
+  if (maxBlockLookup !== undefined && maxBlockLookup !== null && maxBlockLookup !== "") {
+    result.builderBundleMaxBlockLookup = parseLooseBoolean(maxBlockLookup);
+  }
+  takeOptionalInteger(source, result, "builderBundleMaxTimestampOffsetSeconds", nested ? ["maxTimestampOffsetSeconds"] : []);
+  takeOptionalInteger(source, result, "builderBundleTimeoutMs", nested ? ["timeoutMs"] : []);
+  takeOptionalInteger(source, result, "builderBundleFanoutDelayMs", nested ? ["fanoutDelayMs", "publicFanoutDelayMs", "delayedPublicFanoutMs"] : []);
+  takeOptionalInteger(source, result, "builderBundlePrepositionLeadMs", nested ? ["prepositionLeadMs"] : []);
+  takeOptionalInteger(source, result, "builderBundleFallbackSafetyMs", nested ? ["fallbackSafetyMs"] : []);
+  takeOptionalInteger(source, result, "builderBundleEarlySubmitLeadMs", nested ? ["earlySubmitLeadMs", "preSubmitLeadMs"] : []);
+  takeOptionalInteger(source, result, "builderBundleMinTimestampOffsetMs", nested ? ["minTimestampOffsetMs", "notBeforeOffsetMs"] : []);
+  if (
+    result.builderBundleFanoutDelayMs !== undefined &&
+    (result.builderBundleFanoutDelayMs < 0 || result.builderBundleFanoutDelayMs > 5000)
+  ) {
+    delete result.builderBundleFanoutDelayMs;
+  }
+  if (
+    result.builderBundleEarlySubmitLeadMs !== undefined &&
+    (result.builderBundleEarlySubmitLeadMs < 0 || result.builderBundleEarlySubmitLeadMs > 5000)
+  ) {
+    delete result.builderBundleEarlySubmitLeadMs;
+  }
+  if (
+    result.builderBundlePrepositionLeadMs !== undefined &&
+    (result.builderBundlePrepositionLeadMs <= 0 || result.builderBundlePrepositionLeadMs > 5000)
+  ) {
+    delete result.builderBundlePrepositionLeadMs;
+  }
+  if (
+    result.builderBundleFallbackSafetyMs !== undefined &&
+    (result.builderBundleFallbackSafetyMs < 0 || result.builderBundleFallbackSafetyMs > 5000)
+  ) {
+    delete result.builderBundleFallbackSafetyMs;
+  }
+  if (
+    result.builderBundleMinTimestampOffsetMs !== undefined &&
+    (result.builderBundleMinTimestampOffsetMs < 0 || result.builderBundleMinTimestampOffsetMs > 24 * 60 * 60 * 1000)
+  ) {
+    delete result.builderBundleMinTimestampOffsetMs;
+  }
+  const mode = String(firstDefinedValue(source, nested ? ["mode", "builderBundleMode"] : ["builderBundleMode"]) ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s]+/gu, "_");
+  if (["concurrent", "builder_only", "builder_then_fanout"].includes(mode)) result.builderBundleMode = mode;
+  const timingMode = String(firstDefinedValue(source, nested ? ["timingMode", "builderBundleTimingMode"] : ["builderBundleTimingMode"]) ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s]+/gu, "_");
+  if (["legacy", "auto", "first_19s_block", "first_20s_block"].includes(timingMode)) {
+    result.builderBundleTimingMode = timingMode;
+  }
+  const noMerge = firstDefinedValue(source, nested ? ["noMerge", "builderBundleNoMerge"] : ["builderBundleNoMerge"]);
+  if (noMerge !== undefined && noMerge !== null && noMerge !== "") result.builderBundleNoMerge = parseLooseBoolean(noMerge);
+  const positionFirst = firstDefinedValue(source, nested ? ["positionFirst", "builderBundlePositionFirst"] : ["builderBundlePositionFirst"]);
+  if (positionFirst !== undefined && positionFirst !== null && positionFirst !== "") {
+    result.builderBundlePositionFirst = parseLooseBoolean(positionFirst);
+  }
+  const sign = String(firstDefinedValue(source, nested ? ["48spSign", "builderBundle48spSign"] : ["builderBundle48spSign"]) ?? "").trim();
+  if (sign) result.builderBundle48spSign = sign;
+  const guardEnabled = firstDefinedValue(
+    source,
+    nested ? ["timestampGuardEnabled", "builderTimestampGuardEnabled"] : ["builderTimestampGuardEnabled"]
+  );
+  if (guardEnabled !== undefined && guardEnabled !== null && guardEnabled !== "") {
+    result.builderTimestampGuardEnabled = parseLooseBoolean(guardEnabled);
+  }
+  const guardAddress = String(firstDefinedValue(
+    source,
+    nested ? ["timestampGuardAddress", "builderTimestampGuardAddress"] : ["builderTimestampGuardAddress"]
+  ) ?? "").trim();
+  if (/^0x[a-fA-F0-9]{40}$/u.test(guardAddress)) result.builderTimestampGuardAddress = guardAddress;
+  takeOptionalInteger(source, result, "builderTimestampGuardGasLimit", nested ? ["timestampGuardGasLimit"] : []);
+  takeOptionalInteger(source, result, "builderTimestampGuardRetryIntervalMs", nested ? ["timestampGuardRetryIntervalMs"] : []);
+  takeOptionalInteger(source, result, "builderTimestampGuardRetryUntilLeadMs", nested ? ["timestampGuardRetryUntilLeadMs"] : []);
+  takeOptionalInteger(source, result, "builderTimestampGuardReleasePollMs", nested ? ["timestampGuardReleasePollMs"] : []);
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function plannedBuyBuilderBundleOverrides(plan) {
+  const overrides = plan?.builderBundle ?? plan?.plannedBuy?.builderBundle;
+  if (!overrides) return {};
+  return Object.fromEntries(
+    Object.entries(overrides).filter(([, value]) => value !== undefined && value !== null && value !== "")
+  );
+}
+
 function takeOptionalNumber(source, target, key, aliases = []) {
   const raw = firstDefinedValue(source, [key, ...aliases]);
   if (raw === undefined || raw === null || raw === "") return;
@@ -9531,6 +12205,38 @@ function plannedBuyOutcomeNames(row) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizePlannedBuyStakeByOutcome(value, selectedOutcomes = []) {
+  if (value === undefined || value === null || value === "") return {};
+  const entries = Array.isArray(value)
+    ? value.map((row) => [row?.outcome ?? row?.name, row?.stakeUsdt ?? row?.amountUsdt ?? row?.stake])
+    : value && typeof value === "object"
+      ? Object.entries(value)
+      : null;
+  if (!entries) throw new Error("stakeByOutcomeUsdt must be an object or array");
+
+  const selectedByKey = new Map(selectedOutcomes.map((outcome) => [
+    normalizePlannedBuyOutcomeName(outcome),
+    String(outcome).trim()
+  ]));
+  const result = {};
+  const seen = new Set();
+  for (const [rawOutcome, rawStake] of entries) {
+    const requestedOutcome = String(rawOutcome ?? "").trim();
+    const key = normalizePlannedBuyOutcomeName(requestedOutcome);
+    if (!key) throw new Error("stakeByOutcomeUsdt contains an empty outcome name");
+    if (seen.has(key)) throw new Error(`duplicate outcome stake override after normalization: ${requestedOutcome}`);
+    const selectedOutcome = selectedByKey.get(key);
+    if (!selectedOutcome) throw new Error(`outcome stake override is not in planned outcomes: ${requestedOutcome}`);
+    const stakeUsdt = Number(rawStake);
+    if (!Number.isFinite(stakeUsdt) || stakeUsdt <= 0) {
+      throw new Error(`invalid outcome stake override for ${requestedOutcome}`);
+    }
+    seen.add(key);
+    result[selectedOutcome] = stakeUsdt;
+  }
+  return result;
 }
 
 function normalizePlannedBuyAddress(value) {
@@ -9577,20 +12283,26 @@ function normalizePlannedBuyDate(value) {
 
 function plannedBuyConfigForMarket(cfg, market) {
   const plan = plannedBuyForMarket(cfg, market);
-  if (!plan) return cfg;
+  if (!plan) return applyBuilderBundleTimingPreset(cfg);
   const stakePerOutcomeUsdt = Number(plan.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
-  const totalStakeUsdt = roundUsd(stakePerOutcomeUsdt * plan.outcomes.length);
-  return {
+  const stakeByOutcomeUsdt = plan.stakeByOutcomeUsdt ?? {};
+  const outcomeStakesUsdt = plan.outcomes.map((outcome) => Number(stakeByOutcomeUsdt[outcome] ?? stakePerOutcomeUsdt));
+  const totalStakeUsdt = roundUsd(outcomeStakesUsdt.reduce((sum, stake) => sum + stake, 0));
+  const maxStakePerOutcomeUsdt = Math.max(stakePerOutcomeUsdt, ...outcomeStakesUsdt);
+  return applyBuilderBundleTimingPreset({
     ...cfg,
+    ...plannedBuyBuilderBundleOverrides(plan),
     eventOutcomeSelection: "names",
     eventOutcomeNames: plan.outcomes.join(","),
     eventOutcomeCount: plan.outcomes.length,
     stakePerOutcomeUsdt,
-    maxStakeUsdt: Math.max(Number(cfg.maxStakeUsdt ?? 0), stakePerOutcomeUsdt),
+    stakeByOutcomeUsdt,
+    maxStakeUsdt: Math.max(Number(cfg.maxStakeUsdt ?? 0), maxStakePerOutcomeUsdt),
     maxOutcomesPerMarket: Math.max(Number(cfg.maxOutcomesPerMarket ?? 0), plan.outcomes.length),
     maxMarketStakeUsdt: Math.max(Number(cfg.maxMarketStakeUsdt ?? 0), totalStakeUsdt),
     maxBatchStakeUsdt: Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), totalStakeUsdt),
     gasPriceGwei: plan.gasPriceGwei ?? cfg.gasPriceGwei,
+    openBroadcastDelayMs: plan.openBroadcastDelayMs ?? cfg.openBroadcastDelayMs,
     broadcastRpcUrls: plan.broadcastRpcUrls?.length ? plan.broadcastRpcUrls : cfg.broadcastRpcUrls,
     plannedBuy: {
       id: plan.id,
@@ -9598,20 +12310,115 @@ function plannedBuyConfigForMarket(cfg, market) {
       question: plan.question,
       outcomes: plan.outcomes,
       stakePerOutcomeUsdt,
+      stakeByOutcomeUsdt,
+      maxStakePerOutcomeUsdt,
       totalStakeUsdt,
       kickoffAt: plan.kickoffAt,
       openBroadcastDelayMs: plan.openBroadcastDelayMs,
       gasPriceGwei: plan.gasPriceGwei,
       broadcastRpcUrls: plan.broadcastRpcUrls,
+      builderBundle: plan.builderBundle,
       autoSell: plan.autoSell,
       note: plan.note
     }
-  };
+  });
 }
 
 function eventBuyConfigForMarket(cfg, market) {
   if (plannedBuyForMarket(cfg, market)) return plannedBuyConfigForMarket(cfg, market);
-  return bot3FifaExactScoreConfigForMarket(cfg, market) ?? cfg;
+  return applyBuilderBundleTimingPreset(
+    bot3FifaExactScoreConfigForMarket(cfg, market) ??
+    bot2LikeMemeBuyConfigForMarket(cfg, market) ??
+    cfg
+  );
+}
+
+function bot2LikeMemeBuyConfigForMarket(cfg, market) {
+  if (!cfg.memeRangeSelectionEnabled || !isBot2LikeMemeProfile(cfg) || !isMemeIntelMarket(market)) return null;
+  const lockedSelection = market.memeRangeSelection ?? readMemeRangeSelectionLock(cfg, market.address);
+  const selectionMarket = lockedSelection ? { ...market, memeRangeSelection: lockedSelection } : market;
+  const requestedOutcomeCount = Math.min(
+    Math.max(1, Number(cfg.memeRangeSelectionOutcomeCount ?? 3)),
+    Math.max(1, market?.outcomes?.length ?? 1)
+  );
+  const selectedOutcomeNames = lockedMemeRangeOutcomeNames(selectionMarket, requestedOutcomeCount);
+  if (selectedOutcomeNames.length > 0) {
+    return {
+      ...cfg,
+      eventOutcomeSelection: "names",
+      eventOutcomeNames: selectedOutcomeNames.join(","),
+      eventOutcomeCount: selectedOutcomeNames.length,
+      memeRangeSelection: {
+        ...lockedSelection,
+        executionOutcomeCount: selectedOutcomeNames.length,
+        executionSelectedOutcomeNames: selectedOutcomeNames
+      }
+    };
+  }
+  return {
+    ...cfg,
+    eventOutcomeSelection: "middle",
+    eventOutcomeNames: "",
+    eventOutcomeCount: requestedOutcomeCount,
+    memeRangeSelection: {
+      locked: true,
+      mode: "middle_fallback",
+      metric: null,
+      reason: "meme_event_without_locked_metric_selection",
+      selectedOutcomeNames: [],
+      executionOutcomeCount: requestedOutcomeCount
+    }
+  };
+}
+
+function attachMemeRangeSelectionLock(cfg, market) {
+  if (!cfg.memeRangeSelectionEnabled || !isBot2LikeMemeProfile(cfg) || !market?.address) return market;
+  if (market.memeRangeSelection?.locked) return market;
+  const selection = readMemeRangeSelectionLock(cfg, market.address);
+  return selection ? { ...market, memeRangeSelection: selection } : market;
+}
+
+function readMemeRangeSelectionLock(cfg, marketAddress) {
+  const file = String(cfg?.memeRangeSelectionFile ?? "").trim();
+  const address = String(marketAddress ?? "").toLowerCase();
+  if (!file || !address) return null;
+  try {
+    const stat = fs.statSync(file);
+    let cached = memeRangeSelectionFileCache.get(file);
+    if (!cached || cached.mtimeMs !== stat.mtimeMs || cached.size !== stat.size) {
+      const locks = new Map();
+      for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/u)) {
+        if (!line.trim()) continue;
+        try {
+          const row = JSON.parse(line);
+          const selection = row?.selection ?? row;
+          const key = String(selection?.market ?? row?.market ?? "").toLowerCase();
+          if (!key || !selection?.locked || !Array.isArray(selection.selectedOutcomeNames)) continue;
+          locks.set(key, selection);
+        } catch {
+          // A partial trailing JSONL row must not hide earlier durable locks.
+        }
+      }
+      cached = { mtimeMs: stat.mtimeMs, size: stat.size, locks };
+      memeRangeSelectionFileCache.set(file, cached);
+    }
+    return cached.locks.get(address) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isBot2LikeMemeProfile(cfg) {
+  const botName = String(cfg?.botName ?? "").trim().toLowerCase();
+  const role = String(cfg?.profileRole ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_");
+  return role === "bot2_like" ||
+    botName === "42space-2" ||
+    botName === "bot2" ||
+    botName.startsWith("bot2") ||
+    botName === "42space-5" ||
+    botName === "bot5" ||
+    botName.startsWith("bot5") ||
+    botName.includes("bot5");
 }
 
 function clearSeenForFuturePlannedBuy(cfg, seen, market, source) {
@@ -9653,33 +12460,66 @@ function annotatePlannedBuyPlan(plan, buyCfg) {
 }
 
 function annotateBuyConfigPlan(plan, buyCfg) {
-  return annotateBot3FifaExactScorePlan(annotatePlannedBuyPlan(plan, buyCfg), buyCfg);
+  return annotateBot3FifaExactScorePlan(
+    annotateMemeRangeSelectionPlan(annotatePlannedBuyPlan(plan, buyCfg), buyCfg),
+    buyCfg
+  );
+}
+
+function annotateMemeRangeSelectionPlan(plan, buyCfg) {
+  const selection = buyCfg?.memeRangeSelection;
+  if (!selection) return plan;
+  return {
+    ...plan,
+    memeRangeSelection: selection,
+    selection: {
+      ...(plan.selection ?? {}),
+      memeRangeSelection: true,
+      memeRangeSelectionMode: selection.mode ?? null,
+      memeRangeMetric: selection.metric ?? null,
+      memeRangeMatchedOutcome: selection.matchedOutcomeName ?? null,
+      memeRangeComputedValue: selection.evidence?.computedValue ?? null,
+      memeRangeSourceProvider: selection.source?.provider ?? null,
+      memeRangeLockedAt: selection.lockedAt ?? null,
+      fallbackReason: selection.mode === "middle_fallback"
+        ? selection.reason ?? plan.selection?.fallbackReason ?? "meme_middle_fallback"
+        : plan.selection?.fallbackReason ?? null
+    }
+  };
 }
 
 function executionConfigForPlan(cfg, plan) {
-  if (!plan?.selection?.plannedBuy) return cfg;
+  if (!plan?.selection?.plannedBuy) return applyBuilderBundleTimingPreset(cfg);
   const totalStakeUsdt = Number(plan.totalStakeUsdt ?? 0);
   const stakePerOutcomeUsdt = Number(plan.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
-  return {
+  const maxStakePerOutcomeUsdt = Math.max(
+    stakePerOutcomeUsdt,
+    ...(plan.outcomes ?? []).map((outcome) => Number(outcome?.stakeUsdt ?? 0))
+  );
+  return applyBuilderBundleTimingPreset({
     ...cfg,
+    ...plannedBuyBuilderBundleOverrides(plan),
     eventOutcomeSelection: "names",
     eventOutcomeNames: plan.plannedBuy?.outcomes?.join(",") ?? cfg.eventOutcomeNames,
     eventOutcomeCount: plan.outcomes?.length ?? cfg.eventOutcomeCount,
     stakePerOutcomeUsdt,
-    maxStakeUsdt: Math.max(Number(cfg.maxStakeUsdt ?? 0), stakePerOutcomeUsdt),
+    stakeByOutcomeUsdt: plan.stakeByOutcomeUsdt ?? plan.plannedBuy?.stakeByOutcomeUsdt ?? {},
+    maxStakeUsdt: Math.max(Number(cfg.maxStakeUsdt ?? 0), maxStakePerOutcomeUsdt),
     maxMarketStakeUsdt: Math.max(Number(cfg.maxMarketStakeUsdt ?? 0), totalStakeUsdt),
     maxBatchStakeUsdt: Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), totalStakeUsdt),
     gasPriceGwei: plan.plannedBuy?.gasPriceGwei ?? cfg.gasPriceGwei,
+    openBroadcastDelayMs: plan.plannedBuy?.openBroadcastDelayMs ?? cfg.openBroadcastDelayMs,
     broadcastRpcUrls: plan.plannedBuy?.broadcastRpcUrls?.length
       ? plan.plannedBuy.broadcastRpcUrls
       : cfg.broadcastRpcUrls
-  };
+  });
 }
 
 function marketFilterDecision(market, cfg) {
-  const decision = getEventMarketDecision(market, cfg);
-  const planned = plannedBuyForMarket(cfg, market);
-  if (planned && !["missing-market", "status", "no-outcomes", "price-market"].includes(decision.reason)) {
+  const decisionMarket = attachMemeRangeSelectionLock(cfg, market);
+  const decision = getEventMarketDecision(decisionMarket, cfg);
+  const planned = plannedBuyForMarket(cfg, decisionMarket);
+  if (planned && !["missing-market", "status", "no-outcomes"].includes(decision.reason)) {
     return {
       ...decision,
       eligible: true,
@@ -9688,16 +12528,16 @@ function marketFilterDecision(market, cfg) {
       tags: [...(decision.tags ?? []), "计划买入"]
     };
   }
-  const bot3Fifa = bot3FifaExactScoreConfigForMarket(cfg, market)?.bot3FifaExactScoreAutoBuy?.preview ?? null;
+  const bot3Fifa = bot3FifaExactScoreConfigForMarket(cfg, decisionMarket)?.bot3FifaExactScoreAutoBuy?.preview ?? null;
   if (bot3Fifa && !["missing-market", "status", "no-outcomes", "price-market"].includes(decision.reason)) {
     return {
       ...decision,
       eligible: true,
       reason: "bot3-fifa-exact-score-auto-buy",
-      reasonText: "Bot3 FIFA 精确比分最低价格档自动买入",
+      reasonText: "FIFA 精确比分最低价格档自动买入",
       tags: [
         ...(decision.tags ?? []),
-        "Bot3",
+        "精确比分自动买入",
         "FIFA 精确比分",
         "最低价格档",
         bot3Fifa.selectedSide === "home_win" ? "主队胜档" : "客队胜档"
@@ -9705,7 +12545,7 @@ function marketFilterDecision(market, cfg) {
     };
   }
   if (!decision.eligible) return decision;
-  if (filterEventMarkets([market], cfg).length > 0) return decision;
+  if (filterEventMarkets([decisionMarket], cfg).length > 0) return decision;
   return {
     ...decision,
     eligible: false,
@@ -9751,6 +12591,8 @@ function recordMarketDecision(cfg, market, action, details = {}) {
     stakeUsdt: details.stakeUsdt ?? selectedStakeUsdt(market, cfg),
     rankSource: details.rankSource ?? null,
     fallbackReason: details.fallbackReason ?? null,
+    selectedOutcomes: details.selectedOutcomes ?? null,
+    memeRangeSelection: details.memeRangeSelection ?? null,
     txHash: details.txHash ?? null,
     message: details.message ?? null,
     at: new Date().toISOString()
@@ -9784,6 +12626,88 @@ function stableRecordActionGroupTimeMs(record, cfg, runtime = null) {
   const timing = openBroadcastTimingForRecord(record, cfg, runtime);
   if (timing.mode === "block_aware_20s") return timing.fixedTargetMs;
   return timing.targetMs;
+}
+
+function strictBuilderTargetKeyForRecord(record, cfg) {
+  const market = pendingMarket(record);
+  const startMs = Date.parse(market?.startDate ?? "");
+  if (!Number.isFinite(startMs)) return null;
+  const executionCfg = executionConfigForPlan(cfg, record?.preparedPlan);
+  const timing = executionCfg.builderBundleTimingResolved ?? resolveBuilderBundleTimingPreset(executionCfg);
+  if (!executionCfg.builderBundleEnabled || !timing.strict || !timing.eligible) return null;
+  const targetTimestamp = Math.ceil((startMs + timing.targetSecond * 1000) / 1000);
+  return `${targetTimestamp}:${timing.targetSecond}`;
+}
+
+function assignStrictBuilderLaneAdmission(cfg, records) {
+  const split = splitRecordsByStrictBuilderLane(cfg, records);
+  for (const record of split.selected) record.strictBuilderLaneBlocked = false;
+  for (const record of split.skipped) record.strictBuilderLaneBlocked = true;
+  return new Set(split.selected.map((record) => eventSeenKey(pendingMarket(record), cfg)));
+}
+
+function splitRecordsByStrictBuilderLane(cfg, records) {
+  const selected = [];
+  const skipped = [];
+  const strictGroups = new Map();
+  for (const record of records) {
+    const targetKey = strictBuilderTargetKeyForRecord(record, cfg);
+    if (!targetKey) {
+      selected.push(record);
+      continue;
+    }
+    if (!strictGroups.has(targetKey)) strictGroups.set(targetKey, []);
+    strictGroups.get(targetKey).push(record);
+  }
+  for (const group of strictGroups.values()) {
+    const sorted = sortRecordsByBuyPriority(group);
+    selected.push(sorted[0]);
+    skipped.push(...sorted.slice(1));
+  }
+  return { selected, skipped };
+}
+
+async function markStrictBuilderLaneSkippedRecords(cfg, seen, pending, runtime, records, source) {
+  if (!records.length) return;
+  let resetNonce = false;
+  for (const record of records) {
+    const market = pendingMarket(record);
+    const key = eventSeenKey(market, cfg);
+    if (hasPreSignedSingle(record) || hasPreSignedBundle(record)) resetNonce = true;
+    clearPreSignedSingleRecord(record, "builder-wallet-lane-conflict");
+    clearPreSignedBundleRecords([record], "builder-wallet-lane-conflict");
+    pending?.delete?.(key);
+    seen.add(key);
+    const row = {
+      level: "event-skip-builder-wallet-lane",
+      source,
+      market: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      reason: "one wallet can submit only one strict builder bundle per target second",
+      at: new Date().toISOString()
+    };
+    appendJsonl(cfg.fillsFile, row);
+    recordMarketDecision(cfg, market, "skipped", {
+      source,
+      message: row.reason,
+      dedupeKey: `${String(market.address).toLowerCase()}:skipped-builder-wallet-lane`
+    });
+    console.error(JSON.stringify(row));
+    notifyFeishu(cfg, {
+      title: "Builder 同钱包同秒冲突，已跳过",
+      level: "warn",
+      fields: {
+        market: market.address,
+        question: market.question,
+        startDate: market.startDate
+      },
+      dedupeKey: `builder-wallet-lane:${String(market.address).toLowerCase()}`,
+      cooldownMs: cfg.feishuAlertCooldownMs
+    });
+  }
+  if (resetNonce) await resetRuntimeNonceToPending(cfg, runtime, "builder_wallet_lane_conflict");
+  saveSeen(cfg.stateFile, seen);
 }
 
 function recordKeysWithinOpenLimit(cfg, records) {
@@ -9852,6 +12776,8 @@ function selectedOutcomeCount(market, cfg) {
 
 function selectedStakeUsdt(market, cfg) {
   const buyCfg = eventBuyConfigForMarket(cfg, market);
+  const plannedTotal = Number(buyCfg.plannedBuy?.totalStakeUsdt);
+  if (Number.isFinite(plannedTotal) && plannedTotal > 0) return plannedTotal;
   return buyCfg.stakePerOutcomeUsdt * selectedOutcomeCount(market, cfg);
 }
 
@@ -9864,10 +12790,12 @@ function batchSelectedStakeUsdt(markets, cfg) {
 }
 
 function routerApprovalRequiredUsdt(cfg) {
+  const bot3FifaAutoRequired = bot3FifaExactScoreAutoFallbackBusdt(cfg) ?? 0;
   return roundUsd(Math.max(
     cfg.maxMarketStakeUsdt,
     cfg.maxBatchStakeUsdt,
-    cfg.stakePerOutcomeUsdt * estimateMaxSelectedOutcomeCount(cfg)
+    cfg.stakePerOutcomeUsdt * estimateMaxSelectedOutcomeCount(cfg),
+    bot3FifaAutoRequired
   ));
 }
 
@@ -9949,7 +12877,8 @@ function walletHasBnbForMarkets(cfg, markets, walletStatus) {
 function walletBudgetUsdt(cfg, walletStatus, items = []) {
   if (!walletStatus) return 0;
   const plannedCap = plannedBatchStakeCap(cfg, items);
-  const batchCap = Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), plannedCap);
+  const bot3FifaAutoCap = bot3FifaExactScoreAutoFallbackBusdt(cfg) ?? 0;
+  const batchCap = Math.max(Number(cfg.maxBatchStakeUsdt ?? 0), plannedCap, bot3FifaAutoCap);
   return roundUsd(Math.max(0, Math.min(
     Number(walletStatus.busdtBalance ?? 0),
     Number(walletStatus.busdtAllowanceToRouter ?? 0),
@@ -10024,7 +12953,11 @@ async function estimateFundingGasReserve(publicClient, cfg, funding = {}) {
 
 function calculateFundingGasReserve(cfg, funding = {}) {
   const markets = Array.isArray(funding.nextBatchMarkets) ? funding.nextBatchMarkets : [];
-  if (cfg.bundleDueMarkets || markets.length <= 1) {
+  if (markets.length === 1) {
+    const marketCfg = eventBuyConfigForMarket(cfg, markets[0]);
+    return calculateFastGasReserve(marketCfg, funding);
+  }
+  if (cfg.bundleDueMarkets || markets.length === 0) {
     return calculateFastGasReserve(cfg, funding);
   }
 
@@ -10034,7 +12967,8 @@ function calculateFundingGasReserve(cfg, funding = {}) {
   const perMarket = [];
   for (const market of markets) {
     const marketFunding = fundingForMarketSummaries(cfg, [market], funding);
-    const reserve = calculateFastGasReserve(cfg, marketFunding);
+    const marketCfg = eventBuyConfigForMarket(cfg, market);
+    const reserve = calculateFastGasReserve(marketCfg, marketFunding);
     const required = parseUnits(String(reserve.requiredBnb), 18);
     const limit = BigInt(reserve.gasLimit ?? 0);
     const price = BigInt(reserve.gasPriceWei ?? 0);
@@ -10110,7 +13044,10 @@ function fundingBlockDetails(cfg, record, walletStatus) {
     };
   }
   try {
-    const reserve = calculateFastGasReserve(cfg, fundingForMarketSummaries(cfg, [recordFundingSummary(record, cfg)]));
+    const reserve = calculateFundingGasReserve(
+      cfg,
+      fundingForMarketSummaries(cfg, [recordFundingSummary(record, cfg)])
+    );
     const bnbBalance = Number(walletStatus?.bnbBalance ?? 0);
     if (bnbBalance < Number(reserve.requiredBnb)) {
       return {
@@ -10201,14 +13138,14 @@ function bot3FifaExactScoreAutoFallbackBusdt(cfg) {
   if (!bot3FifaExactScoreAutoBuyActive(cfg)) return null;
   const stake = Number(cfg.bot3FifaExactScoreAutoStakeUsdt ?? 0);
   if (!Number.isFinite(stake) || stake <= 0) return null;
-  return roundUsd(stake * 3);
+  return roundUsd(stake * BOT3_FIFA_EXACT_SCORE_AUTO_OUTCOME_COUNT);
 }
 
 function fundingUpperBoundRequiredBusdt(cfg) {
   const genericRequired = genericUpperBoundRequiredBusdt(cfg);
   const bot3FifaAutoRequired = bot3FifaExactScoreAutoFallbackBusdt(cfg);
   if (cfg.watchFundingMode === "next_batch" && bot3FifaAutoRequired !== null) {
-    return Math.min(genericRequired, bot3FifaAutoRequired);
+    return bot3FifaAutoRequired;
   }
   return genericRequired;
 }
@@ -10217,6 +13154,8 @@ function computeFundingRequirement(cfg, eventMarkets = []) {
   const genericUpperBoundBusdt = genericUpperBoundRequiredBusdt(cfg);
   const bot3FifaExactScoreAutoFallbackRequiredBusdt = bot3FifaExactScoreAutoFallbackBusdt(cfg);
   const upperBoundRequiredBusdt = fundingUpperBoundRequiredBusdt(cfg);
+  const usingBot3FifaExactScoreAutoFallback = cfg.watchFundingMode === "next_batch" &&
+    bot3FifaExactScoreAutoFallbackRequiredBusdt !== null;
   const futureMarkets = eventMarkets
     .filter((market) => msUntilStart(market) > 0)
     .sort(compareMarketBuyPriority);
@@ -10240,7 +13179,7 @@ function computeFundingRequirement(cfg, eventMarkets = []) {
     mode: cfg.watchFundingMode,
     reason: useNextBatch
       ? "known_next_opening_batch"
-      : (upperBoundRequiredBusdt < genericUpperBoundBusdt
+      : (usingBot3FifaExactScoreAutoFallback
         ? "bot3_fifa_exact_score_auto_single_market_fallback"
         : "single_market_upper_bound"),
     requiredBusdt,
@@ -10292,8 +13231,9 @@ function buildFundingWalletSummary(status, requirement, gasReserve) {
 }
 
 async function preparePendingRecord(cfg, market, runtime = null, options = {}) {
+  const lockedMarket = attachMemeRangeSelectionLock(cfg, market);
   const record = {
-    market,
+    market: lockedMarket,
     preparedPlan: null,
     preparedAt: null,
     prepareError: null,
@@ -10318,9 +13258,9 @@ async function preparePendingRecord(cfg, market, runtime = null, options = {}) {
   try {
     const hydrateOdds = options.hydrateOdds !== false;
     const preparedMarket = hydrateOdds
-      ? await maybeHydrateMarketOdds(cfg, market)
+      ? await maybeHydrateMarketOdds(cfg, lockedMarket)
       : {
-          ...market,
+          ...lockedMarket,
           oddsHydrationSkipped: options.hydrationSkipReason ?? "disabled"
         };
     record.market = preparedMarket;
@@ -10462,6 +13402,7 @@ function markExecutionRetry(record, cfg, error) {
 function skipExpiredPendingMarkets(cfg, seen, pending, source) {
   let skipped = false;
   for (const [key, record] of [...pending.entries()]) {
+    if (record.dedicatedOpenTimer || record.dedicatedOpenTimerInFlight) continue;
     const market = pendingMarket(record);
     if (!markSkippedIfExpired(cfg, seen, market, source)) continue;
     pending.delete(key);
@@ -10517,19 +13458,26 @@ function markFollowBlockedPendingRecord(cfg, seen, pending, record, source) {
 }
 
 function markSkippedIfExpired(cfg, seen, market, source) {
-  if (!isPastEventOpenWindow(cfg, market)) return false;
+  const strictWindow = strictBuilderTargetWindow(cfg, market);
+  const strictTargetExpired = Boolean(strictWindow && Date.now() >= strictWindow.expiresAtMs);
+  if (!strictTargetExpired && !isPastEventOpenWindow(cfg, market)) return false;
   const key = eventSeenKey(market, cfg);
   if (seen.has(key)) return true;
   const ageMs = marketOpenAgeMs(market);
+  const reason = strictTargetExpired
+    ? `strict Builder target T+${strictWindow.targetSecond}s expired; one-second-late local buy is forbidden`
+    : `market is ${Math.round(ageMs / 1000)}s past open; max ${cfg.eventOpenWindowSeconds}s`;
   const row = {
-    level: "event-skip-open-window",
+    level: strictTargetExpired ? "event-skip-builder-target-window" : "event-skip-open-window",
     source,
     market: market.address,
     question: market.question,
     startDate: market.startDate,
     ageMs,
     eventOpenWindowSeconds: cfg.eventOpenWindowSeconds,
-    reason: `market is ${Math.round(ageMs / 1000)}s past open; max ${cfg.eventOpenWindowSeconds}s`,
+    builderTargetSecond: strictWindow?.targetSecond ?? null,
+    builderTargetTimestamp: strictWindow?.targetTimestamp ?? null,
+    reason,
     at: new Date().toISOString()
   };
   seen.add(key);
@@ -10537,10 +13485,32 @@ function markSkippedIfExpired(cfg, seen, market, source) {
   recordMarketDecision(cfg, market, "skipped", {
     source,
     message: row.reason,
-    dedupeKey: `${String(market.address).toLowerCase()}:skipped-open-window`
+    dedupeKey: `${String(market.address).toLowerCase()}:${strictTargetExpired ? "skipped-builder-target-window" : "skipped-open-window"}`
   });
   console.error(JSON.stringify(row));
   return true;
+}
+
+function strictBuilderTargetWindow(cfg, market, { planAware = true } = {}) {
+  const startMs = Date.parse(market?.startDate ?? "");
+  if (!Number.isFinite(startMs)) return null;
+  const effective = planAware
+    ? eventBuyConfigForMarket(cfg, market)
+    : applyBuilderBundleTimingPreset(cfg);
+  const timing = effective.builderBundleTimingResolved ?? resolveBuilderBundleTimingPreset(effective);
+  if (
+    !effective.builderBundleEnabled ||
+    effective.builderBundleMode !== "builder_only" ||
+    !timing.strict ||
+    !timing.eligible ||
+    !Number.isSafeInteger(Number(timing.targetSecond))
+  ) return null;
+  const targetTimestamp = Math.ceil((startMs + Number(timing.targetSecond) * 1000) / 1000);
+  return {
+    targetSecond: Number(timing.targetSecond),
+    targetTimestamp,
+    expiresAtMs: (targetTimestamp + 1) * 1000
+  };
 }
 
 function isPastEventOpenWindow(cfg, market) {
@@ -10550,6 +13520,12 @@ function isPastEventOpenWindow(cfg, market) {
 }
 
 function assertPlanWithinOpenWindow(cfg, market, source = "buy") {
+  const strictWindow = strictBuilderTargetWindow(cfg, market, { planAware: false });
+  if (strictWindow && Date.now() >= strictWindow.expiresAtMs) {
+    throw new Error(
+      `Refusing ${source}: strict Builder target T+${strictWindow.targetSecond}s expired; one-second-late local buy is forbidden`
+    );
+  }
   if (!isPastEventOpenWindow(cfg, market)) return;
   const ageMs = marketOpenAgeMs(market);
   throw new Error(
@@ -10855,6 +13831,8 @@ async function maybeExecuteMarket(
 ) {
   const key = eventSeenKey(market, cfg);
   if (seen.has(key)) return false;
+  await waitForRuntimeBuilderNonceRecovery(runtime);
+  if (retryRecord) preSignedFastTransaction = retryRecord.preSignedFastTransaction ?? null;
   if (isMarketFollowBlocked(market, cfg)) {
     seen.add(key);
     saveSeen(cfg.stateFile, seen);
@@ -10969,6 +13947,15 @@ async function maybeExecuteMarket(
   );
   try {
     result = await executeOrPrint(eventPlan, cfg, runtime);
+    if (result?.builderBundleTipNonceReleased && preSignedFastTransaction) {
+      releaseBuilderTipNonceReservationAfterEarlyFailure(
+        cfg,
+        runtime?.pendingBuyRecords ?? new Map(),
+        runtime,
+        retryRecord,
+        preSignedFastTransaction
+      );
+    }
     if (openBroadcastTiming) result = { ...result, openBroadcastTiming };
   } catch (error) {
     markExecutionRetry(retryRecord, cfg, error);
@@ -11253,6 +14240,8 @@ function maybeTrackReceipt(cfg, result, context = {}, runtime = null) {
     result.blockNumber
   ) return;
 
+  maybeTrackTimestampGuardFallback(cfg, result, context, runtime);
+  maybeTrackStrictBuilderTargetExpiry(cfg, result, context, runtime);
   void trackReceipt(cfg, result, context, runtime).catch(async (error) => {
     const receiptWatch = await classifyReceiptWatchError(cfg, result.txHash).catch((classifyError) => ({
       status: "error",
@@ -11278,7 +14267,11 @@ function maybeTrackReceipt(cfg, result, context = {}, runtime = null) {
     };
     appendJsonl(cfg.fillsFile, row);
     console.error(JSON.stringify(row));
+    if (receiptWatch.status === "dropped") {
+      await recoverRuntimeNonceAfterDroppedBuy(cfg, runtime, result, "receipt-watch-dropped");
+    }
     if (receiptWatch.receiptFound && receiptWatch.receiptStatus) {
+      clearTimestampGuardFallbackTransactions(result.txHash);
       if (receiptWatch.receipt) {
         const { publicClient } = makeClients(cfg);
         await appendGasLedgerFromReceipt(cfg, publicClient, {
@@ -11292,6 +14285,9 @@ function maybeTrackReceipt(cfg, result, context = {}, runtime = null) {
             receiptWatchError: message
           }
         });
+        await maybeAppendBuilderTimestampGuardReceipt(cfg, publicClient, result, context, "event-receipt-classify-builder-guard");
+        const tipReceipt = await maybeAppendBuilderBundleTipReceipt(cfg, publicClient, result, context, "event-receipt-classify-builder-tip");
+        await maybeResetRuntimeNonceAfterMissingBuilderTip(cfg, publicClient, runtime, result, tipReceipt, "event-receipt-classify-builder-tip");
       }
       recordReceiptMarketDecisions(cfg, context, { status: receiptWatch.receiptStatus }, result.txHash);
       if (receiptWatch.receiptStatus === "success") return;
@@ -11315,6 +14311,294 @@ function maybeTrackReceipt(cfg, result, context = {}, runtime = null) {
   });
 }
 
+function maybeTrackTimestampGuardFallback(cfg, result, context = {}, runtime = null) {
+  if (!result?.builderTimestampGuardEnabled || !result?.builderTimestampGuardTxHash) return;
+  const fallback = getTimestampGuardFallbackTransactions(result.txHash);
+  if (!fallback) {
+    const row = {
+      level: "builder-timestamp-guard-fallback-missing",
+      txHash: result.txHash,
+      guardTxHash: result.builderTimestampGuardTxHash,
+      context: receiptLogContext(context),
+      at: new Date().toISOString()
+    };
+    appendJsonl(cfg.fillsFile, row);
+    console.error(JSON.stringify(row));
+    notifyFeishu(cfg, {
+      title: "Builder 时间闸门 fallback 缺失",
+      level: "warn",
+      fields: {
+        tx: result.txHash,
+        guardTx: result.builderTimestampGuardTxHash,
+        context: context.type ?? ""
+      },
+      dedupeKey: `builder-timestamp-guard-fallback-missing:${result.txHash}`,
+      cooldownMs: cfg.feishuAlertCooldownMs
+    });
+    return;
+  }
+  void releaseTimestampGuardAfterTarget(cfg, result, context, runtime, fallback).catch((error) => {
+    const row = {
+      level: "builder-timestamp-guard-fallback-error",
+      txHash: result.txHash,
+      guardTxHash: fallback.guard.txHash,
+      message: errorMessage(error),
+      context: receiptLogContext(context),
+      at: new Date().toISOString()
+    };
+    appendJsonl(cfg.fillsFile, row);
+    console.error(JSON.stringify(row));
+    notifyFeishu(cfg, {
+      title: "Builder 时间闸门 fallback 异常",
+      level: "warn",
+      fields: {
+        tx: result.txHash,
+        guardTx: fallback.guard.txHash,
+        message: row.message
+      },
+      dedupeKey: `builder-timestamp-guard-fallback-error:${result.txHash}`,
+      cooldownMs: cfg.feishuAlertCooldownMs
+    });
+  });
+}
+
+async function releaseTimestampGuardAfterTarget(cfg, result, context, runtime, fallback) {
+  const targetTimestamp = Number(fallback.targetTimestamp ?? result.builderTimestampGuardTargetTimestamp);
+  if (!Number.isSafeInteger(targetTimestamp) || targetTimestamp <= 0) {
+    throw new Error(`invalid timestamp guard target ${targetTimestamp}`);
+  }
+  const { publicClient } = makeClients(cfg);
+  const pollMs = Math.max(25, Number(cfg.builderTimestampGuardReleasePollMs ?? 50));
+  const deadlineMs = Date.now() + 10_000;
+  let latestBlock = null;
+  while (Date.now() < deadlineMs) {
+    latestBlock = await publicClient.getBlock({ blockTag: "latest" });
+    if (Number(latestBlock.timestamp) >= targetTimestamp) break;
+    await sleep(pollMs);
+  }
+  if (!latestBlock || Number(latestBlock.timestamp) < targetTimestamp) {
+    throw new Error(`chain timestamp did not reach guard target ${targetTimestamp}`);
+  }
+
+  const existingReceipt = await publicClient.getTransactionReceipt({ hash: result.txHash }).catch(() => null);
+  if (existingReceipt) {
+    clearTimestampGuardFallbackTransactions(result.txHash);
+    return;
+  }
+
+  const fallbackCfg = {
+    ...cfg,
+    builderBundleEnabled: false,
+    builderBundleKillSwitch: true,
+    builderTimestampGuardEnabled: false
+  };
+  let guardBroadcast = null;
+  let buyBroadcast = null;
+  await withRuntimeTransactionLock(runtime, "builder-timestamp-guard-release", async () => {
+    guardBroadcast = await broadcastSignedTransaction(fallbackCfg, fallback.guard);
+    buyBroadcast = await broadcastSignedTransaction(fallbackCfg, fallback.buy);
+  });
+  const row = {
+    level: "builder-timestamp-guard-released",
+    txHash: result.txHash,
+    guardTxHash: fallback.guard.txHash,
+    targetTimestamp,
+    observedBlockNumber: latestBlock.number?.toString() ?? null,
+    observedBlockTimestamp: latestBlock.timestamp?.toString() ?? null,
+    guardBroadcastStartedAt: guardBroadcast?.broadcastStartedAt ?? null,
+    guardFirstAcceptedAt: guardBroadcast?.firstAcceptedAt ?? null,
+    buyBroadcastStartedAt: buyBroadcast?.broadcastStartedAt ?? null,
+    buyFirstAcceptedAt: buyBroadcast?.firstAcceptedAt ?? null,
+    context: receiptLogContext(context),
+    at: new Date().toISOString()
+  };
+  appendJsonl(cfg.fillsFile, row);
+  console.log(JSON.stringify(row));
+}
+
+function maybeTrackStrictBuilderTargetExpiry(cfg, result, context = {}, runtime = null) {
+  scheduleStrictBuilderTargetExpiryWatch(cfg, result, context, runtime);
+}
+
+function scheduleStrictBuilderTargetExpiryWatch(
+  cfg,
+  result,
+  context = {},
+  runtime = null,
+  { allowUnsubmitted = false } = {}
+) {
+  const targetTimestamp = strictBuilderExpiryTargetTimestamp(result);
+  if (
+    (!allowUnsubmitted && !result?.builderBundleSubmitted) ||
+    !result?.publicBroadcastSkipped ||
+    !result?.txHash ||
+    !Number.isSafeInteger(targetTimestamp) ||
+    targetTimestamp <= 0
+  ) return;
+
+  if (runtime && !runtime.builderTargetExpiryWatch) runtime.builderTargetExpiryWatch = new Set();
+  const watchSet = runtime?.builderTargetExpiryWatch ?? builderTargetExpiryWatches;
+  const key = String(result.txHash).toLowerCase();
+  if (watchSet.has(key)) return;
+  watchSet.add(key);
+
+  const tracked = trackStrictBuilderTargetExpiry(cfg, result, context, runtime, targetTimestamp)
+    .catch((error) => {
+      if (runtime) runtime.builderNonceRecoveryError = errorMessage(error);
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "builder-target-expiry-watch",
+        txHash: result.txHash,
+        targetTimestamp,
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+      throw error;
+    });
+  if (!runtime) {
+    void tracked.catch(() => {});
+    return;
+  }
+  runtime.builderNonceRecoveryError = null;
+  const recovery = tracked.finally(() => {
+    if (runtime.builderNonceRecoveryPromise === recovery) {
+      runtime.builderNonceRecoveryPromise = null;
+    }
+  });
+  runtime.builderNonceRecoveryPromise = recovery;
+  runtime.builderNonceRecoveryTxHash = result.txHash;
+  void recovery.catch(() => {});
+}
+
+function strictBuilderExpiryTargetTimestamp(result) {
+  const executorTarget = Number(result?.builderTimedBuyExecutorTargetTimestamp);
+  if (Number.isSafeInteger(executorTarget) && executorTarget > 0) return executorTarget;
+  return Number(result?.builderBundleMaxTimestamp);
+}
+
+async function trackStrictBuilderTargetExpiry(cfg, result, context, runtime, targetTimestamp) {
+  const { publicClient } = makeClients(cfg);
+  const wallTargetEndMs = (targetTimestamp + 1) * 1000;
+  if (Date.now() < wallTargetEndMs) await sleep(wallTargetEndMs - Date.now());
+
+  const deadlineMs = Date.now() + 30_000;
+  let latestBlock = null;
+  while (Date.now() < deadlineMs) {
+    latestBlock = await publicClient.getBlock({ blockTag: "latest" });
+    if (Number(latestBlock.timestamp) > targetTimestamp) break;
+    await sleep(150);
+  }
+  if (!latestBlock || Number(latestBlock.timestamp) <= targetTimestamp) {
+    throw new Error(`chain timestamp did not pass strict builder target ${targetTimestamp}`);
+  }
+
+  let receipt = null;
+  for (let attempt = 0; attempt < 4 && !receipt; attempt += 1) {
+    receipt = await publicClient.getTransactionReceipt({ hash: result.txHash }).catch(() => null);
+    if (!receipt && attempt < 3) await sleep(250);
+  }
+  if (receipt) {
+    await reconcileRuntimeNonceAfterStrictBuilderReceipt(cfg, runtime, result);
+    return;
+  }
+
+  const row = {
+    level: "builder-bundle-target-missed",
+    status: "dropped",
+    txHash: result.txHash,
+    tipTxHash: result.builderBundleTipTxHash ?? null,
+    bundleHash: result.builderBundleHash ?? null,
+    builderBundleSubmitted: Boolean(result.builderBundleSubmitted),
+    targetTimestamp,
+    targetSecond: result.builderBundleTargetSecond ?? null,
+    latestBlockNumber: latestBlock.number?.toString() ?? null,
+    latestBlockTimestamp: latestBlock.timestamp?.toString() ?? null,
+    context: receiptLogContext(context),
+    at: new Date().toISOString()
+  };
+  appendJsonl(cfg.fillsFile, row);
+  console.error(JSON.stringify(row));
+  await recoverRuntimeNonceAfterDroppedBuy(cfg, runtime, result, "strict-builder-target-missed");
+  recordReceiptWatchErrorMarketDecisions(cfg, context, result.txHash, "strict builder target second missed", {
+    status: "dropped",
+    txFound: false,
+    receiptFound: false
+  });
+  notifyFeishu(cfg, {
+    title: "Builder 目标秒未成交，已放弃",
+    level: "warn",
+    fields: {
+      tx: result.txHash,
+      targetSecond: String(result.builderBundleTargetSecond ?? ""),
+      targetTimestamp: String(targetTimestamp),
+      context: context.type ?? ""
+    },
+    dedupeKey: `builder-target-missed:${result.txHash}`,
+    cooldownMs: cfg.feishuAlertCooldownMs
+  });
+}
+
+async function reconcileRuntimeNonceAfterStrictBuilderReceipt(cfg, runtime, result) {
+  if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
+  const buyNonce = Number(result?.nonce ?? result?.preSignedNonce);
+  if (!Number.isSafeInteger(buyNonce) || buyNonce < 0) return;
+  const { publicClient, account } = makeClients(cfg);
+  if (!account) return;
+  const pendingNonce = Number(await publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "pending"
+  }));
+  const expectedNonce = buyNonce + 1 + (result?.builderBundleTipTxHash ? 1 : 0);
+  if (pendingNonce >= expectedNonce) return;
+  const previousNonce = runtime.nextNonce;
+  const cleared = clearRuntimePreSignedTransactionsAtOrAfterNonce(
+    runtime,
+    pendingNonce,
+    "strict-builder-tip-missing"
+  );
+  runtime.nextNonce = pendingNonce;
+  runtime.lastNonceSyncAt = Date.now();
+  console.error(JSON.stringify({
+    level: "warn",
+    source: "strict-builder-receipt-nonce-reconciled",
+    txHash: result.txHash,
+    buyNonce,
+    expectedNonce,
+    pendingNonce,
+    previousNonce,
+    clearedPreSignedTransactions: cleared,
+    at: new Date().toISOString()
+  }));
+}
+
+async function recoverRuntimeNonceAfterDroppedBuy(cfg, runtime, result, reason) {
+  if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
+  const buyNonce = Number(result?.nonce ?? result?.preSignedNonce);
+  if (Number.isSafeInteger(buyNonce) && buyNonce >= 0) {
+    clearRuntimePreSignedTransactionsAtOrAfterNonce(runtime, buyNonce, reason);
+  }
+  await resetRuntimeNonceToPending(cfg, runtime, reason);
+}
+
+function clearRuntimePreSignedTransactionsAtOrAfterNonce(runtime, minNonce, reason) {
+  const pending = runtime?.pendingBuyRecords;
+  if (!pending?.values) return 0;
+  let cleared = 0;
+  for (const record of pending.values()) {
+    const singleNonce = Number(record?.preSignedFastTransaction?.nonce);
+    if (Number.isSafeInteger(singleNonce) && singleNonce >= minNonce) {
+      clearPreSignedSingleRecord(record, reason);
+      cleared += 1;
+    }
+    const bundleNonce = Number(record?.preSignedFastBundleTransaction?.nonce);
+    if (Number.isSafeInteger(bundleNonce) && bundleNonce >= minNonce) {
+      clearPreSignedBundleRecords([record], reason);
+      cleared += 1;
+    }
+  }
+  return cleared;
+}
+
 async function trackReceipt(cfg, result, context, runtime = null) {
   const { publicClient } = makeClients(cfg);
   const txHash = result.txHash;
@@ -11323,6 +14607,7 @@ async function trackReceipt(cfg, result, context, runtime = null) {
     timeout: cfg.receiptWatchTimeoutMs,
     pollingInterval: cfg.receiptWatchPollingMs
   });
+  clearTimestampGuardFallbackTransactions(txHash);
   const row = {
     level: "event-receipt",
     status: receipt.status,
@@ -11341,6 +14626,9 @@ async function trackReceipt(cfg, result, context, runtime = null) {
     source: "event-receipt",
     allocations: gasAllocationsFromReceiptContext(context)
   });
+  await maybeAppendBuilderTimestampGuardReceipt(cfg, publicClient, result, context, "event-receipt-builder-guard");
+  const tipReceipt = await maybeAppendBuilderBundleTipReceipt(cfg, publicClient, result, context, "event-receipt-builder-tip");
+  await maybeResetRuntimeNonceAfterMissingBuilderTip(cfg, publicClient, runtime, result, tipReceipt, "event-receipt-builder-tip");
   console.log(JSON.stringify(row));
   recordReceiptMarketDecisions(cfg, context, receipt, txHash);
   if (receipt.status === "success") {
@@ -11359,6 +14647,142 @@ async function trackReceipt(cfg, result, context, runtime = null) {
       cooldownMs: cfg.feishuAlertCooldownMs
     });
   }
+}
+
+async function maybeAppendBuilderTimestampGuardReceipt(
+  cfg,
+  publicClient,
+  result,
+  context = {},
+  source = "builder-guard"
+) {
+  const guardTxHash = result?.builderTimestampGuardTxHash;
+  if (!guardTxHash) return null;
+  const receipt = await publicClient.getTransactionReceipt({ hash: guardTxHash }).catch(() => null);
+  const row = {
+    level: "builder-timestamp-guard-receipt",
+    status: receipt?.status ?? "not_found",
+    buyTxHash: result.txHash ?? null,
+    guardTxHash,
+    targetTimestamp: result.builderTimestampGuardTargetTimestamp ?? null,
+    blockNumber: receipt?.blockNumber?.toString() ?? null,
+    gasUsed: receipt?.gasUsed?.toString() ?? null,
+    effectiveGasPrice: receipt?.effectiveGasPrice?.toString() ?? null,
+    context: receiptLogContext(context),
+    at: new Date().toISOString()
+  };
+  appendJsonl(cfg.fillsFile, row);
+  if (!receipt) return null;
+  await appendGasLedgerFromReceipt(cfg, publicClient, {
+    txHash: guardTxHash,
+    receipt,
+    action: "builder_guard",
+    source,
+    allocations: gasAllocationsFromReceiptContext(context).map((item) => ({
+      ...item,
+      action: "builder_guard"
+    })),
+    metadata: {
+      buyTxHash: result.txHash ?? null,
+      targetTimestamp: result.builderTimestampGuardTargetTimestamp ?? null,
+      guardAddress: result.builderTimestampGuardAddress ?? null
+    }
+  });
+  return receipt;
+}
+
+async function maybeAppendBuilderBundleTipReceipt(cfg, publicClient, result, context = {}, source = "builder-tip") {
+  if (!result?.builderBundleSubmitted) return null;
+  const candidates = Array.isArray(result.builderBundleTipCandidates) && result.builderBundleTipCandidates.length > 0
+    ? result.builderBundleTipCandidates
+    : result.builderBundleTipTxHash
+      ? [{
+          tipTxHash: result.builderBundleTipTxHash,
+          tipBnb: result.builderBundleTipBnb ?? null,
+          provider: result.builderBundleProvider ?? null,
+          targetId: null,
+          tipTo: result.builderBundleTipTo ?? null
+        }]
+      : [];
+  const uniqueCandidates = [...new Map(candidates
+    .filter((candidate) => /^0x[a-fA-F0-9]{64}$/u.test(String(candidate?.tipTxHash ?? "")))
+    .map((candidate) => [String(candidate.tipTxHash).toLowerCase(), candidate])).values()];
+  if (uniqueCandidates.length === 0) return null;
+  const checked = await Promise.all(uniqueCandidates.map(async (candidate) => ({
+    candidate,
+    receipt: await publicClient.getTransactionReceipt({ hash: candidate.tipTxHash }).catch(() => null)
+  })));
+  for (const { candidate, receipt } of checked) {
+    appendJsonl(cfg.fillsFile, {
+      level: "builder-bundle-tip-receipt",
+      status: receipt?.status ?? "not_found",
+      buyTxHash: result.txHash ?? null,
+      tipTxHash: candidate.tipTxHash,
+      tipTo: candidate.tipTo ?? null,
+      tipBnb: candidate.tipBnb ?? result.builderBundleTipBnb ?? null,
+      provider: candidate.provider ?? null,
+      targetId: candidate.targetId ?? null,
+      blockNumber: receipt?.blockNumber?.toString() ?? null,
+      gasUsed: receipt?.gasUsed?.toString() ?? null,
+      effectiveGasPrice: receipt?.effectiveGasPrice?.toString() ?? null,
+      context: receiptLogContext(context),
+      at: new Date().toISOString()
+    });
+  }
+  const landed = checked.find((item) => item.receipt);
+  if (!landed) return null;
+  const { candidate, receipt } = landed;
+  await appendGasLedgerFromReceipt(cfg, publicClient, {
+    txHash: candidate.tipTxHash,
+    receipt,
+    action: "builder_tip",
+    source,
+    extraFeeBnb: candidate.tipBnb ?? result.builderBundleTipBnb ?? null,
+    allocations: gasAllocationsFromReceiptContext(context).map((item) => ({
+      ...item,
+      action: "builder_tip"
+    })),
+    metadata: {
+      buyTxHash: result.txHash ?? null,
+      tipBnb: candidate.tipBnb ?? result.builderBundleTipBnb ?? null,
+      provider: candidate.provider ?? null,
+      targetId: candidate.targetId ?? null,
+      tipTo: candidate.tipTo ?? null
+    }
+  });
+  return receipt;
+}
+
+async function maybeResetRuntimeNonceAfterMissingBuilderTip(cfg, publicClient, runtime, result, tipReceipt, source) {
+  if (tipReceipt) return;
+  if (result?.builderBundleTipNonceReleased) return;
+  if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
+  if (!result?.builderBundleTipPreSigned || !result?.builderBundleTipTxHash) return;
+  const buyNonce = Number(result.nonce ?? result.preSignedNonce);
+  if (!Number.isSafeInteger(buyNonce) || buyNonce < 0) return;
+  const { account } = makeClients(cfg);
+  if (!account) return;
+  const pendingNonce = Number(await publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "pending"
+  }));
+  if (!Number.isSafeInteger(pendingNonce) || pendingNonce <= buyNonce || pendingNonce >= runtime.nextNonce) return;
+  const previousNonce = runtime.nextNonce;
+  const clearedPreSignedTransactions = clearRuntimePreSignedTransactionsAtOrAfterNonce(runtime, pendingNonce, source);
+  runtime.nextNonce = pendingNonce;
+  runtime.lastNonceSyncAt = Date.now();
+  console.error(JSON.stringify({
+    level: "warn",
+    source: "builder-tip-missing-nonce-reset",
+    reason: source,
+    buyTxHash: result.txHash ?? null,
+    tipTxHash: result.builderBundleTipTxHash,
+    buyNonce,
+    previousNonce,
+    pendingNonce,
+    clearedPreSignedTransactions,
+    at: new Date().toISOString()
+  }));
 }
 
 async function classifyReceiptWatchError(cfg, txHash) {
@@ -11410,11 +14834,32 @@ function maybeScheduleFastOpenExitAfterBuyReceipt(cfg, result, context = {}, run
     }));
     return;
   }
+  const earlierBuy = pendingBuyBeforeFastOpenExit(cfg, runtime, market, schedule.targetMs);
+  if (earlierBuy) {
+    console.error(JSON.stringify({
+      level: "event-auto-sell-fast-open-exit-skip",
+      reason: "pending-buy-precedes-fast-exit",
+      market: market.address,
+      question: market.question,
+      txHash: result.txHash,
+      targetAt: schedule.targetAt,
+      pendingBuyMarket: earlierBuy.market,
+      pendingBuyQuestion: earlierBuy.question,
+      pendingBuyTargetAt: earlierBuy.targetAt,
+      at: new Date().toISOString()
+    }));
+    return;
+  }
 
   const key = `${String(market.address).toLowerCase()}:${String(result.txHash).toLowerCase()}`;
   if (!runtime.fastOpenExitScheduled) runtime.fastOpenExitScheduled = new Set();
   if (runtime.fastOpenExitScheduled.has(key)) return;
   runtime.fastOpenExitScheduled.add(key);
+  runtime.fastOpenExitPreSignGate = {
+    key,
+    market: market.address,
+    targetAt: schedule.targetAt
+  };
   pauseRuntimeAutoSellUntil(runtime, schedule.targetMs + Number(cfg.autoSellFastOpenExitMonitorPauseMs ?? 0), "fast-open-exit-scheduled");
 
   console.log(JSON.stringify({
@@ -11433,7 +14878,7 @@ function maybeScheduleFastOpenExitAfterBuyReceipt(cfg, result, context = {}, run
     at: new Date().toISOString()
   }));
 
-  void prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, schedule)
+  void prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, schedule, key)
     .catch(async (error) => {
       console.error(JSON.stringify({
         level: "event-auto-sell-fast-open-exit-error",
@@ -11455,7 +14900,32 @@ function maybeScheduleFastOpenExitAfterBuyReceipt(cfg, result, context = {}, run
         dedupeKey: `fast-open-exit-error:${String(market.address).toLowerCase()}:${String(result.txHash).toLowerCase()}`,
         cooldownMs: cfg.autoSellAlertCooldownMs
       });
-    });
+    })
+    .finally(() => releaseFastOpenExitPreSignGate(runtime, key));
+}
+
+function pendingBuyBeforeFastOpenExit(cfg, runtime, currentMarket, fastExitTargetMs) {
+  const pending = runtime?.pendingBuyRecords;
+  if (!pending?.values) return null;
+  const currentMarketKey = String(currentMarket?.address ?? "").toLowerCase();
+  let earliest = null;
+  for (const record of pending.values()) {
+    const market = pendingMarket(record);
+    if (String(market?.address ?? "").toLowerCase() === currentMarketKey) continue;
+    const waitMs = msUntilRecordAction(record, cfg, runtime);
+    if (!Number.isFinite(waitMs)) continue;
+    const targetMs = Date.now() + waitMs;
+    if (targetMs > fastExitTargetMs) continue;
+    if (!earliest || targetMs < earliest.targetMs) {
+      earliest = {
+        market: market?.address ?? null,
+        question: market?.question ?? null,
+        targetMs,
+        targetAt: new Date(targetMs).toISOString()
+      };
+    }
+  }
+  return earliest;
 }
 
 function shouldScheduleFastOpenExitAfterBuy(cfg, result, context = {}, runtime = null, receipt = null) {
@@ -11522,7 +14992,19 @@ function pauseRuntimeAutoSellUntil(runtime, untilMs, reason) {
   runtime.autoSellPauseReason = reason;
 }
 
-async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, schedule) {
+function releaseFastOpenExitAutoSellPause(runtime) {
+  if (!runtime || runtime.autoSellPauseReason !== "fast-open-exit-scheduled") return;
+  runtime.autoSellPausedUntil = 0;
+  runtime.autoSellPauseReason = null;
+}
+
+function releaseFastOpenExitPreSignGate(runtime, key) {
+  if (!runtime?.fastOpenExitPreSignGate) return;
+  if (runtime.fastOpenExitPreSignGate.key !== key) return;
+  runtime.fastOpenExitPreSignGate = null;
+}
+
+async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, schedule, gateKey = null) {
   const { publicClient, account } = makeClients(cfg);
   if (!account) throw new Error("PRIVATE_KEY is required for fast open exit");
   const walletAddress = cfg.walletAddress || account.address;
@@ -11532,6 +15014,9 @@ async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, sc
   let signed = null;
   let broadcast = null;
   let actions = [];
+  const sellExecutionCfg = rpcOnlyAutoSellBroadcastConfig(
+    autoSellExecutionConfigForItems(cfg, [{ autoSellCfg: cfg }])
+  );
 
   try {
     let plans = await buildFastOpenExitSellPlans(cfg, publicClient, market, result, walletAddress, schedule.targetMs);
@@ -11547,7 +15032,7 @@ async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, sc
     await ensureAutoSellGasBudget(cfg, publicClient, walletAddress, estimateAutoSellBatchGas(plans.length));
     signed = await withRuntimeTransactionLock(runtime, "fast-open-exit-presign", () =>
       preSignSellOutcomesBatch(
-        autoSellExecutionConfigForItems(cfg, [{ autoSellCfg: cfg }]),
+        sellExecutionCfg,
         plans,
         runtime,
         { requirePreapprovedOperator: true }
@@ -11577,9 +15062,10 @@ async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, sc
 
     await waitUntilBroadcastTarget(schedule.targetMs, Number(cfg.openBroadcastSpinMs ?? 0));
     broadcast = await withRuntimeTransactionLock(runtime, "fast-open-exit-broadcast", () =>
-      broadcastSignedTransaction(cfg, signed)
+      broadcastSignedTransaction(sellExecutionCfg, signed)
     );
     await syncRuntimeNonceAfterExternalTx(cfg, runtime, "fast-open-exit-broadcast");
+    releaseFastOpenExitPreSignGate(runtime, gateKey);
     for (const action of actions) {
       action.status = "broadcast";
       action.txHash = broadcast.txHash;
@@ -11660,6 +15146,7 @@ async function prepareAndBroadcastFastOpenExit(cfg, result, context, runtime, sc
       }
     });
   } catch (error) {
+    releaseFastOpenExitAutoSellPause(runtime);
     if (signed && !broadcast) await resetRuntimeNonceToPending(cfg, runtime, "fast_open_exit_unbroadcast_signed_tx");
     for (const action of actions) {
       action.status = "error";
@@ -11708,9 +15195,11 @@ async function buildFastOpenExitSellPlans(cfg, publicClient, market, result, wal
 }
 
 async function ensureFastOpenExitOperatorApproval(cfg, runtime, marketAddress, plans) {
+  void cfg;
+  void runtime;
   if (plans.every((plan) => plan.operatorApproved)) return null;
-  return withRuntimeTransactionLock(runtime, "fast-open-exit-operator-approval", () =>
-    ensureMarketOperatorApproval(cfg, marketAddress)
+  throw new Error(
+    `Fast open exit operator approval was not mined before buy for market ${marketAddress}; refusing a nonce-consuming approval after buy`
   );
 }
 
@@ -11808,6 +15297,7 @@ function notifyFeishu(
   cfg,
   { title, level = "info", fields = {}, dedupeKey = null, cooldownMs = 0, fingerprint = null, repeatMs = 0 } = {}
 ) {
+  if (cfg?.executionTestMode) return;
   if (!cfg.feishuAlertsEnabled || !cfg.feishuWebhook || !title) return;
   if (!shouldSendFeishuAlert(cfg, { dedupeKey, cooldownMs, fingerprint, repeatMs, title })) return;
 
@@ -12825,6 +16315,68 @@ function wsProviderLabel(url) {
   } catch {
     return "unknown";
   }
+}
+
+function builderBundleConfigSummary(cfg) {
+  const effective = applyBuilderBundleTimingPreset(cfg);
+  const timing = effective.builderBundleTimingResolved ?? resolveBuilderBundleTimingPreset(effective);
+  return {
+    killSwitch: Boolean(effective.builderBundleKillSwitch),
+    configuredEnabled: Boolean(cfg.builderBundleEnabled),
+    enabled: Boolean(effective.builderBundleEnabled),
+    provider: effective.builderBundleUrl ? wsProviderLabel(effective.builderBundleUrl) : null,
+    builders: [
+      {
+        id: "48club",
+        enabled: Boolean(effective.builderBundleEnabled),
+        provider: effective.builderBundleUrl ? wsProviderLabel(effective.builderBundleUrl) : null,
+        tipTo: effective.builderBundleTipTo ?? null
+      },
+      {
+        id: "blockrazor",
+        enabled: Boolean(effective.builderBundleEnabled && effective.blockrazorBuilderEnabled),
+        provider: effective.blockrazorBuilderUrl ? wsProviderLabel(effective.blockrazorBuilderUrl) : null,
+        tipTo: effective.blockrazorBuilderTipTo ?? null,
+        authConfigured: Boolean(effective.blockrazorBuilderAuthToken)
+      }
+    ],
+    tipBnb: effective.builderBundleTipBnb ?? null,
+    tipGasPriceGwei: effective.builderBundleTipGasPriceGwei ?? null,
+    maxBlocks: effective.builderBundleMaxBlocks ?? null,
+    maxBlockLookup: Boolean(effective.builderBundleMaxBlockLookup),
+    maxTimestampOffsetSeconds: effective.builderBundleMaxTimestampOffsetSeconds ?? null,
+    timeoutMs: effective.builderBundleTimeoutMs ?? null,
+    configuredTimeoutMs: timing.configuredTimeoutMs ?? null,
+    mode: effective.builderBundleMode ?? "concurrent",
+    timingMode: timing.mode,
+    timingEligible: timing.eligible,
+    timingReason: timing.reason,
+    targetSecond: timing.targetSecond,
+    fallbackOffsetMs: timing.fallbackOffsetMs,
+    earlySubmitOffsetMs: timing.earlySubmitOffsetMs,
+    targetBoundaryLeadMs: timing.targetBoundaryLeadMs ?? null,
+    publicFallbackLeadMs: timing.publicFallbackLeadMs ?? null,
+    fanoutDelayMs: effective.builderBundleFanoutDelayMs ?? null,
+    earlySubmitLeadMs: effective.builderBundleEarlySubmitLeadMs ?? null,
+    minTimestampOffsetMs: effective.builderBundleMinTimestampOffsetMs ?? null,
+    maxTimestampOffsetMs: effective.builderBundleMaxTimestampOffsetMs ?? null,
+    noMerge: Boolean(effective.builderBundleNoMerge),
+    positionFirst: Boolean(effective.builderBundlePositionFirst),
+    timedBuyExecutor: {
+      enabled: Boolean(effective.builderTimedBuyExecutorEnabled),
+      address: effective.builderTimedBuyExecutorAddress ?? null,
+      exactSecond: Boolean(effective.builderTimedBuyExecutorExactSecond),
+      releasePollMs: effective.builderTimedBuyExecutorReleasePollMs ?? null
+    },
+    timestampGuard: {
+      enabled: Boolean(effective.builderTimestampGuardEnabled),
+      address: effective.builderTimestampGuardAddress ?? null,
+      gasLimit: effective.builderTimestampGuardGasLimit ?? null,
+      retryIntervalMs: effective.builderTimestampGuardRetryIntervalMs ?? null,
+      retryUntilLeadMs: effective.builderTimestampGuardRetryUntilLeadMs ?? null,
+      releasePollMs: effective.builderTimestampGuardReleasePollMs ?? null
+    }
+  };
 }
 
 function redactSecretUrls(message) {

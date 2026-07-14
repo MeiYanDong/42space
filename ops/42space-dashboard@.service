@@ -1,0 +1,20 @@
+[Unit]
+Description=42space Bot Dashboard (%i)
+After=network-online.target 42space-event@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+EnvironmentFile=-/etc/42space/shared-builder.env
+EnvironmentFile=/etc/42space/profiles/%i.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/npm run dashboard
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

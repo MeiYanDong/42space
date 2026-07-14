@@ -6,6 +6,7 @@ import { createPublicClient, http } from "viem";
 import { bsc } from "viem/chains";
 
 import { readConfig } from "../src/config.js";
+import { fetchActivity } from "../src/fortytwo.js";
 import {
   appendGasLedgerEntries,
   buildGasLedgerEntry,
@@ -41,16 +42,19 @@ async function main() {
   const actionsFile = path.resolve(rootDir, args.actionsFile ?? process.env.DASHBOARD_ACTIONS_FILE ?? path.join(dataDir, "dashboard-actions.jsonl"));
   const gasLedgerFile = path.resolve(rootDir, args.gasLedgerFile ?? gasLedgerFileForConfig(cfg));
   const outputFile = path.resolve(rootDir, args.output ?? path.join("output", "gas-ledger", `${safeSlug(profile || "profile")}-latest.json`));
+  const activityLimit = positiveInteger(args.activityLimit, 0);
+  const activityUser = args.activityUser ?? args.user ?? process.env.DASHBOARD_WALLET ?? cfg.walletAddress ?? process.env.WALLET_ADDRESS ?? "";
 
   const existing = readGasLedger(gasLedgerFile);
-  const existingTxs = args.rebuild
-    ? new Set()
-    : gasLedgerTxSet(existing.filter((entry) => args.noUsdt || entry.gasFeeUsdt !== null));
+  const existingTxCount = gasLedgerTxSet(existing).size;
   const fills = readJsonl(fillsFile);
   const actions = readJsonl(actionsFile);
-  const candidates = collectTxCandidates({ fills, actions, profile });
+  const activity = activityLimit > 0 && activityUser
+    ? await fetchActivity(cfg, { user: activityUser, limit: activityLimit })
+    : [];
+  const candidates = collectTxCandidates({ fills, actions, activity, profile });
   const pending = [...candidates.values()]
-    .filter((candidate) => !existingTxs.has(candidate.txHash))
+    .filter((candidate) => args.rebuild || !hasCoveredGasLedgerEntry(existing, candidate, { noUsdt: Boolean(args.noUsdt) }))
     .sort(compareCandidates);
   const limit = positiveInteger(args.limit, pending.length);
   const selected = pending.slice(0, limit);
@@ -82,6 +86,11 @@ async function main() {
           source: null,
           error: error?.message ?? String(error)
         }));
+      const extraFeeWei = candidate.extraFeeWei ?? (
+        candidate.action === "builder_tip" && transaction?.value !== undefined && transaction?.value !== null
+          ? transaction.value
+          : null
+      );
       entries.push(buildGasLedgerEntry({
         txHash: candidate.txHash,
         receipt,
@@ -94,9 +103,13 @@ async function main() {
         allocations: candidate.allocations,
         bnbUsdtPrice: priceInfo?.price ?? null,
         bnbUsdtSource: priceInfo?.source ?? "",
+        extraFeeWei,
+        extraFeeBnb: candidate.extraFeeBnb ?? null,
         metadata: {
           firstSeenAt: candidate.firstSeenAt ?? null,
           sources: candidate.sources,
+          buyTxHash: candidate.buyTxHash ?? null,
+          expectedExtraFeeBnb: candidate.extraFeeBnb ?? null,
           priceError: priceInfo?.error ?? null
         }
       }));
@@ -121,14 +134,16 @@ async function main() {
     files: {
       fillsFile,
       actionsFile,
+      activityUser,
       gasLedgerFile,
       outputFile
     },
     counts: {
       fills: fills.length,
       actions: actions.length,
+      activity: activity.length,
       candidates: candidates.size,
-      existingTxs: existingTxs.size,
+      existingTxs: existingTxCount,
       pending: pending.length,
       selected: selected.length,
       entriesBuilt: entries.length,
@@ -155,14 +170,29 @@ async function main() {
   }, null, 2));
 }
 
-function collectTxCandidates({ fills, actions, profile }) {
+function collectTxCandidates({ fills, actions, activity = [], profile }) {
   const candidates = new Map();
   for (const row of fills) collectFillTxCandidates(candidates, row, profile);
   for (const row of actions) collectActionTxCandidates(candidates, row, profile);
+  for (const row of activity) collectActivityTxCandidates(candidates, row, profile);
   return candidates;
 }
 
 function collectFillTxCandidates(candidates, row, profile) {
+  if (row?.level === "builder-bundle-tip-receipt" && row.tipTxHash) {
+    addCandidate(candidates, row.tipTxHash, {
+      profile,
+      action: "builder_tip",
+      source: "fills:builder-bundle-tip-receipt",
+      firstSeenAt: row.at,
+      extraFeeBnb: row.status === "success" ? row.tipBnb : null,
+      buyTxHash: row.buyTxHash ?? null,
+      allocations: allocationsFromReceiptContext(row.context).map((item) => ({
+        ...item,
+        action: "builder_tip"
+      }))
+    });
+  }
   if (row?.plan && row?.result?.txHash) {
     addCandidate(candidates, row.result.txHash, {
       profile,
@@ -265,6 +295,53 @@ function collectActionTxCandidates(candidates, row, profile) {
   });
 }
 
+function collectActivityTxCandidates(candidates, row, profile) {
+  const txHash = row?.transactionHash ?? row?.txHash ?? row?.tx;
+  const action = activityAction(row?.type);
+  addCandidate(candidates, txHash, {
+    profile,
+    action,
+    source: "rest:activity",
+    firstSeenAt: activityTimestampIso(row),
+    wallet: row?.userAddress ?? "",
+    allocations: [{
+      market: row?.marketAddress,
+      question: row?.title,
+      tokenId: row?.tokenId,
+      outcome: row?.outcome ?? row?.outcomeSymbol,
+      action,
+      amountUsdt: positiveFinite(row?.collateral),
+      weight: activityAllocationWeight(row)
+    }]
+  });
+}
+
+function activityAction(type) {
+  const normalized = String(type ?? "").toUpperCase();
+  if (normalized === "MINT" || normalized === "BUY") return "buy";
+  if (normalized === "REDEEM" || normalized === "SELL") return "sell";
+  if (normalized === "FINALISE" || normalized === "FINALIZE") return "settlement";
+  return "activity";
+}
+
+function activityTimestampIso(row) {
+  const timestamp = Number(row?.timestamp);
+  if (Number.isFinite(timestamp) && timestamp > 0) return new Date(timestamp * 1000).toISOString();
+  return row?.at ?? null;
+}
+
+function activityAllocationWeight(row) {
+  return positiveFinite(row?.collateral)
+    ?? positiveFinite(Math.abs(Number(row?.realizedPnlDelta ?? 0)))
+    ?? positiveFinite(row?.size)
+    ?? 1;
+}
+
+function positiveFinite(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
 function collectGenericTxHashes(candidates, value, defaults, seenObjects = new Set()) {
   if (!value || typeof value !== "object" || seenObjects.has(value)) return;
   seenObjects.add(value);
@@ -291,13 +368,19 @@ function addCandidate(candidates, txHash, candidate) {
     sources: [],
     firstSeenAt: candidate.firstSeenAt ?? null,
     wallet: candidate.wallet ?? "",
-    allocations: []
+    allocations: [],
+    extraFeeBnb: candidate.extraFeeBnb ?? null,
+    extraFeeWei: candidate.extraFeeWei ?? null,
+    buyTxHash: candidate.buyTxHash ?? null
   };
   if (existing.action === "unknown" && candidate.action) existing.action = candidate.action;
   if (!existing.source && candidate.source) existing.source = candidate.source;
   if (candidate.source && !existing.sources.includes(candidate.source)) existing.sources.push(candidate.source);
   if (!existing.firstSeenAt && candidate.firstSeenAt) existing.firstSeenAt = candidate.firstSeenAt;
   if (!existing.wallet && candidate.wallet) existing.wallet = candidate.wallet;
+  if (!existing.extraFeeBnb && candidate.extraFeeBnb) existing.extraFeeBnb = candidate.extraFeeBnb;
+  if (!existing.extraFeeWei && candidate.extraFeeWei) existing.extraFeeWei = candidate.extraFeeWei;
+  if (!existing.buyTxHash && candidate.buyTxHash) existing.buyTxHash = candidate.buyTxHash;
   for (const allocation of candidate.allocations ?? []) {
     if (!allocation?.market && !allocation?.question && !allocation?.tokenId && !allocation?.outcome) continue;
     const key = [
@@ -317,18 +400,38 @@ function addCandidate(candidates, txHash, candidate) {
   candidates.set(normalizedTxHash, existing);
 }
 
+function hasCoveredGasLedgerEntry(existingEntries, candidate, { noUsdt = false } = {}) {
+  const rows = existingEntries.filter((entry) => normalizeTxHash(entry?.txHash) === candidate.txHash);
+  if (rows.length === 0) return false;
+  return rows.some((entry) => {
+    if (!noUsdt && entry.gasFeeUsdt === null && entry.totalFeeUsdt === null) return false;
+    if (candidate.action === "builder_tip" || Number(candidate.extraFeeBnb ?? 0) > 0) {
+      const entryExtra = Number(entry.extraFeeBnb ?? 0);
+      const entryTotal = Number(entry.totalFeeBnb ?? 0);
+      const entryGas = Number(entry.gasFeeBnb ?? 0);
+      if (!(entryExtra > 0 || (Number.isFinite(entryTotal) && Number.isFinite(entryGas) && entryTotal > entryGas))) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
 function allocationsFromPlan(plan) {
   const market = plan?.market ?? {};
-  const stake = Number(plan?.stakePerOutcomeUsdt ?? 0);
-  return (plan?.outcomes ?? []).map((outcome) => ({
-    market: market.address,
-    question: market.question,
-    tokenId: outcome.tokenId,
-    outcome: outcome.name,
-    action: "buy",
-    amountUsdt: Number.isFinite(stake) && stake > 0 ? stake : null,
-    weight: Number.isFinite(stake) && stake > 0 ? stake : 1
-  }));
+  const fallbackStake = Number(plan?.stakePerOutcomeUsdt ?? 0);
+  return (plan?.outcomes ?? []).map((outcome) => {
+    const stake = Number(outcome?.stakeUsdt ?? fallbackStake);
+    return {
+      market: market.address,
+      question: market.question,
+      tokenId: outcome.tokenId,
+      outcome: outcome.name,
+      action: "buy",
+      amountUsdt: Number.isFinite(stake) && stake > 0 ? stake : null,
+      weight: Number.isFinite(stake) && stake > 0 ? stake : 1
+    };
+  });
 }
 
 function allocationsFromBundle(bundle) {
@@ -479,7 +582,7 @@ function markdownReport(report) {
     "",
     "| Tx | Action | BNB | U | Status |",
     "| --- | --- | ---: | ---: | --- |",
-    ...report.entries.slice(-30).map((entry) => `| ${entry.txHash} | ${entry.action} | ${entry.gasFeeBnb} | ${entry.gasFeeUsdt ?? ""} | ${entry.status ?? ""} |`)
+    ...report.entries.slice(-30).map((entry) => `| ${entry.txHash} | ${entry.action} | ${entry.totalFeeBnb ?? entry.gasFeeBnb} | ${entry.totalFeeUsdt ?? entry.gasFeeUsdt ?? ""} | ${entry.status ?? ""} |`)
   ];
   if (report.errors.length > 0) {
     lines.push("", "## Errors", "", "| Tx | Action | Message |", "| --- | --- | --- |");
@@ -568,6 +671,8 @@ Options:
   --rpc-url URL            Override RPC URL.
   --fills-file FILE        Override fills.jsonl.
   --actions-file FILE      Override dashboard-actions.jsonl.
+  --activity-limit N       Also read recent 42 REST activity rows for tx hashes.
+  --activity-user ADDRESS  Override the REST activity wallet address.
   --gas-ledger-file FILE   Override output gas-ledger.jsonl.
   --output FILE            Write a JSON and Markdown report.
   --limit N                Backfill at most N missing transactions.

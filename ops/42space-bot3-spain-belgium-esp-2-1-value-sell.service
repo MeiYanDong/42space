@@ -1,0 +1,27 @@
+[Unit]
+Description=42space Bot3 Spain vs Belgium ESP 2-1 value-trigger sell monitor
+After=network-online.target 42space-event@42space-3.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+Environment=POSITION_VALUE_TRIGGER_EXECUTE=1
+Environment=POSITION_VALUE_TRIGGER_MARKET=0x94FA631F5A8d830919db6d5B1571e438f0222Fb0
+Environment=POSITION_VALUE_TRIGGER_TOKEN_ID=2048
+Environment=POSITION_VALUE_TRIGGER_THRESHOLD_USDT=99
+Environment=POSITION_VALUE_TRIGGER_MIN_OUT_USDT=99
+Environment=POSITION_VALUE_TRIGGER_SELL_PERCENT=100
+Environment=POSITION_VALUE_TRIGGER_POLL_MS=5000
+Environment=POSITION_VALUE_TRIGGER_LOG_EVERY_MS=60000
+Environment=POSITION_VALUE_TRIGGER_STATE_FILE=/opt/42space/data/42space-3/position-value-trigger-sell-spain-belgium-esp-2-1-state.json
+Environment=POSITION_VALUE_TRIGGER_LOG_FILE=/opt/42space/data/42space-3/position-value-trigger-sell-spain-belgium-esp-2-1.jsonl
+ExecStart=/usr/bin/node /opt/42space/scripts/position-value-trigger-sell.js --profile-env /etc/42space/profiles/42space-3.env
+Restart=on-failure
+RestartSec=5
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target

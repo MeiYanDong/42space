@@ -6,6 +6,11 @@ import { formatUnits, parseUnits } from "viem";
 
 import { appendJsonl, loadSeen, parseArgs, readConfig, saveSeen } from "./config.js";
 import { buildEventIntelOptions, runEventIntel } from "./event-intel.js";
+import {
+  buildMemeRangeFallback,
+  isPotentialMemeRangeMarket,
+  resolveMemeRangeSelection
+} from "./meme-range-selection.js";
 import { renderPremiumWatchChartFile } from "../scripts/premium-watch-chart.js";
 import {
   buildMarketFromCreationLog,
@@ -34,6 +39,8 @@ async function main() {
     entries: new Map(),
     tasks: new Set(),
     intelTasks: new Set(),
+    memeSelectionTasks: new Set(),
+    memeRangeSelections: loadMemeRangeSelectionLocks(opts.memeRangeSelectionFile),
     intelSeen: loadIntelSeen(opts.intel),
     stopping: false,
     unwatch: null,
@@ -60,6 +67,10 @@ async function main() {
     eventIntelNotifyNonTemplate: opts.intel.notifyNonTemplate,
     eventIntelNotifySeenFile: opts.intel.notifySeenFile,
     eventIntelNotifyWebhookConfigured: Boolean(opts.intel.notifyWebhook || (isBot1ProfileName(cfg.botName) && cfg.feishuWebhook)),
+    memeRangeSelectionEnabled: opts.memeRangeSelectionEnabled,
+    memeRangeSelectionFile: opts.memeRangeSelectionFile,
+    memeRangeSelectionLocks: state.memeRangeSelections.size,
+    pythApiKeyConfigured: Boolean(opts.pythApiKey),
     premiumProbesEnabled: opts.probesEnabled,
     readOnly: true
   }));
@@ -104,7 +115,8 @@ async function main() {
       level: "premium-watch-once-complete",
       scheduled: state.entries.size,
       running: state.tasks.size,
-      intelRunning: state.intelTasks.size
+      intelRunning: state.intelTasks.size,
+      memeSelectionRunning: state.memeSelectionTasks.size
     }));
     return;
   }
@@ -114,7 +126,7 @@ async function main() {
     await sleep(opts.pollMs);
     await scanRest({ cfg, opts, publicClient, state });
   }
-  await Promise.allSettled([...state.tasks, ...state.intelTasks]);
+  await Promise.allSettled([...state.tasks, ...state.intelTasks, ...state.memeSelectionTasks]);
   stopWatch(state);
 }
 
@@ -193,6 +205,19 @@ function buildOptions(cfg, args) {
       process.env.EVENT_DISCOVERY_FEED_FILE ??
       ""
     ),
+    memeRangeSelectionEnabled: args.noMemeRangeSelection
+      ? false
+      : Boolean(cfg.memeRangeSelectionEnabled),
+    memeRangeSelectionFile: String(
+      args.memeRangeSelectionFile ??
+      cfg.memeRangeSelectionFile ??
+      path.join(outputDir, "meme-range-selection-locks.jsonl")
+    ),
+    memeRangeSelectionFetchTimeoutMs: Number(cfg.memeRangeSelectionFetchTimeoutMs ?? 2500),
+    memeRangeSelectionFetchAttempts: Number(cfg.memeRangeSelectionFetchAttempts ?? 2),
+    pythHermesUrl: String(cfg.pythHermesUrl ?? "https://hermes.pyth.network"),
+    pythApiKey: String(cfg.pythApiKey ?? ""),
+    pythMaxAgeSeconds: Number(cfg.pythMaxAgeSeconds ?? 120),
     intel: buildEventIntelOptions(args, { outputDir }),
     stakesUsdt: parseStakes(args.stakes ?? process.env.PREMIUM_WATCH_STAKES, cfg.stakePerOutcomeUsdt),
     noWs: Boolean(args.noWs || envBool("PREMIUM_WATCH_NO_WS", false)),
@@ -281,16 +306,29 @@ function scheduleMarket({ cfg, opts, publicClient, state, market, source }) {
       lastDecisionReason: null,
       notScheduledLogged: false,
       intelStarted: false,
-      intelCompleted: false
+      intelCompleted: false,
+      memeRangeSelectionStarted: false,
+      memeRangeSelectionCompleted: false
     };
     state.entries.set(key, entry);
   }
 
   entry.market = mergeMarket(entry.market, market);
+  const persistedMemeSelection = state.memeRangeSelections.get(key);
+  if (persistedMemeSelection) {
+    entry.market = { ...entry.market, memeRangeSelection: persistedMemeSelection };
+    entry.memeRangeSelectionStarted = true;
+    entry.memeRangeSelectionCompleted = true;
+  }
   entry.sources.add(source);
   entry.lastSeenAt = new Date().toISOString();
   entry.seenCount += 1;
-  appendEventDiscoveryFeed(opts, entry, source, decision);
+  const awaitingMemeSelection = Boolean(
+    opts.memeRangeSelectionEnabled &&
+    isPotentialMemeRangeMarket(entry.market) &&
+    !entry.market.memeRangeSelection
+  );
+  if (!awaitingMemeSelection) appendEventDiscoveryFeed(opts, entry, source, decision);
 
   if (isNew) {
     appendDiscovery(opts, {
@@ -305,6 +343,7 @@ function scheduleMarket({ cfg, opts, publicClient, state, market, source }) {
     });
     startIntelTask({ cfg, opts, state, entry, source, decision });
   }
+  startMemeRangeSelectionTask({ cfg, opts, state, entry, source });
 
   if (!opts.probesEnabled) {
     entry.lastDecisionReason = "premium-probes-disabled";
@@ -478,6 +517,143 @@ async function runIntelTask({ cfg, opts, entry, source, discovery }) {
     jsonFile: report.files.jsonFile,
     at: new Date().toISOString()
   });
+}
+
+function startMemeRangeSelectionTask({ cfg, opts, state, entry, source }) {
+  if (!opts.memeRangeSelectionEnabled) return;
+  if (!isPotentialMemeRangeMarket(entry.market)) return;
+  if (entry.market.memeRangeSelection || entry.memeRangeSelectionStarted) return;
+  entry.memeRangeSelectionStarted = true;
+
+  const task = lockMemeRangeSelection({ cfg, opts, state, entry, source })
+    .catch((error) => {
+      const selection = buildMemeRangeFallback(entry.market, "selection_task_failed", {
+        observedAt: entry.discoveredAt,
+        error
+      });
+      persistMemeRangeSelectionLock(opts, state, entry, selection, source);
+    })
+    .finally(() => {
+      entry.memeRangeSelectionCompleted = true;
+      state.memeSelectionTasks.delete(task);
+    });
+  state.memeSelectionTasks.add(task);
+}
+
+async function lockMemeRangeSelection({ cfg, opts, state, entry, source }) {
+  const hydrated = await hydrateMarketForMemeSelection(cfg, entry.market, opts);
+  entry.market = mergeMarket(entry.market, hydrated);
+  const selection = await resolveMemeRangeSelection(entry.market, {
+    observedAt: entry.discoveredAt,
+    fetchTimeoutMs: opts.memeRangeSelectionFetchTimeoutMs,
+    fetchAttempts: opts.memeRangeSelectionFetchAttempts,
+    pythHermesUrl: opts.pythHermesUrl,
+    pythApiKey: opts.pythApiKey,
+    pythMaxAgeSeconds: opts.pythMaxAgeSeconds
+  });
+  persistMemeRangeSelectionLock(opts, state, entry, selection, source);
+}
+
+async function hydrateMarketForMemeSelection(cfg, market, opts) {
+  if (!market?.address) return market;
+  const attempts = Math.max(1, Number(opts.memeRangeSelectionFetchAttempts ?? 2));
+  const timeoutMs = Math.max(1, Number(opts.memeRangeSelectionFetchTimeoutMs ?? 2500));
+  const url = new URL(`/api/v1/markets/${market.address}`, cfg.restUrl);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        headers: { accept: "application/json", "user-agent": "42-btc-open-sniper/0.1" },
+        signal: controller.signal
+      });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`42 market ${response.status}: ${body.slice(0, 160)}`);
+      const json = JSON.parse(body);
+      return json.data ?? json;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await sleep(150);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  console.log(JSON.stringify({
+    level: "meme-range-selection-hydrate-fallback",
+    market: market.address,
+    attempts,
+    message: errorMessage(lastError)
+  }));
+  return market;
+}
+
+function persistMemeRangeSelectionLock(opts, state, entry, selection, source) {
+  if (entry.market.memeRangeSelection) return;
+  const key = String(entry.market.address ?? "").toLowerCase();
+  entry.market = { ...entry.market, memeRangeSelection: selection };
+  state.memeRangeSelections.set(key, selection);
+  appendJsonl(opts.memeRangeSelectionFile, {
+    level: "meme-range-selection-lock",
+    market: entry.market.address,
+    question: entry.market.question ?? entry.market.title ?? null,
+    selection,
+    source,
+    at: selection.lockedAt ?? new Date().toISOString()
+  });
+  appendEventDiscoveryFeed(
+    opts,
+    entry,
+    "meme-range-selection",
+    getProbeCandidateDecision(entry.market, opts, Date.now())
+  );
+  appendDiscovery(opts, {
+    level: "meme-range-selection-lock",
+    market: entry.market.address,
+    question: entry.market.question ?? entry.market.title ?? null,
+    mode: selection.mode,
+    metric: selection.metric,
+    matchedOutcome: selection.matchedOutcomeName,
+    selectedOutcomes: selection.selectedOutcomeNames,
+    reason: selection.reason,
+    error: selection.error,
+    observedAt: selection.observedAt,
+    lockedAt: selection.lockedAt,
+    at: new Date().toISOString()
+  });
+  console.log(JSON.stringify({
+    level: "meme-range-selection-lock",
+    market: entry.market.address,
+    question: entry.market.question ?? entry.market.title ?? null,
+    mode: selection.mode,
+    metric: selection.metric,
+    matchedOutcome: selection.matchedOutcomeName,
+    selectedOutcomes: selection.selectedOutcomeNames,
+    reason: selection.reason,
+    at: selection.lockedAt
+  }));
+}
+
+function loadMemeRangeSelectionLocks(file) {
+  const locks = new Map();
+  if (!file || !fs.existsSync(file)) return locks;
+  try {
+    for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/u)) {
+      if (!line.trim()) continue;
+      const row = JSON.parse(line);
+      const selection = row?.selection ?? row;
+      const market = String(selection?.market ?? row?.market ?? "").toLowerCase();
+      if (!market || !selection?.locked || !Array.isArray(selection.selectedOutcomeNames)) continue;
+      locks.set(market, selection);
+    }
+  } catch (error) {
+    console.log(JSON.stringify({
+      level: "meme-range-selection-lock-load-error",
+      file,
+      message: errorMessage(error)
+    }));
+  }
+  return locks;
 }
 
 async function hydrateMarketForIntel(cfg, market) {
@@ -1170,7 +1346,7 @@ function renderMarkdown({ header, analysis, files }) {
 async function waitForOnce(state, opts) {
   const until = Date.now() + opts.maxWaitMs;
   while (true) {
-    const running = state.tasks.size > 0 || state.intelTasks.size > 0;
+    const running = state.tasks.size > 0 || state.intelTasks.size > 0 || state.memeSelectionTasks.size > 0;
     const dueEntries = [...state.entries.values()].filter((entry) =>
       !entry.completed && Number.isFinite(entry.startMs) && entry.startMs <= until
     );
@@ -1203,7 +1379,7 @@ function installSignalHandlers(state) {
       console.log(JSON.stringify({ level: "premium-watch-stopping", signal }));
       stopWatch(state);
       const deadline = setTimeout(() => process.exit(0), 25_000);
-      Promise.allSettled([...state.tasks, ...state.intelTasks]).then(() => {
+      Promise.allSettled([...state.tasks, ...state.intelTasks, ...state.memeSelectionTasks]).then(() => {
         clearTimeout(deadline);
         process.exit(0);
       });
@@ -1294,6 +1470,7 @@ function compactMarketForDiscoveryFeed(market = {}) {
     blockNumber: stringOrNull(market.blockNumber),
     transactionIndex: stringOrNull(market.transactionIndex),
     logIndex: stringOrNull(market.logIndex),
+    memeRangeSelection: market.memeRangeSelection ?? null,
     outcomes: Array.isArray(market.outcomes)
       ? market.outcomes.map(compactOutcomeForDiscoveryFeed).filter((outcome) => outcome.tokenId || outcome.name)
       : []

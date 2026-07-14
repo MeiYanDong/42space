@@ -5,16 +5,40 @@ import { spawnSync } from "node:child_process";
 
 const DEFAULT_OPEN_BROADCAST_DELAY_MS = 19900;
 const DEFAULT_OPEN_WINDOW_SECONDS = 35;
+const DEFAULT_TIMED_BUY_EXECUTOR_ADDRESS = "0xC2B2F78C620228Ea8d1B2E155664ceBbc7212148";
 const TARGETS = [
   {
     id: "openrouter-python",
     questionPattern: "highest Python usage on OpenRouter",
     sampleQuestion: "Which AI model will have the highest Python usage on OpenRouter on June 27th?",
     titleRe: /highest\s+Python\s+usage\s+on\s+OpenRouter|AI\s*模型.*OpenRouter.*Python.*使用量.*最高/iu,
-    outcomes: ["DeepSeek V4 Flash", "Owl Alpha", "Hy3 preview"],
+    outcomes: ["Hy3 (free)", "MiMo - V2.5"],
     expectedBroadcastDelayMs: 19900,
     latestAllowedBroadcastStartDelayMs: 20000,
-    gasPriceGwei: "0.5"
+    gasPriceGwei: "0.5",
+    builderBundle: {
+      enabled: true,
+      mode: "builder_only",
+      tipBnb: "0.001",
+      timeoutMs: 700,
+      timingMode: "first_20s_block",
+      targetSecond: 20,
+      prepositionLeadMs: 700,
+      exactSecond: true,
+      noMerge: true,
+      timedBuyExecutorAddress: DEFAULT_TIMED_BUY_EXECUTOR_ADDRESS,
+      positionFirst: true
+    },
+    autoSell: {
+      priceTargets: [
+        { outcome: "Hy3 (free)", price: 0.002 },
+        { outcome: "MiMo - V2.5", price: 0.0017 }
+      ],
+      priceHotPollMs: 1000,
+      priceHotWindowSeconds: 600,
+      priceSellPercent: 100,
+      stopLossEnabled: false
+    }
   },
   {
     id: "bnbusdt-daily-volume",
@@ -133,6 +157,8 @@ function collectAndWriteEvidence(args) {
     broadcastStartedWithinTargetWindow: TARGETS.every((target) => targetChecks[target.id]?.broadcastStartedWithinTargetWindow),
     firstAcceptedRpc: TARGETS.every((target) => targetChecks[target.id]?.firstAcceptedRpc),
     outcomeOk,
+    builderSubmitted: TARGETS.every((target) => targetChecks[target.id]?.builderSubmitted),
+    builderPrepositioned: TARGETS.every((target) => targetChecks[target.id]?.builderPrepositioned),
     receiptSuccess: TARGETS.every((target) => targetChecks[target.id]?.receiptSuccess),
     autoSellMonitorStarted: autoSellStartEvents.length > 0,
     stopLossDisabled,
@@ -144,6 +170,8 @@ function collectAndWriteEvidence(args) {
     checks.broadcastStartedWithinTargetWindow &&
     checks.firstAcceptedRpc &&
     checks.outcomeOk &&
+    checks.builderSubmitted &&
+    checks.builderPrepositioned &&
     checks.receiptSuccess &&
     checks.autoSellMonitorStarted &&
     checks.stopLossDisabled &&
@@ -171,9 +199,13 @@ function collectAndWriteEvidence(args) {
         outcomes: target.outcomes,
         expectedBroadcastDelayMs: target.expectedBroadcastDelayMs,
         expectedBroadcastIso: target.expectedBroadcastIso,
+        expectedPrivateSubmitDelayMs: target.expectedPrivateSubmitDelayMs,
+        expectedPrivateSubmitIso: target.expectedPrivateSubmitIso,
         latestAllowedBroadcastStartDelayMs: target.latestAllowedBroadcastStartDelayMs,
         latestAllowedBroadcastStartIso: target.latestAllowedBroadcastStartIso,
-        gasPriceGwei: target.gasPriceGwei
+        gasPriceGwei: target.gasPriceGwei,
+        builderBundle: target.builderBundle ?? null,
+        autoSell: target.autoSell ?? null
       }))
     },
     profile: {
@@ -186,7 +218,9 @@ function collectAndWriteEvidence(args) {
       eventOpenWindowSeconds: profileEnv.EVENT_OPEN_WINDOW_SECONDS ?? null,
       gasPriceGwei: profileEnv.GAS_PRICE_GWEI ?? null,
       autoSellGasPriceGwei: profileEnv.AUTO_SELL_GAS_PRICE_GWEI ?? null,
-      bundleDueMarkets: profileEnv.BUNDLE_DUE_MARKETS ?? null
+      bundleDueMarkets: profileEnv.BUNDLE_DUE_MARKETS ?? null,
+      builderTimedBuyExecutorEnabled: profileEnv.BUILDER_TIMED_BUY_EXECUTOR_ENABLED ?? null,
+      builderTimedBuyExecutorAddress: profileEnv.BUILDER_TIMED_BUY_EXECUTOR_ADDRESS ?? null
     },
     checks,
     targetChecks,
@@ -287,13 +321,20 @@ function resolveTargetConfigs(profileEnv, openingMs) {
       ? target.latestAllowedBroadcastStartDelayMs
       : Math.max(expectedBroadcastDelayMs, profileWindowMs);
     const gasPriceGwei = row?.gasPriceGwei ?? row?.buyGasPriceGwei ?? row?.gasGwei ?? row?.buyGasGwei ?? target.gasPriceGwei ?? profileEnv.GAS_PRICE_GWEI ?? null;
+    const expectedPrivateSubmitDelayMs = target.builderBundle
+      ? Number(target.builderBundle.targetSecond) * 1000 - Number(target.builderBundle.prepositionLeadMs)
+      : expectedBroadcastDelayMs;
     return {
       ...target,
       expectedBroadcastDelayMs,
       expectedBroadcastIso: new Date(openingMs + expectedBroadcastDelayMs).toISOString(),
+      expectedPrivateSubmitDelayMs,
+      expectedPrivateSubmitIso: new Date(openingMs + expectedPrivateSubmitDelayMs).toISOString(),
       latestAllowedBroadcastStartDelayMs,
       latestAllowedBroadcastStartIso: new Date(openingMs + latestAllowedBroadcastStartDelayMs).toISOString(),
-      gasPriceGwei: gasPriceGwei === null ? null : String(gasPriceGwei)
+      gasPriceGwei: gasPriceGwei === null ? null : String(gasPriceGwei),
+      builderBundle: target.builderBundle ?? null,
+      autoSell: target.autoSell ?? null
     };
   });
 }
@@ -407,24 +448,27 @@ function broadcastTiming(row, openingMs, target) {
   if (!result?.txHash) return null;
   const broadcastStartedMs = Date.parse(result.broadcastStartedAt ?? "");
   const firstAcceptedMs = Date.parse(result.firstAcceptedAt ?? "");
-  const expectedBroadcastMs = Date.parse(target.expectedBroadcastIso);
+  const expectedPrivateSubmitMs = Date.parse(target.expectedPrivateSubmitIso ?? target.expectedBroadcastIso);
   const latestAllowedBroadcastStartMs = Date.parse(target.latestAllowedBroadcastStartIso);
+  const expectedBuilderTargetTimestamp = expectedBuilderTimestamp(openingMs, target);
   return {
     targetId: target.id,
     txHash: result.txHash,
     status: result.status ?? null,
     broadcastMode: result.broadcastMode ?? null,
     expectedBroadcastAt: target.expectedBroadcastIso,
+    expectedPrivateSubmitAt: target.expectedPrivateSubmitIso ?? target.expectedBroadcastIso,
+    expectedBuilderTargetTimestamp,
     latestAllowedBroadcastStartAt: target.latestAllowedBroadcastStartIso,
     broadcastStartedAt: result.broadcastStartedAt ?? null,
     firstAcceptedAt: result.firstAcceptedAt ?? null,
     broadcastStartDelayMs: Number.isFinite(broadcastStartedMs) ? broadcastStartedMs - openingMs : null,
-    broadcastStartAfterExpectedMs: Number.isFinite(broadcastStartedMs) ? broadcastStartedMs - expectedBroadcastMs : null,
+    broadcastStartAfterExpectedMs: Number.isFinite(broadcastStartedMs) ? broadcastStartedMs - expectedPrivateSubmitMs : null,
     firstAcceptedDelayMs: Number.isFinite(firstAcceptedMs) ? firstAcceptedMs - openingMs : null,
-    firstAcceptedAfterExpectedMs: Number.isFinite(firstAcceptedMs) ? firstAcceptedMs - expectedBroadcastMs : null,
+    firstAcceptedAfterExpectedMs: Number.isFinite(firstAcceptedMs) ? firstAcceptedMs - expectedPrivateSubmitMs : null,
     firstAcceptedLatencyMs: result.firstAcceptedLatencyMs ?? null,
     broadcastStartedWithinTargetWindow: Number.isFinite(broadcastStartedMs) &&
-      broadcastStartedMs >= expectedBroadcastMs - 5 &&
+      broadcastStartedMs >= expectedPrivateSubmitMs - 5 &&
       broadcastStartedMs <= latestAllowedBroadcastStartMs
   };
 }
@@ -556,7 +600,8 @@ function targetEvidenceChecks({ target, openingIso, decisions, fills, journalRow
     ...decisions.filter((row) => txHashes.includes(row.txHash) && String(row.action ?? "").startsWith("receipt-"))
   ];
   const scheduledOnTime = targetJournalRows.some((row) => scheduledRowOnTime(row, target));
-  const expectedBroadcastMs = Date.parse(target.expectedBroadcastIso);
+  const openingMs = Date.parse(openingIso);
+  const expectedPrivateSubmitMs = Date.parse(target.expectedPrivateSubmitIso ?? target.expectedBroadcastIso);
   const latestAllowedBroadcastStartMs = Date.parse(target.latestAllowedBroadcastStartIso);
   return {
     scheduled: targetJournalRows.some((row) => row.level === "open-broadcast-scheduled"),
@@ -566,17 +611,70 @@ function targetEvidenceChecks({ target, openingIso, decisions, fills, journalRow
     broadcastStartedWithinTargetWindow: targetBuyFills.some((row) => {
       const startedAt = Date.parse(row?.result?.broadcastStartedAt ?? "");
       return Number.isFinite(startedAt) &&
-        startedAt >= expectedBroadcastMs - 5 &&
+        startedAt >= expectedPrivateSubmitMs - 5 &&
         startedAt <= latestAllowedBroadcastStartMs;
     }),
     firstAcceptedRpc: targetBuyFills.some((row) => Number.isFinite(Date.parse(row?.result?.firstAcceptedAt ?? ""))),
     outcomeOk: targetBuyFills.some((row) => targetOutcomesPresent(JSON.stringify(row?.plan?.outcomes ?? row?.plan ?? row), target)),
+    builderSubmitted: !target.builderBundle || targetBuyFills.some((row) => row?.result?.builderBundleSubmitted === true),
+    builderPrepositioned: !target.builderBundle || targetBuyFills.some((row) =>
+      strictAtomicBuilderResultMatches(row?.result, target, openingMs)
+    ),
     receiptSuccess: targetReceiptRows.some((row) => row.status === "success" || row.action === "receipt-success"),
     txHashes,
     expectedBroadcastDelayMs: target.expectedBroadcastDelayMs,
+    expectedPrivateSubmitDelayMs: target.expectedPrivateSubmitDelayMs,
     latestAllowedBroadcastStartDelayMs: target.latestAllowedBroadcastStartDelayMs,
-    gasPriceGwei: target.gasPriceGwei ?? null
+    gasPriceGwei: target.gasPriceGwei ?? null,
+    builderBundle: target.builderBundle ?? null,
+    autoSell: target.autoSell ?? null
   };
+}
+
+function strictAtomicBuilderResultMatches(result, target, openingMs) {
+  if (!result || !target?.builderBundle) return false;
+  const expectedTimestamp = expectedBuilderTimestamp(openingMs, target);
+  const expectedAddress = target.builderBundle.timedBuyExecutorAddress;
+  const targetResults = Array.isArray(result.builderBundleTargetResults)
+    ? result.builderBundleTargetResults
+    : [];
+  const targetIds = new Set(targetResults.map((row) => String(row?.targetId ?? "").toLowerCase()));
+  const bothBuildersAttempted = targetIds.has("48club") && targetIds.has("blockrazor");
+  const targetConfigMatches = targetResults.every((row) =>
+    row?.timedBuyExecutorEnabled === true &&
+    row?.timedBuyExecutorExactSecond === true &&
+    sameAddress(row?.timedBuyExecutorAddress, expectedAddress) &&
+    Number(row?.timedBuyExecutorTargetTimestamp) === expectedTimestamp &&
+    Number(row?.minTimestamp) === expectedTimestamp &&
+    Number(row?.maxTimestamp) === expectedTimestamp + 1 &&
+    String(row?.timingMode ?? "") === target.builderBundle.timingMode &&
+    Number(row?.targetSecond) === Number(target.builderBundle.targetSecond) &&
+    (row?.submitted !== true || (row?.noMerge === true && row?.positionFirst === true))
+  );
+  return result.broadcastMode === "presigned_builder_bundle_only" &&
+    result.publicBroadcastSkipped === true &&
+    result.builderTimedBuyExecutorEnabled === true &&
+    result.builderTimedBuyExecutorExactSecond === true &&
+    sameAddress(result.builderTimedBuyExecutorAddress, expectedAddress) &&
+    Number(result.builderTimedBuyExecutorTargetTimestamp) === expectedTimestamp &&
+    Number(result.builderBundleMinTimestamp) === expectedTimestamp &&
+    Number(result.builderBundleMaxTimestamp) === expectedTimestamp + 1 &&
+    String(result.builderBundleTimingMode ?? "") === target.builderBundle.timingMode &&
+    Number(result.builderBundleTargetSecond) === Number(target.builderBundle.targetSecond) &&
+    result.builderBundleNoMerge === true &&
+    result.builderBundlePositionFirst === true &&
+    bothBuildersAttempted &&
+    targetConfigMatches;
+}
+
+function expectedBuilderTimestamp(openingMs, target) {
+  if (!target?.builderBundle) return null;
+  return Math.ceil((openingMs + Number(target.builderBundle.targetSecond) * 1000) / 1000);
+}
+
+function sameAddress(actual, expected) {
+  return /^0x[a-fA-F0-9]{40}$/u.test(String(actual ?? "")) &&
+    String(actual).toLowerCase() === String(expected).toLowerCase();
 }
 
 function scheduledRowOnTime(row, target) {

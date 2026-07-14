@@ -437,7 +437,673 @@ span[data-icon] {
 }
 
 .strategyGrid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.strategyProfilePanel {
+  overflow: hidden;
+  border-top: 2px solid #68c6d6;
+}
+
+.strategyProfileHead {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.strategyProfileIdentity {
+  min-width: 0;
+}
+
+.strategyProfileIdentity h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  font-size: 20px;
+}
+
+.strategyProfileIdentity h3 svg {
+  width: 18px;
+  height: 18px;
+  color: #68c6d6;
+}
+
+.strategyProfileIdentity p {
+  max-width: 780px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.strategyProfileEyebrow {
+  color: #8ed9e4;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.strategyProfileBadges {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.automationRuntime {
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(9, 17, 22, 0.42);
+}
+
+.automationRuntimeHead {
+  min-width: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 18px 10px;
+}
+
+.automationRuntimeHead > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.automationRuntimeHead > div > span {
+  color: #8ed9e4;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.automationRuntimeHead strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.automationRuntimeHead > span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.automationRuntimeGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.automationLane {
+  min-width: 0;
+  min-height: 126px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 14px 18px 15px;
+  border-top: 1px solid var(--line-soft);
+  border-right: 1px solid var(--line-soft);
+  box-shadow: inset 0 2px 0 rgba(161, 161, 170, 0.24);
+}
+
+.automationLane:last-child {
+  border-right: 0;
+}
+
+.automationLane.good {
+  box-shadow: inset 0 2px 0 rgba(75, 208, 118, 0.78);
+}
+
+.automationLane.warn {
+  box-shadow: inset 0 2px 0 rgba(255, 185, 72, 0.82);
+}
+
+.automationLane.bad {
+  box-shadow: inset 0 2px 0 rgba(252, 10, 82, 0.78);
+}
+
+.automationLaneTop {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.automationLaneTop > span {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.automationLaneTop svg {
+  width: 15px;
+  height: 15px;
+}
+
+.automationLaneTop strong {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.automationLane.good .automationLaneTop strong {
+  color: var(--success);
+}
+
+.automationLane.warn .automationLaneTop strong {
+  color: var(--warning);
+}
+
+.automationLane.bad .automationLaneTop strong {
+  color: var(--destructive);
+}
+
+.automationLane > p {
+  min-width: 0;
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.automationLaneMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  margin-top: auto;
+}
+
+.automationLaneMeta span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.strategyBadge,
+.strategyStageMeta span {
+  min-height: 25px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 0 8px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.strategyBadge.live {
+  border-color: rgba(75, 208, 118, 0.38);
+  background: rgba(75, 208, 118, 0.1);
+  color: #8ce7aa;
+}
+
+.strategyBadge.focus {
+  border-color: rgba(104, 198, 214, 0.4);
+  background: rgba(104, 198, 214, 0.1);
+  color: #9fe0e9;
+}
+
+.strategyBadge.builder {
+  border-color: rgba(255, 185, 72, 0.42);
+  background: rgba(255, 185, 72, 0.1);
+  color: #ffd084;
+}
+
+.strategyBadge.rpc {
+  border-color: rgba(150, 169, 247, 0.42);
+  background: rgba(150, 169, 247, 0.1);
+  color: #c5ceff;
+}
+
+.strategyBadge.risk {
+  border-color: rgba(252, 10, 82, 0.4);
+  background: rgba(252, 10, 82, 0.1);
+  color: #ff91b1;
+}
+
+.strategyFlow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.strategyStage {
+  min-width: 0;
+  min-height: 228px;
+  display: flex;
+  flex-direction: column;
+  padding: 17px;
+  border-right: 1px solid var(--line-soft);
+  background: rgba(18, 9, 23, 0.3);
+}
+
+.strategyStage:last-child {
+  border-right: 0;
+}
+
+.strategyStage:nth-child(1) {
+  box-shadow: inset 0 2px 0 rgba(104, 198, 214, 0.72);
+}
+
+.strategyStage:nth-child(2) {
+  box-shadow: inset 0 2px 0 rgba(75, 208, 118, 0.68);
+}
+
+.strategyStage:nth-child(3) {
+  box-shadow: inset 0 2px 0 rgba(255, 185, 72, 0.72);
+}
+
+.strategyStage:nth-child(4) {
+  box-shadow: inset 0 2px 0 rgba(222, 139, 243, 0.7);
+}
+
+.strategyStageTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.strategyStep {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.strategyStageIcon {
+  width: 18px;
+  height: 18px;
+  color: #d7d7dc;
+}
+
+.strategyStageLabel {
+  margin-top: 17px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.strategyStage > strong {
+  min-width: 0;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: 16px;
+  line-height: 1.35;
+}
+
+.strategyStage > p {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.strategyStageMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 14px;
+}
+
+.strategyOverride {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 10px;
+  padding: 13px 18px;
+  border-top: 1px solid var(--line-soft);
+  background: rgba(150, 169, 247, 0.055);
+}
+
+.strategyOverride > svg {
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  color: var(--info);
+}
+
+.strategyOverride strong {
+  display: block;
+  font-size: 12px;
+}
+
+.strategyOverride p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.strategySecondaryGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+  gap: 14px;
+}
+
+.strategyFacts {
+  display: grid;
+  padding: 4px 14px 12px;
+}
+
+.strategyFactRow {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 108px minmax(0, 1fr);
+  gap: 14px;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.strategyFactRow:last-child {
+  border-bottom: 0;
+}
+
+.strategyFactRow > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.strategyFactRow strong,
+.strategyFactRow p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.strategyFactRow strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.strategyFactRow p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.strategyFactRow.focus > span {
+  color: #8ed9e4;
+}
+
+.strategyFactRow.builder > span,
+.strategyFactRow.exit > span {
+  color: #ffd084;
+}
+
+.strategyFactRow.risk > span {
+  color: #ff91b1;
+}
+
+.strategyRuleList {
+  display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 4px 14px 12px;
+}
+
+.strategyRuleRow {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.strategyRuleRow:nth-child(odd) {
+  padding-right: 18px;
+  border-right: 1px solid var(--line-soft);
+}
+
+.strategyRuleRow:nth-child(even) {
+  padding-left: 18px;
+}
+
+.strategyRuleRow > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.strategyRuleRow strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.advancedConfigPanel {
+  overflow: hidden;
+}
+
+.advancedConfigSummary {
+  min-height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.advancedConfigSummary::-webkit-details-marker {
+  display: none;
+}
+
+.advancedConfigSummary h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.advancedConfigSummary p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.advancedConfigChevron {
+  width: 18px;
+  height: 18px;
+  color: var(--muted);
+  transition: transform 160ms ease;
+}
+
+.advancedConfigPanel[open] .advancedConfigChevron {
+  transform: rotate(180deg);
+}
+
+.advancedConfigPanel[open] .advancedConfigSummary {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.strategyConfigForm {
+  padding-top: 12px;
+}
+
+.configActiveSellMode {
+  display: grid;
+  grid-template-columns: auto auto minmax(180px, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  margin: 0 10px 10px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--primary);
+  background: rgba(222, 139, 243, 0.055);
+}
+
+.configActiveSellMode span,
+.configActiveSellMode p {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.configActiveSellMode strong {
+  font-size: 12px;
+}
+
+.configActiveSellMode p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sellModeField[hidden] {
+  display: none !important;
+}
+
+.orderflowPanel {
+  grid-column: 1 / -1;
+}
+
+.priceExitPanel {
+  grid-column: 1 / -1;
+}
+
+.priceExitCadence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 14px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.priceExitCadence span {
+  padding-right: 10px;
+  border-right: 1px solid var(--line-soft);
+}
+
+.priceExitCadence span:last-child {
+  padding-right: 0;
+  border-right: 0;
+}
+
+.priceExitColumnHead,
+.priceExitRow {
+  display: grid;
+  grid-template-columns: 54px minmax(180px, 1fr) minmax(112px, 0.45fr) minmax(130px, 0.5fr) 40px;
+  gap: 10px;
+  align-items: center;
+}
+
+.priceExitColumnHead {
+  padding: 8px 14px;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.priceExitRows {
+  display: grid;
+}
+
+.priceExitRow {
+  min-width: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.priceExitRow select,
+.priceExitRow input[type="number"],
+.priceExitAdminField input {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  background: rgba(18, 9, 23, 0.72);
+  color: var(--foreground);
+}
+
+.priceExitRow input[type="checkbox"],
+.toggleField input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
+.priceExitCurrent {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.priceExitCurrent strong {
+  font-size: 13px;
+}
+
+.priceExitCurrent small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.priceExitCurrent.reached strong {
+  color: var(--warning);
+}
+
+.priceExitRemove {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0;
+  justify-content: center;
+}
+
+.priceExitControls {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 0.7fr) minmax(220px, 1fr);
+  gap: 12px;
+  align-items: end;
+  padding: 12px 14px 0;
+}
+
+.toggleField {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.compactField {
+  margin: 0;
+}
+
+.priceExitActions {
+  display: grid;
+  grid-template-columns: auto minmax(140px, 1fr);
+  gap: 8px;
+}
+
+.priceExitPanel .configStatus {
+  padding: 0 14px 12px;
+}
+
+.watchAddressPanel,
+.watchActivityPanel {
+  margin-bottom: 14px;
 }
 
 .decisionPanel {
@@ -498,6 +1164,10 @@ span[data-icon] {
   margin-bottom: 14px;
 }
 
+.isHidden {
+  display: none !important;
+}
+
 .summaryCard {
   display: grid;
   gap: 6px;
@@ -513,6 +1183,189 @@ span[data-icon] {
 
 .summaryCard small {
   font-size: 12px;
+}
+
+.aggregatePanel {
+  margin-bottom: 14px;
+}
+
+.aggregatePnlBody {
+  display: grid;
+  gap: 12px;
+  padding: 10px;
+}
+
+.aggregateSummary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.aggregateChartWrap {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: rgba(18, 9, 23, 0.56);
+  overflow-x: auto;
+}
+
+.aggregateChart {
+  width: 100%;
+  min-width: 560px;
+  height: auto;
+  display: block;
+}
+
+.axisLine {
+  stroke: rgba(255, 255, 255, 0.24);
+  stroke-width: 1;
+}
+
+.gridLine {
+  stroke: rgba(255, 255, 255, 0.07);
+  stroke-width: 1;
+}
+
+.pnlLine {
+  fill: none;
+  stroke: var(--info);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pnlPoint {
+  fill: var(--info);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.pnlBar {
+  rx: 3px;
+}
+
+.pnlBar.positive {
+  fill: rgba(46, 159, 74, 0.72);
+}
+
+.pnlBar.negative {
+  fill: rgba(252, 10, 82, 0.72);
+}
+
+.axisLabel {
+  fill: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.axisLabel.end {
+  text-anchor: end;
+}
+
+.barValueLabel {
+  fill: var(--foreground);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  paint-order: stroke;
+  stroke: rgba(18, 9, 23, 0.9);
+  stroke-linejoin: round;
+  stroke-width: 3px;
+  text-anchor: middle;
+}
+
+.barValueLabel.positive {
+  fill: #9fe2ad;
+}
+
+.barValueLabel.negative {
+  fill: #ff8aa9;
+}
+
+.aggregateLegend,
+.aggregateProfiles,
+.aggregateProfile,
+.aggregateWarnings {
+  display: flex;
+}
+
+.aggregateLegend {
+  justify-content: flex-end;
+  gap: 16px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.aggregateLegend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.legendLine,
+.legendBar {
+  width: 18px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--info);
+}
+
+.legendBar {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+}
+
+.aggregateProfiles {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.aggregateProfile {
+  min-width: min(250px, 100%);
+  flex: 1 1 240px;
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 11px;
+  background: rgba(18, 9, 23, 0.48);
+}
+
+.aggregateProfile.hasWarning {
+  border-color: rgba(255, 185, 72, 0.38);
+}
+
+.aggregateProfile span,
+.aggregateProfile small,
+.aggregateProfile em,
+.aggregateWarnings {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.aggregateProfile strong {
+  font-size: 22px;
+  line-height: 1.1;
+}
+
+.aggregateProfile em {
+  font-style: normal;
+  color: var(--warning);
+}
+
+.aggregateWarnings {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.aggregateWarnings span {
+  border: 1px solid rgba(255, 185, 72, 0.28);
+  border-radius: 999px;
+  padding: 5px 8px;
+  background: rgba(255, 185, 72, 0.08);
+  color: var(--warning);
 }
 
 .good,
@@ -1102,9 +1955,229 @@ span[data-icon] {
 }
 
 .settingsGrid,
-.preflightList {
+.preflightList,
+.orderflowList {
   display: grid;
   gap: 8px;
+}
+
+.orderflowList,
+.watchAddressGrid,
+.watchActivityList {
+  padding: 10px;
+}
+
+.watchAddressGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.watchActivityList {
+  display: grid;
+}
+
+.orderflowCard,
+.watchAddressCard {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: rgba(18, 9, 23, 0.62);
+}
+
+.orderflowCardHead,
+.orderflowActions,
+.orderflowMeta,
+.watchAddressCardHead,
+.watchAddressMeta,
+.watchAddressFoot,
+.watchActivityTop {
+  display: flex;
+}
+
+.orderflowCardHead,
+.watchAddressCardHead {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.orderflowCardHead div,
+.watchAddressCardHead div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.orderflowCardHead strong,
+.watchAddressCardHead strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 15px;
+}
+
+.orderflowCardHead span,
+.orderflowMeta,
+.orderflowActions small,
+.watchAddressCardHead span,
+.watchAddressMeta,
+.watchAddressFoot,
+.watchAddressFoot small,
+.watchAddressError,
+.watchWarning {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.orderflowState {
+  min-width: 70px;
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.orderflowFields {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(160px, 0.5fr);
+  gap: 10px;
+}
+
+.orderflowMarketField {
+  min-width: 0;
+}
+
+.orderflowCheckbox {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 10px;
+  color: var(--muted);
+  background: rgba(18, 9, 23, 0.5);
+  font-size: 12px;
+}
+
+.orderflowCheckbox input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.orderflowCheckbox span {
+  min-width: 0;
+}
+
+.orderflowMeta {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.orderflowMeta span,
+.watchAddressMeta span {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 0 8px;
+  background: rgba(31, 27, 41, 0.8);
+  white-space: nowrap;
+}
+
+.watchAddressMeta {
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.watchAddressFoot {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.watchAddressFoot small,
+.watchAddressCardHead span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.watchAddressError,
+.watchWarning {
+  border: 1px solid rgba(252, 10, 82, 0.28);
+  border-radius: var(--radius);
+  padding: 8px;
+  background: rgba(252, 10, 82, 0.08);
+  color: #ff9bb5;
+}
+
+.watchWarning {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.watchActivityRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+  gap: 12px;
+  align-items: start;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 12px 4px;
+}
+
+.watchActivityMain {
+  min-width: 0;
+}
+
+.watchActivityTop {
+  align-items: center;
+  gap: 8px;
+}
+
+.watchActivityTop strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.watchActivityTx {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.watchActivityTx a {
+  color: #c5ccff;
+  text-decoration: none;
+  font-weight: 800;
+}
+
+.watchActivityTx a:hover {
+  color: #e5e9ff;
+}
+
+.orderflowActions {
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.orderflowActions small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .configForm {
@@ -1426,12 +2499,35 @@ span[data-icon] {
 
   .overviewGrid,
   .marketsLayout,
-  .strategyGrid {
+  .orderflowFields,
+  .watchAddressGrid {
     grid-template-columns: 1fr;
   }
 
+  .strategyFlow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .automationRuntimeGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .automationLane {
+    min-height: 0;
+    border-right: 0;
+  }
+
+  .strategyStage:nth-child(2) {
+    border-right: 0;
+  }
+
+  .strategyStage:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--line-soft);
+  }
+
   .summaryStrip,
-  .snapshotGrid {
+  .snapshotGrid,
+  .aggregateSummary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1455,9 +2551,27 @@ span[data-icon] {
     justify-content: space-between;
   }
 
+  .orderflowActions {
+    display: grid;
+    justify-content: stretch;
+  }
+
+  .watchActivityRow {
+    grid-template-columns: 1fr;
+  }
+
+  .watchActivityTx {
+    justify-items: start;
+    text-align: left;
+  }
+
   .topStatus {
     overflow-x: auto;
     justify-content: flex-start;
+  }
+
+  .strategySecondaryGrid {
+    grid-template-columns: 1fr;
   }
 
   .appFrame {
@@ -1577,6 +2691,83 @@ span[data-icon] {
     width: 100%;
   }
 
+  .strategyProfileHead {
+    display: grid;
+    gap: 14px;
+    padding: 15px;
+  }
+
+  .strategyProfileBadges {
+    justify-content: flex-start;
+  }
+
+  .automationRuntimeHead {
+    align-items: flex-start;
+    padding: 12px 15px 9px;
+  }
+
+  .automationLane {
+    padding: 13px 15px;
+  }
+
+  .strategyFlow {
+    grid-template-columns: 1fr;
+  }
+
+  .strategyStage,
+  .strategyStage:nth-child(2) {
+    min-height: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .strategyStage:last-child {
+    border-bottom: 0;
+  }
+
+  .strategyFactRow,
+  .strategyRuleRow {
+    grid-template-columns: 1fr;
+    gap: 5px;
+  }
+
+  .strategyRuleList {
+    grid-template-columns: 1fr;
+  }
+
+  .strategyRuleRow:nth-child(odd),
+  .strategyRuleRow:nth-child(even) {
+    padding-right: 2px;
+    padding-left: 2px;
+    border-right: 0;
+  }
+
+  .configActiveSellMode {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .priceExitColumnHead {
+    display: none;
+  }
+
+  .priceExitRow {
+    grid-template-columns: 34px minmax(0, 1fr) 36px;
+  }
+
+  .priceExitCurrent,
+  .priceExitRow input[type="number"] {
+    grid-column: 2 / 4;
+  }
+
+  .priceExitControls {
+    grid-template-columns: 1fr;
+  }
+
+  .priceExitActions {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .brand h1 {
     font-size: 20px;
   }
@@ -1595,6 +2786,7 @@ span[data-icon] {
 
   .summaryStrip,
   .snapshotGrid,
+  .aggregateSummary,
   .sellContextGrid {
     grid-template-columns: 1fr 1fr;
   }

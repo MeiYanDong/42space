@@ -19,10 +19,15 @@ const ROUTES = {
     title: "Execution",
     lead: "复盘链上活动、本地执行结果和失败原因。"
   },
+  watchlist: {
+    kicker: "Address Watch",
+    title: "地址监控",
+    lead: "查看关注地址的 watcher 状态、最近交易和对应的 42 事件。"
+  },
   strategy: {
-    kicker: "Preflight",
-    title: "Strategy",
-    lead: "检查 watch config、资金状态和实盘前置条件。"
+    kicker: "Profile Policy",
+    title: "策略",
+    lead: "当前 Bot 的买入、执行、退出与事件级覆盖规则。"
   }
 };
 
@@ -47,9 +52,21 @@ const state = {
   configDirty: false,
   runtimeConfig: null,
   runtimeWriteProtected: false,
-  timer: null
+  priceExitPayload: null,
+  priceExitDraft: [],
+  priceExitDirty: false,
+  priceExitWriteProtected: false,
+  orderflowPayload: null,
+  orderflowWriteProtected: false,
+  watchedAddressPayload: null,
+  watchedAddressLookbackMinutes: 60,
+  watchedAddressLoading: false,
+  automationStatus: null,
+  timer: null,
+  automationTimer: null
 };
 const overviewRefreshMs = 60000;
+const automationRefreshMs = 10000;
 
 const ICONS = {
   activity: `<path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>`,
@@ -60,6 +77,8 @@ const ICONS = {
   "chevron-down": `<path d="m6 9 6 6 6-6"></path>`,
   "chevron-right": `<path d="m9 18 6-6-6-6"></path>`,
   "circle-dollar-sign": `<circle cx="12" cy="12" r="10"></circle><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"></path><path d="M12 18V6"></path>`,
+  plus: `<path d="M12 5v14"></path><path d="M5 12h14"></path>`,
+  "trash-2": `<path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v5"></path><path d="M14 11v5"></path>`,
   bookmark: `<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16Z"></path>`,
   "bookmark-x": `<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16Z"></path><path d="m14.5 7.5-5 5"></path><path d="m9.5 7.5 5 5"></path>`,
   clock: `<circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path>`,
@@ -99,6 +118,7 @@ const els = {
   upcomingList: $("upcomingList"),
   upcomingCategoryFilter: $("upcomingCategoryFilter"),
   positionSummary: $("positionSummary"),
+  aggregatePnlPanel: $("aggregatePnlPanel"),
   projectBoardCount: $("projectBoardCount"),
   projectBoardList: $("projectBoardList"),
   toggleHistoryProjects: $("toggleHistoryProjects"),
@@ -108,9 +128,16 @@ const els = {
   overviewSnapshot: $("overviewSnapshot"),
   overviewNextAction: $("overviewNextAction"),
   overviewActivityMini: $("overviewActivityMini"),
-  stakeText: $("stakeText"),
-  windowText: $("windowText"),
-  autoSellText: $("autoSellText"),
+  strategyProfileEyebrow: $("strategyProfileEyebrow"),
+  strategyProfileTitle: $("strategyProfileTitle"),
+  strategyProfileSummary: $("strategyProfileSummary"),
+  strategyProfileBadges: $("strategyProfileBadges"),
+  strategyFlow: $("strategyFlow"),
+  strategyFacts: $("strategyFacts"),
+  automationRuntimeGrid: $("automationRuntimeGrid"),
+  automationRuntimeUpdated: $("automationRuntimeUpdated"),
+  strategyOverrideText: $("strategyOverrideText"),
+  strategyAdvancedConfig: $("strategyAdvancedConfig"),
   ruleFilterText: $("ruleFilterText"),
   ruleDisplayText: $("ruleDisplayText"),
   ruleFollowText: $("ruleFollowText"),
@@ -134,6 +161,25 @@ const els = {
   configAdminToken: $("configAdminToken"),
   saveConfigBtn: $("saveConfigBtn"),
   configStatus: $("configStatus"),
+  configActiveSellMode: $("configActiveSellMode"),
+  priceExitPanel: $("priceExitPanel"),
+  priceExitPlanLabel: $("priceExitPlanLabel"),
+  priceExitStatus: $("priceExitStatus"),
+  priceExitCadence: $("priceExitCadence"),
+  priceExitRows: $("priceExitRows"),
+  priceExitApplyExisting: $("priceExitApplyExisting"),
+  priceExitAdminField: $("priceExitAdminField"),
+  priceExitAdminToken: $("priceExitAdminToken"),
+  addPriceExitTarget: $("addPriceExitTarget"),
+  savePriceExitConfig: $("savePriceExitConfig"),
+  priceExitMessage: $("priceExitMessage"),
+  orderflowPanel: $("orderflowPanel"),
+  orderflowStatus: $("orderflowStatus"),
+  orderflowMonitorList: $("orderflowMonitorList"),
+  watchedAddressStatus: $("watchedAddressStatus"),
+  watchedAddressMonitorList: $("watchedAddressMonitorList"),
+  watchedAddressActivityStatus: $("watchedAddressActivityStatus"),
+  watchedAddressActivityList: $("watchedAddressActivityList"),
   sellDrawer: $("sellDrawer"),
   sellBackdrop: $("sellBackdrop"),
   closeDialog: $("closeDialog"),
@@ -153,19 +199,38 @@ renderStaticIcons();
 bindNavigation();
 bindSellControls();
 bindRuntimeConfigControls();
+bindPriceExitControls();
 setRoute(state.route, { replace: true });
 
-els.refreshBtn.addEventListener("click", () => loadOverview({ force: true }));
+els.refreshBtn.addEventListener("click", async () => {
+  await loadOverview({ force: true });
+  await loadAutomationStatus();
+  await loadPriceExitConfig({ force: true });
+  await loadOrderflowMonitors();
+  if (state.route === "watchlist") await loadWatchedAddressActivity();
+});
 window.addEventListener("hashchange", () => setRoute(routeFromHash(), { replace: true }));
 
 loadOverview();
+loadAutomationStatus();
 loadRuntimeConfig();
+loadPriceExitConfig();
+loadOrderflowMonitors();
+if (state.route === "watchlist") loadWatchedAddressActivity();
 state.timer = setInterval(() => {
   updateCountdowns();
   if (document.visibilityState === "visible") loadOverview();
+  if (document.visibilityState === "visible" && state.route === "strategy") loadPriceExitConfig();
+  if (document.visibilityState === "visible" && state.route === "watchlist") loadWatchedAddressActivity();
 }, overviewRefreshMs);
+state.automationTimer = setInterval(() => {
+  if (document.visibilityState === "visible") loadAutomationStatus();
+}, automationRefreshMs);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") loadOverview();
+  if (document.visibilityState === "visible") loadAutomationStatus();
+  if (document.visibilityState === "visible" && state.route === "strategy") loadPriceExitConfig();
+  if (document.visibilityState === "visible" && state.route === "watchlist") loadWatchedAddressActivity();
 });
 setInterval(updateCountdowns, 1000);
 
@@ -182,6 +247,22 @@ async function loadOverview({ force = false } = {}) {
   }
 }
 
+async function loadAutomationStatus() {
+  if (!els.automationRuntimeGrid) return;
+  try {
+    state.automationStatus = await api("/api/automation-status");
+  } catch (error) {
+    state.automationStatus = {
+      ok: false,
+      updatedAt: new Date().toISOString(),
+      worker: { label: "状态读取失败", tone: "bad" },
+      buy: { label: "状态读取失败", tone: "bad", policyLabel: error.message || "接口不可用" },
+      sell: { label: "状态读取失败", tone: "bad", strategyLabel: error.message || "接口不可用" }
+    };
+  }
+  renderAutomationStatus();
+}
+
 async function loadRuntimeConfig({ force = false } = {}) {
   try {
     const data = await api("/api/runtime-config");
@@ -193,6 +274,119 @@ async function loadRuntimeConfig({ force = false } = {}) {
     syncAdminTokenField();
   } catch (error) {
     els.configStatus.textContent = error.message || "配置读取失败";
+  }
+}
+
+async function loadPriceExitConfig({ force = false } = {}) {
+  if (!els.priceExitPanel) return;
+  if (state.priceExitDirty && !force) return;
+  try {
+    const data = await api("/api/planned-price-exit");
+    state.priceExitPayload = data;
+    state.priceExitWriteProtected = Boolean(data.writeProtected);
+    state.priceExitDraft = Array.isArray(data.targets)
+      ? data.targets.map((target) => ({ outcome: target.outcome, price: String(target.price), enabled: target.enabled !== false }))
+      : [];
+    state.priceExitDirty = false;
+    renderPriceExitConfig();
+    syncAdminTokenField();
+  } catch (error) {
+    state.priceExitPayload = { ok: false, enabled: false, message: error.message || "价格配置读取失败" };
+    els.priceExitPanel.classList.add("isHidden");
+  }
+}
+
+function renderPriceExitConfig() {
+  const payload = state.priceExitPayload;
+  if (!els.priceExitPanel || !payload?.enabled) {
+    els.priceExitPanel?.classList.add("isHidden");
+    return;
+  }
+  els.priceExitPanel.classList.remove("isHidden");
+  els.priceExitPlanLabel.textContent = payload.plan?.label ?? payload.plan?.id ?? "OpenRouter Python";
+  const reachedCount = (payload.targets ?? []).filter((target) => target.reached).length;
+  els.priceExitStatus.textContent = reachedCount > 0 ? `${reachedCount} 项达到阈值` : `${state.priceExitDraft.length} 项监控中`;
+  els.priceExitCadence.innerHTML = [
+    `数据 ${payload.priceSource ?? "42 REST"}`,
+    `买后 ${formatStrategyDuration(Number(payload.priceHotWindowSeconds ?? 600))} / ${formatStrategyDuration(Number(payload.priceHotPollMs ?? 1000) / 1000)}`,
+    `之后 ${formatStrategyDuration(Number(payload.normalPollMs ?? 60000) / 1000)}`,
+    `触发卖出 ${formatPlainNumber(payload.sellPercent ?? 100)}%`
+  ].map((item) => `<span>${escapeHtml(item)}</span>`).join("");
+  els.priceExitApplyExisting.checked = Boolean(payload.applyToExisting);
+  els.priceExitMessage.textContent = payload.positionError
+    ? `当前价格读取失败：${payload.positionError}`
+    : payload.priceApplyAfterIso
+      ? `仅处理 ${formatShortIso(payload.priceApplyAfterIso)} 之后买入的仓位`
+      : "价格规则包括已有持仓";
+  renderPriceExitRows();
+}
+
+function renderPriceExitRows() {
+  if (!els.priceExitRows) return;
+  const payload = state.priceExitPayload ?? {};
+  const outcomes = Array.isArray(payload.outcomes) ? payload.outcomes : [];
+  if (state.priceExitDraft.length === 0) {
+    els.priceExitRows.innerHTML = `<div class="empty">暂无价格阈值</div>`;
+    return;
+  }
+  els.priceExitRows.innerHTML = state.priceExitDraft.map((target, index) => {
+    const live = (payload.targets ?? []).find((item) => normalizeText(item.outcome) === normalizeText(target.outcome));
+    const currentPrice = Number(live?.currentPrice);
+    const targetPrice = Number(target.price);
+    const reached = target.enabled !== false && Number.isFinite(currentPrice) && Number.isFinite(targetPrice) && currentPrice >= targetPrice;
+    const options = outcomes.map((outcome) => `<option value="${escapeAttr(outcome)}" ${normalizeText(outcome) === normalizeText(target.outcome) ? "selected" : ""}>${escapeHtml(outcome)}</option>`).join("");
+    return `
+      <div class="priceExitRow" data-price-exit-index="${index}">
+        <input type="checkbox" data-price-exit-field="enabled" ${target.enabled !== false ? "checked" : ""} aria-label="启用 ${escapeAttr(target.outcome)}">
+        <select data-price-exit-field="outcome" aria-label="Outcome">${options}</select>
+        <span class="priceExitCurrent ${reached ? "reached" : ""}">
+          <strong>${Number.isFinite(currentPrice) ? formatOutcomePrice(currentPrice) : "--"}</strong>
+          <small>${reached ? "已达阈值" : "等待"}</small>
+        </span>
+        <input type="number" min="0.00000001" max="1" step="0.0001" value="${escapeAttr(target.price)}" data-price-exit-field="price" aria-label="卖出阈值">
+        <button class="ghost iconButton priceExitRemove" type="button" data-price-exit-remove="${index}" aria-label="移除 ${escapeAttr(target.outcome)}"><span data-icon="trash-2"></span></button>
+      </div>`;
+  }).join("");
+  renderStaticIcons(els.priceExitRows);
+}
+
+function formatOutcomePrice(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const decimals = number < 0.01 ? 6 : 4;
+  return `$${number.toFixed(decimals)}`;
+}
+
+function normalizeText(value) {
+  return String(value ?? "").trim().replace(/\s+/gu, " ").toLowerCase();
+}
+
+async function loadOrderflowMonitors() {
+  if (!els.orderflowPanel) return;
+  try {
+    const data = await api("/api/orderflow-monitors");
+    state.orderflowPayload = data;
+    state.orderflowWriteProtected = Boolean(data.writeProtected);
+    renderOrderflowMonitors();
+  } catch (error) {
+    state.orderflowPayload = { ok: false, enabled: false, monitors: [] };
+    els.orderflowPanel.classList.add("isHidden");
+  }
+}
+
+async function loadWatchedAddressActivity() {
+  if (!els.watchedAddressActivityList || state.watchedAddressLoading) return;
+  state.watchedAddressLoading = true;
+  if (els.watchedAddressActivityStatus) els.watchedAddressActivityStatus.textContent = "读取中";
+  try {
+    const data = await api(`/api/watched-address-activity?lookbackMinutes=${encodeURIComponent(state.watchedAddressLookbackMinutes)}`);
+    state.watchedAddressPayload = data;
+    renderWatchedAddressActivity();
+  } catch (error) {
+    state.watchedAddressPayload = { ok: false, enabled: false, monitors: [], activity: [], warnings: [error.message || "读取失败"] };
+    renderWatchedAddressActivity();
+  } finally {
+    state.watchedAddressLoading = false;
   }
 }
 
@@ -489,7 +683,113 @@ function renderPositions(data) {
     ${summaryCard("Gas", `${cards.gasFee} U`, gasCardMeta(cards), false)}
     ${summaryCard("净盈亏", `${cards.totalPnl} U`, `已扣 Gas · ${cards.totalRoi}`, cards.totalPositive)}
   `;
+  renderAggregatePnl(data.analytics.aggregatePnl);
   renderProjectBoard(data.projectBoard);
+}
+
+function renderAggregatePnl(aggregate) {
+  if (!els.aggregatePnlPanel) return;
+  if (!aggregate?.enabled || !aggregate.series?.length) {
+    els.aggregatePnlPanel.classList.add("isHidden");
+    els.aggregatePnlPanel.innerHTML = "";
+    return;
+  }
+  const cards = aggregate.cards ?? {};
+  const warnings = aggregate.warnings ?? [];
+  els.aggregatePnlPanel.classList.remove("isHidden");
+  els.aggregatePnlPanel.innerHTML = `
+    <div class="panelHead">
+      <div>
+        <h3><i data-icon="bar-chart-3"></i>${escapeHtml(aggregate.title || "Bot1-Bot5 总净盈亏")}</h3>
+        <p>线为累计净盈亏，柱为每天净增加</p>
+      </div>
+      <span>${escapeHtml(aggregate.timeZone || "")}</span>
+    </div>
+    <div class="aggregatePnlBody">
+      <div class="aggregateSummary">
+        ${summaryCard("总净盈亏", `${cards.totalNet ?? "0"} U`, `含当前浮盈亏 · ${cards.roi ?? "--"}`, cards.totalPositive)}
+        ${summaryCard("累计记账", `${cards.realizedNet ?? "0"} U`, "已实现减 Gas", cards.realizedPositive)}
+        ${summaryCard("今日净增加", `${cards.dailyNet ?? "0"} U`, "按交易日", cards.dailyPositive)}
+        ${summaryCard("当前浮盈亏", `${cards.openPnl ?? "0"} U`, "未实现", cards.openPositive)}
+      </div>
+      <div class="aggregateChartWrap">
+        ${aggregatePnlChart(aggregate.series)}
+      </div>
+      <div class="aggregateProfiles">
+        ${(aggregate.profiles ?? []).map((profile) => `
+          <div class="aggregateProfile ${profile.ok ? "" : "hasWarning"}">
+            <span>${escapeHtml(profile.label)}</span>
+            <strong class="${profile.positive ? "good" : "bad"}">${escapeHtml(profile.netPnl)} U</strong>
+            <small>${escapeHtml(profile.wallet || "")} · 记账 ${escapeHtml(profile.realizedNet)} U · 浮盈亏 ${escapeHtml(profile.openPnl)} U</small>
+            ${profile.warning ? `<em>${escapeHtml(profile.warning)}</em>` : ""}
+          </div>
+        `).join("")}
+      </div>
+      ${warnings.length ? `<div class="aggregateWarnings">${warnings.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}
+    </div>
+  `;
+  renderStaticIcons();
+}
+
+function aggregatePnlChart(series = []) {
+  const rows = series.filter((row) => Number.isFinite(Number(row.cumulativeNet)) && Number.isFinite(Number(row.dailyNet)));
+  if (!rows.length) return `<div class="empty">暂无盈亏数据</div>`;
+  const width = 760;
+  const height = 280;
+  const pad = { top: 20, right: 18, bottom: 34, left: 56 };
+  const innerW = width - pad.left - pad.right;
+  const innerH = height - pad.top - pad.bottom;
+  const values = rows.flatMap((row) => [Number(row.cumulativeNet), Number(row.dailyNet), 0]);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(1, max - min);
+  const yMin = min - span * 0.08;
+  const yMax = max + span * 0.08;
+  const xStep = rows.length > 1 ? innerW / (rows.length - 1) : innerW;
+  const barSlot = innerW / Math.max(1, rows.length);
+  const barW = Math.max(3, Math.min(18, barSlot * 0.58));
+  const y = (value) => pad.top + (yMax - value) / Math.max(1, yMax - yMin) * innerH;
+  const x = (index) => pad.left + (rows.length > 1 ? index * xStep : innerW / 2);
+  const zeroY = y(0);
+  const linePoints = rows.map((row, index) => `${x(index).toFixed(2)},${y(Number(row.cumulativeNet)).toFixed(2)}`).join(" ");
+  const bars = rows.map((row, index) => {
+    const value = Number(row.dailyNet);
+    const barX = x(index) - barW / 2;
+    const barY = Math.min(y(value), zeroY);
+    const barH = Math.max(1, Math.abs(zeroY - y(value)));
+    const tone = value >= 0 ? "positive" : "negative";
+    return `<rect class="pnlBar ${tone}" x="${barX.toFixed(2)}" y="${barY.toFixed(2)}" width="${barW.toFixed(2)}" height="${barH.toFixed(2)}"><title>${escapeHtml(row.label)} 每日 ${escapeHtml(row.dailyNetText)} U</title></rect>`;
+  }).join("");
+  const barLabels = rows.map((row, index) => {
+    const value = Number(row.dailyNet);
+    const rounded = Math.round(value);
+    if (rounded === 0) return "";
+    const labelX = x(index);
+    const labelY = value >= 0 ? y(value) - 5 : y(value) + 14;
+    return `<text class="barValueLabel ${value >= 0 ? "positive" : "negative"}" x="${labelX.toFixed(2)}" y="${labelY.toFixed(2)}">${escapeHtml(formatInteger(value, { positiveSign: false }))}</text>`;
+  }).join("");
+  const last = rows.at(-1);
+  const lastX = x(rows.length - 1);
+  const lastY = y(Number(last.cumulativeNet));
+  return `
+    <svg class="aggregateChart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Bot1-Bot5 累计净盈亏曲线和每日净增加柱状图">
+      <line class="axisLine" x1="${pad.left}" x2="${width - pad.right}" y1="${zeroY.toFixed(2)}" y2="${zeroY.toFixed(2)}"></line>
+      <line class="gridLine" x1="${pad.left}" x2="${width - pad.right}" y1="${pad.top}" y2="${pad.top}"></line>
+      <line class="gridLine" x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}"></line>
+      ${bars}
+      <polyline class="pnlLine" points="${linePoints}"></polyline>
+      <circle class="pnlPoint" cx="${lastX.toFixed(2)}" cy="${lastY.toFixed(2)}" r="4"></circle>
+      ${barLabels}
+      <text class="axisLabel" x="8" y="${pad.top + 4}">${escapeHtml(formatMoneyShort(yMax))} U</text>
+      <text class="axisLabel" x="8" y="${height - pad.bottom + 4}">${escapeHtml(formatMoneyShort(yMin))} U</text>
+      <text class="axisLabel" x="${pad.left}" y="${height - 8}">${escapeHtml(rows[0].label)}</text>
+      <text class="axisLabel end" x="${width - pad.right}" y="${height - 8}">${escapeHtml(last.label)}</text>
+    </svg>
+    <div class="aggregateLegend">
+      <span><i class="legendLine"></i>累计 ${escapeHtml(last.cumulativeNetText)} U</span>
+      <span><i class="legendBar"></i>每日净增加 · 同一比例</span>
+    </div>
+  `;
 }
 
 function renderProjectBoard(board) {
@@ -741,9 +1041,8 @@ function renderCompactActivity(row) {
 }
 
 function renderStrategy(data) {
-  els.stakeText.textContent = data.settings?.stakeText ?? "--";
-  els.windowText.textContent = data.settings?.windowText ?? "--";
-  els.autoSellText.textContent = data.settings?.autoSellText ?? "--";
+  renderStrategyProfile(data.settings?.strategyProfile);
+  renderAutomationStatus();
   const rules = data.settings?.ruleSummary ?? {};
   if (els.ruleFilterText) els.ruleFilterText.textContent = rules.filterRule ?? "--";
   if (els.ruleDisplayText) els.ruleDisplayText.textContent = rules.displayRule ?? "--";
@@ -764,6 +1063,348 @@ function renderStrategy(data) {
       <strong class="${check.tone}">${escapeHtml(check.value)}</strong>
     </div>
   `).join("");
+  renderOrderflowMonitors();
+}
+
+function renderAutomationStatus() {
+  if (!els.automationRuntimeGrid) return;
+  const status = state.automationStatus;
+  if (!status) {
+    els.automationRuntimeGrid.innerHTML = automationStatusPlaceholder();
+    els.automationRuntimeUpdated.textContent = "读取中";
+    return;
+  }
+  els.automationRuntimeUpdated.textContent = `状态 ${formatHealthAge(Date.now() - Date.parse(status.updatedAt ?? ""))}`;
+  const worker = status.worker ?? {};
+  const buy = status.buy ?? {};
+  const sell = status.sell ?? {};
+  const workerMeta = [
+    worker.pid ? `PID ${worker.pid}` : null,
+    Number.isFinite(Number(worker.restartCount)) ? `重启 ${worker.restartCount} 次` : null,
+    status.heartbeat?.ageMs !== null && status.heartbeat?.ageMs !== undefined
+      ? `心跳 ${formatHealthAge(status.heartbeat.ageMs)}`
+      : "尚无心跳"
+  ].filter(Boolean);
+  const buyMeta = [
+    `待处理 ${Number(buy.pendingCount ?? 0)} 场`,
+    `已准备 ${Number(buy.preparedCount ?? 0)} 场`,
+    buy.lastAction?.at ? `最近交易 ${formatShortIso(buy.lastAction.at)}` : "暂无买入记录"
+  ];
+  const sellMeta = [
+    sell.lastSuccessfulScanAt ? `有效扫描 ${formatHealthAge(Date.now() - Date.parse(sell.lastSuccessfulScanAt))}` : "尚无有效扫描",
+    `检查 ${Number(sell.checked ?? 0)} 个持仓`,
+    sell.pollMs ? `轮询 ${formatStrategyDuration(Number(sell.pollMs) / 1000)}` : null,
+    sell.guardUntil ? `保护至 ${formatShortIso(sell.guardUntil)}` : null,
+    sell.lastAction?.at ? `最近卖出 ${formatShortIso(sell.lastAction.at)}` : null
+  ].filter(Boolean);
+  els.automationRuntimeGrid.innerHTML = [
+    automationStatusLane({
+      iconName: "radio",
+      label: "主 Worker",
+      status: worker.label ?? "--",
+      tone: worker.tone ?? "neutral",
+      detail: worker.running ? "事件发现、预签名和交易调度主进程" : "主进程未运行",
+      meta: workerMeta
+    }),
+    automationStatusLane({
+      iconName: "sparkles",
+      label: "自动买入",
+      status: buy.label ?? "--",
+      tone: buy.tone ?? "neutral",
+      detail: buy.policyLabel ?? "--",
+      meta: buyMeta
+    }),
+    automationStatusLane({
+      iconName: "timer",
+      label: "自动卖出",
+      status: sell.label ?? "--",
+      tone: sell.tone ?? "neutral",
+      detail: sell.lastError && sell.tone === "bad" ? sell.lastError : (sell.strategyLabel ?? "--"),
+      meta: sellMeta
+    })
+  ].join("");
+}
+
+function automationStatusLane({ iconName, label, status, tone, detail, meta = [] }) {
+  return `
+    <article class="automationLane ${escapeAttr(tone)}">
+      <div class="automationLaneTop">
+        <span>${icon(iconName)}${escapeHtml(label)}</span>
+        <strong>${escapeHtml(status)}</strong>
+      </div>
+      <p>${escapeHtml(detail)}</p>
+      <div class="automationLaneMeta">
+        ${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function automationStatusPlaceholder() {
+  return ["主 Worker", "自动买入", "自动卖出"].map((label) => `
+    <article class="automationLane neutral">
+      <div class="automationLaneTop"><span>${escapeHtml(label)}</span><strong>读取中</strong></div>
+      <p>--</p>
+    </article>
+  `).join("");
+}
+
+function formatHealthAge(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return "--";
+  if (ms < 1500) return "刚刚";
+  if (ms < 60000) return `${Math.floor(ms / 1000)} 秒前`;
+  if (ms < 3600000) return `${Math.floor(ms / 60000)} 分钟前`;
+  return `${Math.floor(ms / 3600000)} 小时前`;
+}
+
+function renderStrategyProfile(profile) {
+  if (!profile) return;
+  els.strategyProfileEyebrow.textContent = profile.eyebrow ?? "PROFILE";
+  els.strategyProfileTitle.textContent = profile.title ?? "当前策略";
+  els.strategyProfileSummary.textContent = profile.summary ?? "--";
+  els.strategyOverrideText.textContent = profile.overrideNote ?? "--";
+  els.strategyProfileBadges.innerHTML = (profile.badges ?? []).map((badge) => `
+    <span class="strategyBadge ${escapeAttr(badge.tone ?? "neutral")}">${escapeHtml(badge.label ?? "--")}</span>
+  `).join("");
+  els.strategyFlow.innerHTML = (profile.stages ?? []).map((stage) => `
+    <article class="strategyStage">
+      <div class="strategyStageTop">
+        <span class="strategyStep">${escapeHtml(stage.step ?? "--")}</span>
+        ${icon(stage.icon ?? "radio", "strategyStageIcon")}
+      </div>
+      <span class="strategyStageLabel">${escapeHtml(stage.label ?? "--")}</span>
+      <strong>${escapeHtml(stage.title ?? "--")}</strong>
+      <p>${escapeHtml(stage.detail ?? "")}</p>
+      <div class="strategyStageMeta">
+        ${(stage.meta ?? []).map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
+      </div>
+    </article>
+  `).join("");
+  els.strategyFacts.innerHTML = (profile.facts ?? []).map((fact) => `
+    <div class="strategyFactRow ${escapeAttr(fact.tone ?? "neutral")}">
+      <span>${escapeHtml(fact.label ?? "--")}</span>
+      <div>
+        <strong>${escapeHtml(fact.value ?? "--")}</strong>
+        <p>${escapeHtml(fact.detail ?? "")}</p>
+      </div>
+    </div>
+  `).join("");
+  syncSellModeFields(profile.sellMode, profile.sellModeLabel, profile.sellSummary);
+}
+
+function renderOrderflowMonitors() {
+  if (!els.orderflowPanel || !els.orderflowMonitorList) return;
+  const payload = state.orderflowPayload;
+  const enabled = Boolean(payload?.enabled);
+  els.orderflowPanel.classList.toggle("isHidden", !enabled);
+  if (!enabled) return;
+  const monitors = Array.isArray(payload.monitors) ? payload.monitors : [];
+  const runningCount = monitors.filter((monitor) => monitor.running).length;
+  const tokenText = payload.writeProtected ? "需令牌" : "可写";
+  els.orderflowStatus.textContent = `${runningCount}/${monitors.length} 运行 · ${tokenText}`;
+  els.orderflowMonitorList.innerHTML = monitors.length
+    ? monitors.map(renderOrderflowMonitorCard).join("")
+    : `<div class="empty">没有可配置的 orderflow 监控。</div>`;
+  bindOrderflowControls();
+}
+
+function renderOrderflowMonitorCard(monitor) {
+  const stateClass = monitor.running ? "good" : monitor.activeState === "failed" ? "bad" : "warn";
+  const stateText = monitor.running
+    ? "运行中"
+    : [monitor.activeState, monitor.subState].filter(Boolean).join(" / ") || "未运行";
+  const tokenIds = (monitor.tokenIds ?? []).join(",");
+  const startedText = monitor.latestStartedAt
+    ? `${formatShortIso(monitor.latestStartedAt)} · ${monitor.latestStartedThresholdUsdt ?? "--"}U`
+    : "--";
+  const watchedText = monitor.watchCurrentPositions
+    ? `当前持仓 + ${monitor.latestStartedWatchedTokenIds?.length ?? monitor.tokenIds?.length ?? 0} 个已启动 Token`
+    : `${monitor.tokenIds?.length ?? 0} 个 Token`;
+  return `
+    <form class="orderflowCard" data-orderflow-id="${escapeAttr(monitor.id)}">
+      <div class="orderflowCardHead">
+        <div>
+          <strong>${escapeHtml(monitor.label)}</strong>
+          <span>${escapeHtml(monitor.service)}</span>
+        </div>
+        <span class="orderflowState ${stateClass}">${escapeHtml(stateText)}</span>
+      </div>
+      <div class="orderflowFields">
+        <label class="field orderflowMarketField">
+          <span>事件地址</span>
+          <input name="market" value="${escapeAttr(monitor.market)}" spellcheck="false" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>触发阈值 U</span>
+          <input name="thresholdUsdt" type="number" min="0.1" max="1000000" step="0.1" value="${escapeAttr(monitor.thresholdUsdt || "")}">
+        </label>
+        <label class="field tokenField">
+          <span>Token IDs</span>
+          <input name="tokenIds" value="${escapeAttr(tokenIds)}" spellcheck="false" autocomplete="off" placeholder="用逗号或空格分隔">
+        </label>
+        <label class="orderflowCheckbox tokenField">
+          <input name="watchCurrentPositions" type="checkbox" ${monitor.watchCurrentPositions ? "checked" : ""}>
+          <span>按当前持仓自动监控；Token IDs 作为固定补充</span>
+        </label>
+      </div>
+      <div class="orderflowMeta">
+        <span>监控：${escapeHtml(watchedText)}</span>
+        <span>卖出：${escapeHtml(monitor.sellMode || "--")} · ${escapeHtml(String(monitor.sellPercent || "--"))}%</span>
+        <span>轮询：${escapeHtml(String(monitor.pollMs || "--"))}ms</span>
+        <span>区块：${escapeHtml(String(monitor.lastProcessedBlock ?? "--"))}</span>
+        <span>失败/处理中：${escapeHtml(String(monitor.failedTxCount ?? 0))}/${escapeHtml(String(monitor.processingTxCount ?? 0))}</span>
+        <span>最近启动：${escapeHtml(startedText)}</span>
+      </div>
+      <div class="orderflowActions">
+        <small title="${escapeAttr(monitor.unitPath || "")}">${escapeHtml(monitor.profile || "")}</small>
+        <button class="iconButton compactIconButton" type="submit">
+          ${icon("send")}<span>保存并重启</span>
+        </button>
+      </div>
+    </form>
+  `;
+}
+
+function renderWatchedAddressActivity() {
+  if (!els.watchedAddressMonitorList || !els.watchedAddressActivityList) return;
+  const payload = state.watchedAddressPayload;
+  if (!payload?.enabled) {
+    els.watchedAddressStatus.textContent = "未启用";
+    els.watchedAddressActivityStatus.textContent = payload?.warnings?.[0] ?? "未启用";
+    els.watchedAddressMonitorList.innerHTML = `<div class="empty">地址监控面板未启用。</div>`;
+    els.watchedAddressActivityList.innerHTML = `<div class="empty">暂无地址活动。</div>`;
+    return;
+  }
+  const monitors = Array.isArray(payload.monitors) ? payload.monitors : [];
+  const activity = Array.isArray(payload.activity) ? payload.activity : [];
+  const runningCount = monitors.filter((monitor) => monitor.running).length;
+  els.watchedAddressStatus.textContent = `${runningCount}/${monitors.length} 运行`;
+  els.watchedAddressActivityStatus.textContent = `${activity.length} 条 · ${payload.lookbackMinutes ?? state.watchedAddressLookbackMinutes} 分钟`;
+  els.watchedAddressMonitorList.innerHTML = monitors.length
+    ? monitors.map(renderWatchedAddressMonitorCard).join("")
+    : `<div class="empty">没有配置关注地址。</div>`;
+  const warnings = payload.warnings?.length
+    ? `<div class="watchWarning">${payload.warnings.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>`
+    : "";
+  els.watchedAddressActivityList.innerHTML = activity.length
+    ? `${warnings}${activity.map(renderWatchedAddressActivityRow).join("")}`
+    : `${warnings}<div class="empty">当前回看窗口没有活动。</div>`;
+}
+
+function renderWatchedAddressMonitorCard(monitor) {
+  const stateClass = monitor.running ? "good" : monitor.activeState === "failed" ? "bad" : "warn";
+  const stateText = monitor.running
+    ? "运行中"
+    : [monitor.activeState, monitor.subState].filter(Boolean).join(" / ") || "未运行";
+  const cooldown = monitor.cooldownMs ? `${Math.round(Number(monitor.cooldownMs) / 60000)} 分钟冷却` : "冷却未配置";
+  return `
+    <section class="watchAddressCard">
+      <div class="watchAddressCardHead">
+        <div>
+          <strong>${escapeHtml(monitor.label || monitor.address)}</strong>
+          <span title="${escapeAttr(monitor.address)}">${escapeHtml(monitor.address)}</span>
+        </div>
+        <span class="orderflowState ${stateClass}">${escapeHtml(stateText)}</span>
+      </div>
+      <div class="watchAddressMeta">
+        <span>区块 ${escapeHtml(String(monitor.lastProcessedBlock ?? "--"))}</span>
+        <span>${escapeHtml(cooldown)}</span>
+        <span>命中 ${escapeHtml(String(monitor.recentHitCount ?? 0))}</span>
+        <span>通知 ${escapeHtml(String(monitor.recentAlertCount ?? 0))}</span>
+        <span>已见 ${escapeHtml(String(monitor.seenTxCount ?? 0))}</span>
+      </div>
+      <div class="watchAddressFoot">
+        <small title="${escapeAttr(monitor.service)}">${escapeHtml(monitor.service)}</small>
+        <small>${monitor.lastHitAt ? `最近 ${formatShortIso(monitor.lastHitAt)}` : "暂无命中"}</small>
+      </div>
+      ${monitor.lastError ? `<div class="watchAddressError">${escapeHtml(monitor.lastError)}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderWatchedAddressActivityRow(row) {
+  const event = row.event;
+  const title = event?.question || "未识别 42 事件";
+  const outcome = event?.outcome || "";
+  const action = event?.actionLabel || (row.direct ? "原生交易" : row.directionsText || "活动");
+  const marketMeta = event?.market
+    ? `${shortAddressText(event.market)}${event.tokenId ? ` · Token ${event.tokenId}` : ""}`
+    : row.contracts?.length ? `${row.contracts.length} contract` : "";
+  return `
+    <div class="watchActivityRow">
+      <div class="watchActivityMain">
+        <div class="watchActivityTop">
+          <span class="activityType ${watchActionTone(action)}">${escapeHtml(action)}</span>
+          <strong title="${escapeAttr(title)}">${escapeHtml(title)}</strong>
+        </div>
+        ${outcome ? `<div class="activityOutcome">${escapeHtml(outcome)}</div>` : ""}
+        <div class="activityMeta">
+          <span>${icon("clock", "metaIcon")}${formatTime(row.at)}</span>
+          <span>${escapeHtml(row.addressLabel || shortAddressText(row.address))}</span>
+          ${row.amountText ? `<span>${escapeHtml(row.amountText)}</span>` : ""}
+          ${marketMeta ? `<span>${escapeHtml(marketMeta)}</span>` : ""}
+        </div>
+      </div>
+      <div class="watchActivityTx">
+        <a href="${escapeAttr(row.explorerUrl)}" target="_blank" rel="noreferrer">${escapeHtml(row.shortTx || shortHashText(row.txHash))}</a>
+        <span>${escapeHtml(row.directionsText || "")} · #${escapeHtml(String(row.blockNumber ?? "--"))}</span>
+      </div>
+    </div>
+  `;
+}
+
+function watchActionTone(action) {
+  if (String(action).includes("买")) return "buy";
+  if (String(action).includes("卖") || String(action).includes("赎回") || String(action).includes("转出")) return "sell";
+  return "neutral";
+}
+
+function bindOrderflowControls() {
+  for (const form of els.orderflowMonitorList?.querySelectorAll("[data-orderflow-id]") ?? []) {
+    form.addEventListener("submit", saveOrderflowMonitor);
+  }
+}
+
+async function saveOrderflowMonitor(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const id = form.dataset.orderflowId;
+  const token = els.configAdminToken?.value.trim() ?? "";
+  if (state.orderflowWriteProtected && !token) {
+    showToast("需要管理令牌");
+    return;
+  }
+  const button = form.querySelector("button[type='submit']");
+  const payload = {
+    id,
+    market: form.elements.market.value.trim(),
+    thresholdUsdt: Number(form.elements.thresholdUsdt.value),
+    tokenIds: form.elements.tokenIds.value.trim(),
+    watchCurrentPositions: form.elements.watchCurrentPositions.checked
+  };
+  button.disabled = true;
+  setButtonLabel(button, "loader-circle", "保存中");
+  try {
+    const data = await api("/api/orderflow-monitors", {
+      method: "PUT",
+      headers: token ? { "x-admin-token": token } : {},
+      body: JSON.stringify(payload)
+    });
+    if (token) localStorage.setItem("42spaceAdminToken", token);
+    const monitors = Array.isArray(state.orderflowPayload?.monitors) ? state.orderflowPayload.monitors : [];
+    state.orderflowPayload = {
+      ...state.orderflowPayload,
+      enabled: true,
+      monitors: monitors.map((item) => item.id === data.monitor?.id ? data.monitor : item)
+    };
+    showToast(data.message || "Orderflow 监控已保存");
+    renderOrderflowMonitors();
+  } catch (error) {
+    showToast(error.message || "Orderflow 监控保存失败");
+    button.disabled = false;
+    setButtonLabel(button, "send", "保存并重启");
+  }
 }
 
 function evidencePreflightRows(evidence) {
@@ -779,8 +1420,8 @@ function evidencePreflightRows(evidence) {
       tone: readiness.ok ? "good" : "bad"
     });
     rows.push({
-      label: "止损监控",
-      value: readiness.autoSellMonitorStarted ? "已启动 · 10% 全卖" : "未确认",
+      label: "自动卖出监控",
+      value: readiness.autoSellMonitorStarted ? "已启动" : "未确认",
       tone: readiness.autoSellMonitorStarted ? "good" : "warn"
     });
   }
@@ -852,6 +1493,7 @@ function setRuntimeConfigForm(config) {
   els.configAutoSellStopLossEnabled.value = config.autoSellStopLossEnabled ? "1" : "0";
   els.configAutoSellStopLoss.value = config.autoSellStopLossPercent ?? 10;
   els.configAutoSellStopLossSell.value = config.autoSellStopLossSellPercent ?? 100;
+  syncSellModeFields(config.autoSellStrategy, runtimeSellModeLabel(config.autoSellStrategy), runtimeSellSummary(config));
 }
 
 function runtimeStatusText(config) {
@@ -861,11 +1503,71 @@ function runtimeStatusText(config) {
     : "买入门槛：基础排除+时长门槛";
   const filterCount = Array.isArray(config.eventDisplayFilterRules) ? config.eventDisplayFilterRules.length : 0;
   const filterText = filterCount ? `过滤${filterCount}项` : "显示全部";
-  const sell = config.autoSellEnabled
-    ? `${config.autoSellStartDelaySeconds}s/${config.autoSellIntervalSeconds}s/${config.autoSellChunkPercent}%`
-    : "卖出关";
+  const sell = runtimeSellSummary(config);
   const sellGas = config.autoSellGasPriceGwei ? `卖 gas ${config.autoSellGasPriceGwei}` : "卖 gas 同买入";
   return `${mode} · ${filterText} · ${config.eventOutcomeCount} 档 · ${config.stakePerOutcomeUsdt}U/档 · 买 gas ${config.gasPriceGwei} · ${sellGas} · ${sell}`;
+}
+
+function syncSellModeFields(mode, label = null, summary = null) {
+  const normalized = String(mode ?? "legacy").trim().toLowerCase();
+  for (const field of document.querySelectorAll("[data-sell-config]")) {
+    const supported = String(field.dataset.sellConfig ?? "").split(/\s+/u).filter(Boolean);
+    field.hidden = !supported.includes(normalized);
+  }
+  if (els.configActiveSellMode) {
+    const modeLabel = label || runtimeSellModeLabel(normalized);
+    els.configActiveSellMode.innerHTML = `<span>当前卖出模式</span><strong>${escapeHtml(modeLabel)}</strong><p>${escapeHtml(summary || "")}</p>`;
+  }
+}
+
+function runtimeSellModeLabel(mode) {
+  if (mode === "open_timed_exit") return "开盘定时退出";
+  if (mode === "pre_start_exit") return "赛前退出";
+  if (mode === "ladder") return "阶梯卖出";
+  return "Legacy 倍数止盈";
+}
+
+function runtimeSellSummary(config) {
+  if (!config?.autoSellEnabled) return "自动卖出关闭";
+  const mode = String(config.autoSellStrategy ?? "legacy");
+  let main = "";
+  if (mode === "open_timed_exit") {
+    main = `开盘后 ${formatStrategyDuration(config.autoSellOpenExitDelaySeconds ?? 36)} 卖 ${formatPlainNumber(config.autoSellOpenExitPercent ?? 100)}%`;
+    if (config.autoSellFastOpenExitEnabled) {
+      main += `，快速窗口 T+${formatPlainNumber(Number(config.autoSellFastOpenExitMinDelayMs ?? 0) / 1000, 3)}-${formatPlainNumber(Number(config.autoSellFastOpenExitMaxDelayMs ?? 0) / 1000, 3)}s`;
+    }
+  } else if (mode === "pre_start_exit") {
+    const beforeStart = Number(config.autoSellBeforeMarketStartSeconds ?? 0);
+    main = beforeStart > 0 ? `赛前 ${formatStrategyDuration(beforeStart)} 清仓` : "赛前清仓时间未配置";
+  } else if (mode === "ladder") {
+    const profit = Number(config.autoSellLadderProfitPercent ?? 0);
+    const gate = profit > 0 ? `盈利 ${formatPlainNumber(profit)}% 后` : `${formatStrategyDuration(config.autoSellStartDelaySeconds ?? 0)} 后`;
+    const steps = Number(config.autoSellTakeProfitSteps ?? 0);
+    main = steps > 0
+      ? `${gate}卖 ${formatPlainNumber(config.autoSellChunkPercent ?? 0)}%，共 ${formatPlainNumber(steps)} 次`
+      : `${gate}每 ${formatStrategyDuration(config.autoSellIntervalSeconds ?? 10)} 卖 ${formatPlainNumber(config.autoSellChunkPercent ?? 0)}%`;
+  } else {
+    main = `${formatPlainNumber(config.autoSellProfitMultiplier ?? 2)}x 卖 ${formatPlainNumber(config.autoSellPercent ?? 50)}%`;
+  }
+  const stop = config.autoSellStopLossEnabled
+    ? `亏 ${formatPlainNumber(config.autoSellStopLossPercent ?? 10)}% ${Number(config.autoSellStopLossSellPercent ?? 100) >= 100 ? "全卖" : `卖 ${formatPlainNumber(config.autoSellStopLossSellPercent)}%`}`
+    : "止损关闭";
+  return `${main} / ${stop}`;
+}
+
+function formatStrategyDuration(value) {
+  const seconds = Number(value ?? 0);
+  if (!Number.isFinite(seconds)) return "--";
+  if (seconds >= 3600 && seconds % 3600 === 0) return `${formatPlainNumber(seconds / 3600)}h`;
+  if (seconds >= 60 && seconds % 60 === 0) return `${formatPlainNumber(seconds / 60)}min`;
+  return `${formatPlainNumber(seconds, 3)}s`;
+}
+
+function formatPlainNumber(value, decimals = 6) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  if (Number.isInteger(number)) return String(number);
+  return number.toFixed(decimals).replace(/0+$/u, "").replace(/\.$/u, "");
 }
 
 function renderDisplayFilterOptions(config) {
@@ -1031,6 +1733,15 @@ function bindNavigation() {
         item.classList.toggle("isActive", item === button);
       }
       if (state.data) renderNewMarkets(state.data.newMarkets);
+    });
+  }
+  for (const button of document.querySelectorAll("[data-watch-lookback]")) {
+    button.addEventListener("click", () => {
+      state.watchedAddressLookbackMinutes = Number(button.dataset.watchLookback) || 60;
+      for (const item of document.querySelectorAll("[data-watch-lookback]")) {
+        item.classList.toggle("isActive", item === button);
+      }
+      loadWatchedAddressActivity();
     });
   }
   els.upcomingCategoryFilter?.addEventListener("change", () => {
@@ -1234,10 +1945,114 @@ function bindRuntimeConfigControls() {
   els.runtimeConfigForm.addEventListener("submit", saveRuntimeConfig);
 }
 
+function bindPriceExitControls() {
+  if (!els.priceExitPanel) return;
+  els.priceExitRows?.addEventListener("input", updatePriceExitDraftFromInput);
+  els.priceExitRows?.addEventListener("change", updatePriceExitDraftFromInput);
+  els.priceExitRows?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-price-exit-remove]");
+    if (!button) return;
+    const index = Number(button.dataset.priceExitRemove);
+    if (!Number.isInteger(index) || index < 0 || index >= state.priceExitDraft.length) return;
+    state.priceExitDraft.splice(index, 1);
+    markPriceExitDirty();
+    renderPriceExitRows();
+  });
+  els.addPriceExitTarget?.addEventListener("click", () => {
+    const used = new Set(state.priceExitDraft.map((target) => normalizeText(target.outcome)));
+    const outcome = (state.priceExitPayload?.outcomes ?? []).find((item) => !used.has(normalizeText(item)));
+    if (!outcome) {
+      showToast("当前计划没有可添加的 outcome");
+      return;
+    }
+    state.priceExitDraft.push({ outcome, price: "0.001", enabled: true });
+    markPriceExitDirty();
+    renderPriceExitRows();
+  });
+  els.priceExitApplyExisting?.addEventListener("change", markPriceExitDirty);
+  els.priceExitAdminToken?.addEventListener("input", () => {
+    const token = els.priceExitAdminToken.value;
+    localStorage.setItem("42spaceAdminToken", token);
+    if (els.configAdminToken) els.configAdminToken.value = token;
+  });
+  els.savePriceExitConfig?.addEventListener("click", savePriceExitConfig);
+}
+
+function updatePriceExitDraftFromInput(event) {
+  const input = event.target.closest("[data-price-exit-field]");
+  if (!input) return;
+  const row = input.closest("[data-price-exit-index]");
+  const index = Number(row?.dataset.priceExitIndex);
+  if (!Number.isInteger(index) || !state.priceExitDraft[index]) return;
+  const field = input.dataset.priceExitField;
+  state.priceExitDraft[index][field] = field === "enabled" ? input.checked : input.value;
+  markPriceExitDirty();
+  if (field !== "price") renderPriceExitRows();
+}
+
+function markPriceExitDirty() {
+  state.priceExitDirty = true;
+  if (els.priceExitMessage) els.priceExitMessage.textContent = "未应用";
+}
+
+async function savePriceExitConfig() {
+  const payload = state.priceExitPayload;
+  if (!payload?.enabled) return;
+  const token = els.priceExitAdminToken?.value.trim() || els.configAdminToken?.value.trim() || localStorage.getItem("42spaceAdminToken") || "";
+  if (state.priceExitWriteProtected && !token) {
+    showToast("需要管理令牌");
+    return;
+  }
+  const targets = state.priceExitDraft.map((target) => ({
+    outcome: target.outcome,
+    price: String(target.price).trim(),
+    enabled: target.enabled !== false
+  }));
+  if (targets.some((target) => !(Number(target.price) > 0 && Number(target.price) <= 1))) {
+    showToast("卖出阈值必须大于 0 且不超过 1");
+    return;
+  }
+  const applyToExisting = Boolean(els.priceExitApplyExisting?.checked);
+  const reachesExisting = applyToExisting && targets.some((target) => {
+    const current = (payload.targets ?? []).find((item) => normalizeText(item.outcome) === normalizeText(target.outcome));
+    return target.enabled && Number.isFinite(Number(current?.currentPrice)) && Number(current.currentPrice) >= Number(target.price);
+  });
+  if (reachesExisting && !window.confirm("当前持仓已经达到至少一个价格阈值，应用后可能立即卖出。继续应用？")) return;
+
+  els.savePriceExitConfig.disabled = true;
+  try {
+    const data = await api("/api/planned-price-exit", {
+      method: "PUT",
+      headers: token ? { "x-admin-token": token } : {},
+      body: JSON.stringify({ planId: payload.plan?.id, targets, applyToExisting })
+    });
+    state.priceExitPayload = data;
+    state.priceExitWriteProtected = Boolean(data.writeProtected);
+    state.priceExitDraft = (data.targets ?? []).map((target) => ({
+      outcome: target.outcome,
+      price: String(target.price),
+      enabled: target.enabled !== false
+    }));
+    state.priceExitDirty = false;
+    if (token) localStorage.setItem("42spaceAdminToken", token);
+    renderPriceExitConfig();
+    syncAdminTokenField();
+    showToast(data.message || "价格配置已应用");
+    await loadOverview({ force: true });
+  } catch (error) {
+    showToast(error.message || "价格配置保存失败");
+  } finally {
+    els.savePriceExitConfig.disabled = false;
+  }
+}
+
 function syncAdminTokenField() {
   const field = els.configAdminToken?.closest(".field");
-  if (!field) return;
-  field.hidden = !state.runtimeWriteProtected;
+  if (field) field.hidden = !state.runtimeWriteProtected;
+  if (els.priceExitAdminField) els.priceExitAdminField.hidden = !state.priceExitWriteProtected;
+  const token = localStorage.getItem("42spaceAdminToken") ?? "";
+  if (els.configAdminToken && !els.configAdminToken.value) els.configAdminToken.value = token;
+  if (els.priceExitAdminToken && !els.priceExitAdminToken.value) els.priceExitAdminToken.value = token;
 }
 
 async function saveRuntimeConfig(event) {
@@ -1305,6 +2120,7 @@ function setRoute(route, { replace = false } = {}) {
   els.viewKicker.textContent = copy.kicker;
   els.viewTitle.textContent = copy.title;
   els.viewLead.textContent = copy.lead;
+  if (nextRoute === "watchlist") loadWatchedAddressActivity();
 }
 
 function routeFromHash() {
@@ -1401,6 +2217,34 @@ function formatTime(value) {
     minute: "2-digit",
     second: "2-digit"
   }).format(new Date(value));
+}
+
+function formatMoneyShort(value) {
+  const number = Number(value ?? 0);
+  if (!Number.isFinite(number)) return "0";
+  const sign = number > 0 ? "+" : "";
+  const abs = Math.abs(number);
+  if (abs >= 1000) return `${sign}${(number / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  if (abs >= 10) return `${sign}${number.toFixed(1).replace(/\.0$/, "")}`;
+  return `${sign}${number.toFixed(2).replace(/\.?0+$/, "")}`;
+}
+
+function formatInteger(value, options = {}) {
+  const number = Number(value ?? 0);
+  if (!Number.isFinite(number)) return "0";
+  const rounded = Math.round(number);
+  const positiveSign = options.positiveSign ?? true;
+  return `${positiveSign && rounded > 0 ? "+" : ""}${rounded}`;
+}
+
+function shortAddressText(value) {
+  const text = String(value ?? "");
+  return text.length > 12 ? `${text.slice(0, 6)}...${text.slice(-4)}` : text;
+}
+
+function shortHashText(value) {
+  const text = String(value ?? "");
+  return text.length > 18 ? `${text.slice(0, 10)}...${text.slice(-8)}` : text;
 }
 
 function clampPercent(value) {

@@ -10,6 +10,7 @@ import {
 import { bsc } from "viem/chains";
 
 import { appendJsonl, readConfig } from "../src/config.js";
+import { readJsonlTail } from "../src/jsonl-tail.js";
 import {
   appendGasLedgerEntries,
   bnbUsdtPriceForBlock,
@@ -29,6 +30,9 @@ const DEFAULT_THRESHOLD_USDT = 200;
 const DEFAULT_POLL_MS = 1000;
 const DEFAULT_BLOCK_LOOKBACK = 0;
 const DEFAULT_SELL_PERCENT = 100;
+const DEFAULT_RPC_STATS_MS = 60000;
+const DEFAULT_FEED_POLL_MS = 100;
+const DEFAULT_FEED_FILE = "data/shared-rpc-observer/feed.jsonl";
 const DEFAULT_STATE_FILE = "data/orderflow-trigger-sell-state.json";
 const DEFAULT_LOG_FILE = "output/orderflow-trigger-sell.jsonl";
 const MARKET_TRADE_TOPIC = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
@@ -54,8 +58,40 @@ async function main() {
   const pollMs = positiveInteger(args.pollMs ?? process.env.ORDERFLOW_TRIGGER_POLL_MS, DEFAULT_POLL_MS);
   const lookbackBlocks = nonNegativeInteger(args.lookbackBlocks ?? process.env.ORDERFLOW_TRIGGER_LOOKBACK_BLOCKS, DEFAULT_BLOCK_LOOKBACK);
   const maxRangeBlocks = positiveInteger(args.maxRangeBlocks ?? process.env.ORDERFLOW_TRIGGER_MAX_RANGE_BLOCKS, 1000);
-  const watchedTokenIds = csvSet(args.tokenIds ?? process.env.ORDERFLOW_TRIGGER_TOKEN_IDS);
-  if (watchedTokenIds.size === 0) throw new Error("ORDERFLOW_TRIGGER_TOKEN_IDS or --token-ids is required");
+  const rpcStatsMs = nonNegativeInteger(
+    args.rpcStatsMs ?? process.env.ORDERFLOW_TRIGGER_RPC_STATS_MS,
+    DEFAULT_RPC_STATS_MS
+  );
+  const discoverySource = String(
+    args.source ?? process.env.ORDERFLOW_TRIGGER_SOURCE ?? "rpc"
+  ).trim().toLowerCase();
+  if (!["rpc", "feed"].includes(discoverySource)) {
+    throw new Error("ORDERFLOW_TRIGGER_SOURCE must be rpc or feed");
+  }
+  const feedFile = path.resolve(
+    args.feedFile ?? process.env.ORDERFLOW_TRIGGER_FEED_FILE ?? path.join(appDir, DEFAULT_FEED_FILE)
+  );
+  const feedPollMs = positiveInteger(
+    args.feedPollMs ?? process.env.ORDERFLOW_TRIGGER_FEED_POLL_MS,
+    DEFAULT_FEED_POLL_MS
+  );
+  const feedFromStart = boolFlag(
+    args.feedFromStart ?? process.env.ORDERFLOW_TRIGGER_FEED_FROM_START,
+    false
+  );
+  const configuredWatchedTokenIds = csvSet(args.tokenIds ?? process.env.ORDERFLOW_TRIGGER_TOKEN_IDS);
+  const watchedTokenIds = new Set(configuredWatchedTokenIds);
+  const watchCurrentPositions = boolFlag(
+    args.watchCurrentPositions ?? process.env.ORDERFLOW_TRIGGER_WATCH_CURRENT_POSITIONS,
+    false
+  );
+  if (watchedTokenIds.size === 0 && !watchCurrentPositions) {
+    throw new Error("ORDERFLOW_TRIGGER_TOKEN_IDS or --token-ids is required unless current-position watch is enabled");
+  }
+  const watchCurrentPositionsRefreshMs = positiveInteger(
+    args.watchCurrentPositionsRefreshMs ?? process.env.ORDERFLOW_TRIGGER_WATCH_CURRENT_POSITIONS_REFRESH_MS,
+    30000
+  );
   const sellMode = String(args.sellMode ?? process.env.ORDERFLOW_TRIGGER_SELL_MODE ?? "matched_outcomes").trim();
   if (!["matched_outcomes", "all_watched"].includes(sellMode)) {
     throw new Error("ORDERFLOW_TRIGGER_SELL_MODE must be matched_outcomes or all_watched");
@@ -83,7 +119,30 @@ async function main() {
   state.soldTokenIds ??= {};
 
   const rpcUrl = args.rpcUrl ?? process.env.ORDERFLOW_TRIGGER_RPC_URL ?? cfg.rpcUrl;
-  const publicClient = createPublicClient({ chain: bsc, transport: http(rpcUrl) });
+  const rpcStats = createRpcStats();
+  const publicClient = createPublicClient({
+    chain: bsc,
+    transport: instrumentTransport(http(rpcUrl), rpcStats)
+  });
+  const baseCtx = {
+    cfg,
+    publicClient,
+    state,
+    stateFile,
+    logFile,
+    priceCache,
+    market,
+    walletAddress,
+    configuredWatchedTokenIds,
+    watchedTokenIds,
+    watchCurrentPositions,
+    watchCurrentPositionsRefreshMs,
+    discoverySource,
+    feedFile,
+    expandTradeRowsFromReceipt: discoverySource === "feed",
+    lastPositionWatchRefreshAt: 0
+  };
+  await refreshWatchedTokenIdsFromPositions(baseCtx, true);
   if (execute) {
     const approval = await ensureMarketOperatorApproval(cfg, market);
     await appendOrderflowGasLedger({
@@ -106,67 +165,76 @@ async function main() {
     });
   }
 
+  const previousDiscoverySource = state.discoverySource;
   let lastProcessedBlock = state.lastProcessedBlock !== undefined
     ? BigInt(state.lastProcessedBlock)
-    : await initialLastProcessedBlock(publicClient, lookbackBlocks);
+    : 0n;
+  if (discoverySource === "rpc" && state.lastProcessedBlock === undefined) {
+    lastProcessedBlock = await initialLastProcessedBlock(publicClient, lookbackBlocks);
+  }
+  if (discoverySource === "feed") {
+    if (!feedFromStart) armFeedCutover(state, { previousDiscoverySource, lastProcessedBlock });
+    const initialized = readJsonlTail(feedFile, state.feedCursor, {
+      startAtEnd: !feedFromStart && state.feedCutoverAfterBlock === undefined
+    });
+    if (initialized.missing) throw new Error(`Orderflow observer feed is missing: ${feedFile}`);
+    state.feedCursor = initialized.cursor;
+  }
+  state.discoverySource = discoverySource;
   state.lastProcessedBlock = lastProcessedBlock.toString();
   saveState(stateFile, state);
 
   appendJsonl(logFile, {
     level: "orderflow-trigger-sell-started",
     mode: execute ? "execute" : "dry-run",
+    discoverySource,
     profileEnvFile,
     market,
     wallet: walletAddress,
+    configuredWatchedTokenIds: [...configuredWatchedTokenIds],
     watchedTokenIds: [...watchedTokenIds],
+    watchCurrentPositions,
+    watchCurrentPositionsRefreshMs,
     thresholdUsdt,
     sellMode,
     sellPercent,
     pollMs,
+    feedPollMs: discoverySource === "feed" ? feedPollMs : null,
+    feedFile: discoverySource === "feed" ? feedFile : null,
+    feedOffset: discoverySource === "feed" ? state.feedCursor?.offset ?? null : null,
+    feedCutoverAfterBlock: discoverySource === "feed" ? state.feedCutoverAfterBlock ?? null : null,
+    rpcStatsMs,
     lookbackBlocks,
     lastProcessedBlock: lastProcessedBlock.toString(),
     sellGasPriceGwei: cfg.autoSellGasPriceGwei || cfg.gasPriceGwei,
     at: new Date().toISOString()
   });
 
+  const loopCtx = {
+    ...baseCtx,
+    thresholdUsdt,
+    sellMode,
+    sellPercent,
+    maxRangeBlocks
+  };
   while (true) {
     try {
-      await retryFailedTransactions({
-        cfg,
-        publicClient,
-        state,
-        stateFile,
-        logFile,
-        priceCache,
-        market,
-        walletAddress,
-        watchedTokenIds,
-        thresholdUsdt,
-        sellMode,
-        sellPercent
-      });
-      const latestBlock = await publicClient.getBlockNumber();
-      if (latestBlock > lastProcessedBlock) {
-        const result = await processBlockRange({
-          cfg,
-          publicClient,
-          state,
-          stateFile,
-          logFile,
-          priceCache,
-          market,
-          walletAddress,
-          watchedTokenIds,
-          thresholdUsdt,
-          sellMode,
-          sellPercent,
-          fromBlock: lastProcessedBlock + 1n,
-          toBlock: latestBlock,
-          maxRangeBlocks
-        });
-        lastProcessedBlock = result.lastProcessedBlock;
-        state.lastProcessedBlock = lastProcessedBlock.toString();
-        saveState(stateFile, state);
+      await refreshWatchedTokenIdsFromPositions(baseCtx);
+      await retryFailedTransactions(loopCtx);
+      if (discoverySource === "feed") {
+        await processObserverFeed(loopCtx);
+      } else {
+        const latestBlock = await publicClient.getBlockNumber();
+        if (latestBlock > lastProcessedBlock) {
+          const result = await processBlockRange({
+            ...loopCtx,
+            fromBlock: lastProcessedBlock + 1n,
+            toBlock: latestBlock
+          });
+          lastProcessedBlock = result.lastProcessedBlock;
+          state.lastProcessedBlock = lastProcessedBlock.toString();
+          saveState(stateFile, state);
+        }
       }
     } catch (error) {
       appendJsonl(logFile, {
@@ -176,7 +244,8 @@ async function main() {
         at: new Date().toISOString()
       });
     }
-    await sleep(pollMs);
+    maybeFlushRpcStats({ rpcStats, rpcStatsMs, logFile, market });
+    await sleep(discoverySource === "feed" ? feedPollMs : pollMs);
   }
 }
 
@@ -188,32 +257,157 @@ async function processBlockRange(ctx) {
     const logs = await getMarketTradeLogs(ctx.publicClient, ctx.market, cursor, chunkTo);
     const trades = logs.map((log) => parseMarketTradeLog(log, ctx.market)).filter(Boolean);
     const groups = groupByTxHash(trades);
-    for (const [txHash, rows] of groups.entries()) {
-      if (isHandledTx(ctx.state, txHash)) continue;
-      markTxProcessing(ctx, txHash, rows);
-      try {
-        const result = await handleTradeTx(ctx, txHash, rows);
-        markTxHandled(ctx, txHash, result);
-      } catch (error) {
-        recordFailedTx(ctx, txHash, rows, error);
-        appendJsonl(ctx.logFile, {
-          level: "orderflow-trigger-sell-tx-error",
-          market: ctx.market,
-          txHash,
-          message: error?.message ?? String(error),
-          at: new Date().toISOString()
-        });
-      }
-      pruneTxState(ctx.state);
-      saveState(ctx.stateFile, ctx.state);
-    }
+    await processTradeGroups(ctx, groups);
     lastProcessedBlock = chunkTo;
     cursor = chunkTo + 1n;
   }
   return { lastProcessedBlock };
 }
 
+async function processObserverFeed(ctx) {
+  const tail = readJsonlTail(ctx.feedFile, ctx.state.feedCursor, { startAtEnd: true });
+  if (tail.missing) throw new Error(`Orderflow observer feed is missing: ${ctx.feedFile}`);
+  if (tail.bytesRead === 0 && !tail.rotated && !tail.truncated && tail.parseErrors === 0) {
+    return { rowsRead: 0, tradeRows: 0, bytesRead: 0, feedOffset: tail.cursor?.offset ?? null };
+  }
+  const cutoverAfterBlock = optionalBlockNumber(ctx.state.feedCutoverAfterBlock);
+  const marketRows = tail.rows
+    .filter((row) => row.level === "shared-rpc-observer-market-trade")
+    .filter((row) => normalizeAddress(row.market) === normalizeAddress(ctx.market));
+  const trades = marketRows
+    .filter((row) => observerFeedRowAfterBlock(row, cutoverAfterBlock))
+    .map(tradeRowFromObserverFeed)
+    .filter(Boolean);
+  await processTradeGroups(ctx, groupByTxHash(trades));
+  const observedBlock = maxObservedBlock(tail.rows);
+  if (observedBlock !== null && observedBlock > BigInt(ctx.state.lastProcessedBlock ?? 0)) {
+    ctx.state.lastProcessedBlock = observedBlock.toString();
+  }
+  ctx.state.feedCursor = tail.cursor;
+  ctx.state.feedLastReadAt = new Date().toISOString();
+  if (cutoverAfterBlock !== null) {
+    delete ctx.state.feedCutoverAfterBlock;
+    appendJsonl(ctx.logFile, {
+      level: "orderflow-trigger-feed-cutover-complete",
+      market: ctx.market,
+      replayAfterBlock: cutoverAfterBlock.toString(),
+      rowsRead: tail.rows.length,
+      marketRows: marketRows.length,
+      tradeRows: trades.length,
+      skippedPreCutoverMarketRows: marketRows.length - trades.length,
+      feedOffset: tail.cursor?.offset ?? null,
+      at: new Date().toISOString()
+    });
+  }
+  if (tail.rotated || tail.truncated || tail.parseErrors > 0) {
+    appendJsonl(ctx.logFile, {
+      level: "orderflow-trigger-feed-recovered",
+      market: ctx.market,
+      rotated: tail.rotated,
+      truncated: tail.truncated,
+      parseErrors: tail.parseErrors,
+      at: new Date().toISOString()
+    });
+  }
+  saveState(ctx.stateFile, ctx.state);
+  return {
+    rowsRead: tail.rows.length,
+    tradeRows: trades.length,
+    bytesRead: tail.bytesRead,
+    feedOffset: tail.cursor?.offset ?? null
+  };
+}
+
+function armFeedCutover(state, { previousDiscoverySource, lastProcessedBlock }) {
+  if (state.feedCursor?.initialized || state.feedCutoverAfterBlock !== undefined) return false;
+  if (previousDiscoverySource === "feed" || state.lastProcessedBlock === undefined) return false;
+  const processedBlock = BigInt(lastProcessedBlock);
+  state.feedCutoverAfterBlock = (processedBlock > 0n ? processedBlock - 1n : 0n).toString();
+  return true;
+}
+
+function optionalBlockNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function observerFeedRowAfterBlock(row, blockNumber) {
+  if (blockNumber === null) return true;
+  try {
+    return BigInt(row?.blockNumber) > blockNumber;
+  } catch {
+    return false;
+  }
+}
+
+function maxObservedBlock(rows) {
+  let maximum = null;
+  for (const row of rows) {
+    if (row?.blockNumber === undefined || row.blockNumber === null) continue;
+    try {
+      const block = BigInt(row.blockNumber);
+      if (maximum === null || block > maximum) maximum = block;
+    } catch {
+      // Ignore unrelated rows with malformed block metadata.
+    }
+  }
+  return maximum;
+}
+
+async function processTradeGroups(ctx, groups) {
+  for (const [txHash, rows] of groups.entries()) {
+    if (isHandledTx(ctx.state, txHash)) continue;
+    markTxProcessing(ctx, txHash, rows);
+    try {
+      const result = await handleTradeTx(ctx, txHash, rows);
+      markTxHandled(ctx, txHash, result);
+    } catch (error) {
+      recordFailedTx(ctx, txHash, rows, error);
+      appendJsonl(ctx.logFile, {
+        level: "orderflow-trigger-sell-tx-error",
+        market: ctx.market,
+        txHash,
+        message: error?.message ?? String(error),
+        at: new Date().toISOString()
+      });
+    }
+    pruneTxState(ctx.state);
+    saveState(ctx.stateFile, ctx.state);
+  }
+}
+
+function tradeRowFromObserverFeed(row) {
+  try {
+    if (!row?.txHash || row.tokenId === undefined || row.netCollateral === undefined || row.size === undefined) {
+      return null;
+    }
+    return {
+      txHash: row.txHash,
+      blockNumber: Number(row.blockNumber),
+      transactionIndex: Number(row.transactionIndex),
+      logIndex: Number(row.logIndex),
+      operator: row.operator ?? null,
+      user: row.user ?? null,
+      tokenId: String(row.tokenId),
+      netCollateralSigned: BigInt(row.netCollateral),
+      sizeSigned: BigInt(row.size)
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function handleTradeTx(ctx, txHash, rows) {
+  let receipt = null;
+  if (ctx.expandTradeRowsFromReceipt) {
+    receipt = await ctx.publicClient.getTransactionReceipt({ hash: txHash });
+    const receiptRows = marketTradeRowsFromReceipt(receipt, ctx.market);
+    if (receiptRows.length > 0) rows = receiptRows;
+  }
   const watchedBuys = rows
     .filter((row) => ctx.watchedTokenIds.has(String(row.tokenId)))
     .filter((row) => row.netCollateralSigned > 0n);
@@ -224,7 +418,7 @@ async function handleTradeTx(ctx, txHash, rows) {
 
   const buyCostUsdt = sumBigInt(watchedBuys.map((row) => row.netCollateralSigned));
   const buyCost = numberFromUnits(buyCostUsdt, 18);
-  const receipt = await ctx.publicClient.getTransactionReceipt({ hash: txHash });
+  receipt ??= await ctx.publicClient.getTransactionReceipt({ hash: txHash });
   const transferCost = transferCostsFromUserToRouter(receipt.logs, user);
   const transferCostUsdt = numberFromUnits(sumBigInt(transferCost), 18);
   const triggerCostUsdt = buyCost > 0 ? buyCost : transferCostUsdt;
@@ -269,6 +463,49 @@ async function handleTradeTx(ctx, txHash, rows) {
   };
 }
 
+async function refreshWatchedTokenIdsFromPositions(ctx, force = false) {
+  if (!ctx.watchCurrentPositions) return { enabled: false };
+  const now = Date.now();
+  if (!force && now - Number(ctx.lastPositionWatchRefreshAt ?? 0) < ctx.watchCurrentPositionsRefreshMs) {
+    return { enabled: true, refreshed: false };
+  }
+  ctx.lastPositionWatchRefreshAt = now;
+  try {
+    const positions = await fetchOpenPositions(ctx.cfg, {
+      user: ctx.walletAddress,
+      market: ctx.market,
+      limit: 100
+    });
+    const addedTokenIds = mergeCurrentPositionTokenIds(ctx.watchedTokenIds, positions);
+    const currentPositionTokenIds = currentPositionTokenIdsFromPositions(positions);
+    ctx.state.configuredWatchedTokenIds = [...ctx.configuredWatchedTokenIds].map(String);
+    ctx.state.dynamicWatchedTokenIds = currentPositionTokenIds;
+    ctx.state.watchedTokenIds = [...ctx.watchedTokenIds].map(String);
+    ctx.state.lastPositionWatchRefreshAt = new Date(now).toISOString();
+    saveState(ctx.stateFile, ctx.state);
+    if (force || addedTokenIds.length > 0) {
+      appendJsonl(ctx.logFile, {
+        level: "orderflow-trigger-sell-watch-refresh",
+        market: ctx.market,
+        configuredWatchedTokenIds: ctx.state.configuredWatchedTokenIds,
+        dynamicWatchedTokenIds: currentPositionTokenIds,
+        addedTokenIds,
+        watchedTokenIds: ctx.state.watchedTokenIds,
+        at: new Date(now).toISOString()
+      });
+    }
+    return { enabled: true, refreshed: true, addedTokenIds };
+  } catch (error) {
+    appendJsonl(ctx.logFile, {
+      level: "orderflow-trigger-sell-watch-refresh-error",
+      market: ctx.market,
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    });
+    return { enabled: true, refreshed: false, error: errorMessage(error) };
+  }
+}
+
 async function executeTriggeredSell(ctx, trigger) {
   const freshPositions = await fetchOpenPositions(ctx.cfg, {
     user: ctx.walletAddress,
@@ -276,29 +513,50 @@ async function executeTriggeredSell(ctx, trigger) {
     limit: 100
   });
   const sellSet = new Set(trigger.sellTokenIds.map(String));
-  const selected = freshPositions
+  const candidates = freshPositions
     .filter((position) => sellSet.has(String(position.tokenId)))
-    .filter((position) => Number(position.size ?? 0) > 0)
-    .filter((position) => !ctx.state.soldTokenIds[String(position.tokenId)]);
+    .filter((position) => Number(position.size ?? 0) > 0);
+
+  const selected = [];
+  const plans = [];
+  const skipped = [];
+  for (const position of candidates) {
+    try {
+      const plan = await buildDirectSellPlan(ctx.publicClient, {
+        market: position.marketAddress,
+        tokenId: position.tokenId,
+        owner: ctx.walletAddress,
+        percent: ctx.sellPercent
+      });
+      selected.push(position);
+      plans.push(plan);
+    } catch (error) {
+      if (isNoSellableBalanceError(error)) {
+        skipped.push({
+          tokenId: String(position.tokenId),
+          outcome: position.outcome?.name ?? null,
+          reason: errorMessage(error)
+        });
+        continue;
+      }
+      throw error;
+    }
+  }
 
   if (selected.length === 0) {
     appendJsonl(ctx.logFile, {
       level: "orderflow-trigger-sell-no-position",
       market: ctx.market,
-      trigger,
+      trigger: summarizeOrderflowTrigger(trigger),
+      candidates: candidates.map((position) => ({
+        tokenId: String(position.tokenId),
+        outcome: position.outcome?.name ?? null,
+        size: String(position.size ?? "")
+      })),
+      skipped,
       at: new Date().toISOString()
     });
     return { status: "no_position", positionCount: 0 };
-  }
-
-  const plans = [];
-  for (const position of selected) {
-    plans.push(await buildDirectSellPlan(ctx.publicClient, {
-      market: position.marketAddress,
-      tokenId: position.tokenId,
-      owner: ctx.walletAddress,
-      percent: ctx.sellPercent
-    }));
   }
 
   const dryRun = ctx.cfg.dryRun || !ctx.cfg.execute;
@@ -324,10 +582,13 @@ async function executeTriggeredSell(ctx, trigger) {
       });
     }
     for (const position of selected) {
+      const index = selected.indexOf(position);
       ctx.state.soldTokenIds[String(position.tokenId)] = {
         soldAt: new Date().toISOString(),
         triggerTxHash: trigger.txHash,
-        outcome: position.outcome?.name ?? null
+        outcome: position.outcome?.name ?? null,
+        soldPositionSize: String(position.size ?? ""),
+        sellAmountOt: plans[index] ? formatUnits(plans[index].amount, 18) : null
       };
     }
     saveState(ctx.stateFile, ctx.state);
@@ -360,6 +621,36 @@ async function executeTriggeredSell(ctx, trigger) {
     positionCount: selected.length,
     txHash: execution?.txHash ?? null
   };
+}
+
+function currentPositionTokenIdsFromPositions(positions = []) {
+  return [...new Set(
+    positions
+      .filter((position) => Number(position?.size ?? 0) > 0)
+      .map((position) => String(position.tokenId))
+  )].sort(compareNumericString);
+}
+
+function mergeCurrentPositionTokenIds(watchedTokenIds, positions = []) {
+  const added = [];
+  for (const tokenId of currentPositionTokenIdsFromPositions(positions)) {
+    if (watchedTokenIds.has(tokenId)) continue;
+    watchedTokenIds.add(tokenId);
+    added.push(tokenId);
+  }
+  return added;
+}
+
+function compareNumericString(a, b) {
+  const aa = BigInt(a);
+  const bb = BigInt(b);
+  return aa < bb ? -1 : aa > bb ? 1 : 0;
+}
+
+function isNoSellableBalanceError(error) {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("sell amount is zero") ||
+    (message.includes("outcome balance") && message.includes("is below sell amount"));
 }
 
 function orderflowSellAllocations(positions = [], plans = []) {
@@ -547,6 +838,117 @@ function retryDelayForAttempts(attempts) {
   return Math.min(60000, 1000 * Math.max(1, Math.min(60, attempts)));
 }
 
+function summarizeOrderflowTrigger(trigger = {}) {
+  const receipt = trigger.receipt ?? {};
+  return {
+    txHash: trigger.txHash ?? null,
+    user: trigger.user ?? null,
+    triggerCostUsdt: round(trigger.triggerCostUsdt),
+    matchedTokenIds: (trigger.matchedTokenIds ?? []).map(String),
+    sellTokenIds: (trigger.sellTokenIds ?? []).map(String),
+    blockNumber: receipt.blockNumber !== undefined && receipt.blockNumber !== null
+      ? String(receipt.blockNumber)
+      : null,
+    transactionIndex: receipt.transactionIndex !== undefined && receipt.transactionIndex !== null
+      ? Number(receipt.transactionIndex)
+      : null,
+    receiptStatus: receipt.status !== undefined && receipt.status !== null
+      ? String(receipt.status)
+      : null
+  };
+}
+
+function instrumentTransport(baseTransport, stats) {
+  return (options) => {
+    const transport = baseTransport(options);
+    return {
+      ...transport,
+      request: async (requestArgs) => {
+        const startedAt = Date.now();
+        let succeeded = false;
+        try {
+          const result = await transport.request(requestArgs);
+          succeeded = true;
+          return result;
+        } finally {
+          try {
+            recordRpcStat(stats, requestArgs?.method, Date.now() - startedAt, succeeded);
+          } catch {
+            // Metrics must never affect observer or sell execution behavior.
+          }
+        }
+      }
+    };
+  };
+}
+
+function createRpcStats(startedAt = Date.now()) {
+  return {
+    startedAt,
+    totalRequests: 0,
+    totalErrors: 0,
+    methods: new Map()
+  };
+}
+
+function recordRpcStat(stats, method, latencyMs, succeeded) {
+  const name = String(method ?? "unknown");
+  const row = stats.methods.get(name) ?? {
+    requests: 0,
+    errors: 0,
+    totalLatencyMs: 0,
+    maxLatencyMs: 0
+  };
+  const safeLatencyMs = Math.max(0, Number(latencyMs) || 0);
+  row.requests += 1;
+  row.errors += succeeded ? 0 : 1;
+  row.totalLatencyMs += safeLatencyMs;
+  row.maxLatencyMs = Math.max(row.maxLatencyMs, safeLatencyMs);
+  stats.methods.set(name, row);
+  stats.totalRequests += 1;
+  stats.totalErrors += succeeded ? 0 : 1;
+}
+
+function consumeRpcStats(stats, endedAt = Date.now()) {
+  const methods = {};
+  for (const [method, row] of [...stats.methods.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    methods[method] = {
+      requests: row.requests,
+      errors: row.errors,
+      avgLatencyMs: row.requests > 0 ? Math.round(row.totalLatencyMs / row.requests) : 0,
+      maxLatencyMs: Math.round(row.maxLatencyMs)
+    };
+  }
+  const snapshot = {
+    windowStartedAt: new Date(stats.startedAt).toISOString(),
+    windowEndedAt: new Date(endedAt).toISOString(),
+    windowMs: Math.max(0, endedAt - stats.startedAt),
+    totalRequests: stats.totalRequests,
+    totalErrors: stats.totalErrors,
+    methods
+  };
+  stats.startedAt = endedAt;
+  stats.totalRequests = 0;
+  stats.totalErrors = 0;
+  stats.methods.clear();
+  return snapshot;
+}
+
+function maybeFlushRpcStats({ rpcStats, rpcStatsMs, logFile, market }, now = Date.now()) {
+  if (rpcStatsMs <= 0 || now - rpcStats.startedAt < rpcStatsMs) return false;
+  try {
+    appendJsonl(logFile, {
+      level: "orderflow-trigger-rpc-stats",
+      market,
+      ...consumeRpcStats(rpcStats, now),
+      at: new Date(now).toISOString()
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function serializeTradeRows(rows) {
   return rows.map((row) => ({
     ...row,
@@ -597,6 +999,18 @@ function parseMarketTradeLog(log, market) {
   };
 }
 
+function marketTradeRowsFromReceipt(receipt, market) {
+  return (receipt?.logs ?? [])
+    .map((log) => parseMarketTradeLog(log, market))
+    .filter(Boolean)
+    .map((row) => ({
+      ...row,
+      txHash: row.txHash ?? receipt.transactionHash,
+      blockNumber: Number(receipt.blockNumber ?? row.blockNumber),
+      transactionIndex: Number(receipt.transactionIndex ?? row.transactionIndex)
+    }));
+}
+
 function transferCostsFromUserToRouter(logs, user) {
   if (!user) return [];
   const normalizedUser = user.toLowerCase();
@@ -641,6 +1055,94 @@ function runSelfTest() {
   markTxHandled(testCtx, testTx, { status: "retry_success" });
   assert(isHandledTx(testCtx.state, testTx), "handled tx must be marked handled only after success");
   assert(!testCtx.state.failedTxs[testTx], "handled tx must be removed from failed retry queue");
+  const watched = new Set(["2"]);
+  const added = mergeCurrentPositionTokenIds(watched, [
+    { tokenId: "2", size: 10 },
+    { tokenId: "134217728", size: 5 },
+    { tokenId: "8388608", size: 0 }
+  ]);
+  assert(added.length === 1 && added[0] === "134217728", "current position token ids should merge into watched set");
+  assert(watched.has("134217728"), "manual current position token id should become watched");
+  assert(isNoSellableBalanceError(new Error("Sell amount is zero")), "zero on-chain balance should be non-fatal");
+  const triggerSummary = summarizeOrderflowTrigger({
+    txHash: testTx,
+    user: testRows[0].user,
+    triggerCostUsdt: 250,
+    matchedTokenIds: [32768n],
+    sellTokenIds: [32768n],
+    receipt: {
+      blockNumber: 123n,
+      transactionIndex: 4n,
+      cumulativeGasUsed: 567n,
+      status: "success"
+    }
+  });
+  assert(JSON.parse(JSON.stringify(triggerSummary)).blockNumber === "123", "trigger summary must be JSON serializable");
+  const feedRow = tradeRowFromObserverFeed({
+    txHash: testTx,
+    blockNumber: "123",
+    transactionIndex: 4,
+    logIndex: 5,
+    operator: testRows[0].operator,
+    user: testRows[0].user,
+    tokenId: "32768",
+    netCollateral: "10",
+    size: "20"
+  });
+  assert(feedRow?.netCollateralSigned === 10n && feedRow?.sizeSigned === 20n, "observer feed trade must restore signed bigint fields");
+  const cutoverState = { discoverySource: "rpc", lastProcessedBlock: "123" };
+  assert(
+    armFeedCutover(cutoverState, { previousDiscoverySource: "rpc", lastProcessedBlock: 123n }),
+    "RPC-to-feed cutover must arm a replay boundary"
+  );
+  assert(cutoverState.feedCutoverAfterBlock === "122", "feed cutover must overlap the last RPC block by one block");
+  assert(
+    !observerFeedRowAfterBlock({ blockNumber: "122" }, optionalBlockNumber(cutoverState.feedCutoverAfterBlock)) &&
+      observerFeedRowAfterBlock({ blockNumber: "123" }, optionalBlockNumber(cutoverState.feedCutoverAfterBlock)) &&
+      observerFeedRowAfterBlock({ blockNumber: "124" }, optionalBlockNumber(cutoverState.feedCutoverAfterBlock)),
+    "feed cutover must skip older backlog while retaining the overlap block and restart gap"
+  );
+  assert(
+    !armFeedCutover(cutoverState, { previousDiscoverySource: "feed", lastProcessedBlock: 123n }),
+    "an armed feed cutover must remain stable across restart"
+  );
+  assert(
+    !armFeedCutover({ discoverySource: "feed", lastProcessedBlock: "123" }, {
+      previousDiscoverySource: "feed",
+      lastProcessedBlock: 123n
+    }),
+    "an established feed reader must not replay from the beginning"
+  );
+  const word = (value) => BigInt(value).toString(16).padStart(64, "0");
+  const topicForAddress = (address) => `0x${"0".repeat(24)}${address.toLowerCase().slice(2)}`;
+  const testMarket = "0x94FA631F5A8d830919db6d5B1571e438f0222Fb0";
+  const receiptRows = marketTradeRowsFromReceipt({
+    transactionHash: testTx,
+    blockNumber: 123n,
+    transactionIndex: 4,
+    logs: [{
+      address: testMarket,
+      transactionHash: testTx,
+      topics: [
+        MARKET_TRADE_TOPIC,
+        topicForAddress(testRows[0].operator),
+        topicForAddress(testRows[0].user),
+        `0x${word(32768n)}`
+      ],
+      data: `0x${word(10n)}${word(20n)}`,
+      logIndex: 5
+    }]
+  }, testMarket);
+  assert(receiptRows.length === 1 && receiptRows[0].tokenId === "32768", "feed receipt expansion must recover every market trade row");
+  assert(receiptRows[0].blockNumber === 123 && receiptRows[0].transactionIndex === 4, "feed receipt expansion must retain receipt ordering");
+  const rpcStats = createRpcStats(1000);
+  recordRpcStat(rpcStats, "eth_blockNumber", 10, true);
+  recordRpcStat(rpcStats, "eth_getLogs", 30, false);
+  const rpcSnapshot = consumeRpcStats(rpcStats, 2000);
+  assert(rpcSnapshot.totalRequests === 2, "RPC stats must count requests");
+  assert(rpcSnapshot.totalErrors === 1, "RPC stats must count errors");
+  assert(rpcSnapshot.methods.eth_getLogs.maxLatencyMs === 30, "RPC stats must retain method latency");
+  assert(rpcStats.totalRequests === 0 && rpcStats.methods.size === 0, "consumed RPC stats must reset the window");
   console.log(JSON.stringify({ level: "orderflow-trigger-sell-self-test", status: "ok" }));
 }
 
@@ -748,6 +1250,15 @@ function topicAddress(topic) {
   }
 }
 
+function normalizeAddress(value) {
+  if (!value) return "";
+  try {
+    return getAddress(value).toLowerCase();
+  } catch {
+    return String(value).toLowerCase();
+  }
+}
+
 function csvSet(value) {
   return new Set(String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean));
 }
@@ -785,6 +1296,14 @@ function positiveNumber(value, fallback) {
   return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
+function boolFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const text = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(text)) return true;
+  if (["0", "false", "no", "n", "off"].includes(text)) return false;
+  return fallback;
+}
+
 function round(value) {
   return Number.isFinite(Number(value)) ? Math.round(Number(value) * 1e6) / 1e6 : null;
 }
@@ -796,6 +1315,10 @@ function requiredArg(value, name) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(error) {
+  return error?.message ?? String(error);
 }
 
 function assert(condition, message) {

@@ -61,7 +61,7 @@ export function getBaseEventMarketDecision(market, cfg) {
   if (!passesBuyQuestionAllowlist(market, cfg)) {
     return { ...base, reason: "buy-question-allowlist", reasonText: "买入题目不在白名单", tags: ["非买入题目"] };
   }
-  if (isPriceMarket(market, cfg)) {
+  if (isPriceMarket(market, cfg) && !hasLockedMemeRangeSelection(market, cfg)) {
     return { ...base, reason: "price-market", reasonText: "Price 场", tags: ["Price"] };
   }
   if (!passesCategoryAllowlist(market, cfg)) {
@@ -283,6 +283,15 @@ function getEventIntelBuyDecision(market, cfg) {
     };
   }
 
+  if (hasLockedMemeRangeSelection(market, cfg)) {
+    return {
+      eligible: true,
+      reason: "event-intel-meme-range-lock",
+      reasonText: "Meme 数值区间已在首次监控锁定",
+      tags: ["Meme 默认关注", "首次监控锁定"]
+    };
+  }
+
   const classification = classifyEventIntelMarket(market);
   if (classification.fixedTemplate || classification.priceEvent) {
     return archivedIntelBuyDecision(classification);
@@ -341,6 +350,16 @@ function getEventIntelBuyDecision(market, cfg) {
     reasonText: "Binance 关系未达到 strong",
     tags: ["非 strong", String(report.binanceRelation ?? "unknown")]
   };
+}
+
+function hasLockedMemeRangeSelection(market, cfg) {
+  const selection = market?.memeRangeSelection;
+  return Boolean(
+    cfg?.memeRangeSelectionEnabled &&
+    selection?.locked &&
+    ["fdv", "market_cap", "price"].includes(String(selection.metric ?? "")) &&
+    isMemeIntelMarket(market)
+  );
 }
 
 function archivedIntelBuyDecision(input) {

@@ -1,0 +1,33 @@
+[Unit]
+Description=42space Bot3 Spain vs Belgium orderflow-trigger sell monitor
+After=network-online.target 42space-event@42space-3.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+EnvironmentFile=-/etc/42space/profiles/42space-3-orderflow.env
+Environment=ORDERFLOW_TRIGGER_EXECUTE=1
+Environment=ORDERFLOW_TRIGGER_MARKET=0x94FA631F5A8d830919db6d5B1571e438f0222Fb0
+Environment=ORDERFLOW_TRIGGER_TOKEN_IDS=2048,1024,32
+Environment=ORDERFLOW_TRIGGER_WATCH_CURRENT_POSITIONS=1
+Environment=ORDERFLOW_TRIGGER_THRESHOLD_USDT=50
+Environment=ORDERFLOW_TRIGGER_SELL_MODE=matched_outcomes
+Environment=ORDERFLOW_TRIGGER_SELL_PERCENT=100
+Environment=ORDERFLOW_TRIGGER_POLL_MS=1000
+Environment=ORDERFLOW_TRIGGER_SOURCE=rpc
+Environment=ORDERFLOW_TRIGGER_FEED_FILE=/opt/42space/data/shared-rpc-observer/feed.jsonl
+Environment=ORDERFLOW_TRIGGER_FEED_POLL_MS=100
+Environment=ORDERFLOW_TRIGGER_FEED_FROM_START=0
+Environment=ORDERFLOW_TRIGGER_LOOKBACK_BLOCKS=0
+Environment=ORDERFLOW_TRIGGER_STATE_FILE=/opt/42space/data/42space-3/orderflow-trigger-sell-spain-belgium-state.json
+Environment=ORDERFLOW_TRIGGER_LOG_FILE=/opt/42space/data/42space-3/orderflow-trigger-sell-spain-belgium.jsonl
+ExecStart=/usr/bin/node /opt/42space/scripts/orderflow-trigger-sell.js --profile-env /etc/42space/profiles/42space-3.env
+Restart=always
+RestartSec=5
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target

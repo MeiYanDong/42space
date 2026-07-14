@@ -1,0 +1,26 @@
+[Unit]
+Description=42space address transaction watcher for 0x1Bc7dF2AA0DBE1a489A7205f2D1fF92C3d51A80b
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+EnvironmentFile=-/etc/42space/profiles/42space-orderflow.env
+Environment=ADDRESS_TX_WATCH_ADDRESS=0x1Bc7dF2AA0DBE1a489A7205f2D1fF92C3d51A80b
+Environment=ADDRESS_TX_WATCH_LABEL=0x1Bc7...A80b
+Environment=ADDRESS_TX_WATCH_COOLDOWN_MS=600000
+Environment=ADDRESS_TX_WATCH_POLL_MS=3000
+Environment=ADDRESS_TX_WATCH_LOOKBACK_BLOCKS=0
+Environment=ADDRESS_TX_WATCH_TOKEN_TRANSFERS=1
+Environment=ADDRESS_TX_WATCH_STATE_FILE=/opt/42space/data/42space/address-tx-watch-0x1bc7df-state.json
+Environment=ADDRESS_TX_WATCH_LOG_FILE=/opt/42space/data/42space/address-tx-watch-0x1bc7df.jsonl
+ExecStart=/usr/bin/node /opt/42space/scripts/address-tx-watch.js --profile-env /etc/42space/profiles/42space.env
+Restart=always
+RestartSec=5
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target

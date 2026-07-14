@@ -47,6 +47,26 @@ The Strategy page shows the active rule summary in operator terms:
 - default-follow: only Meme and Binance strong; manual follow or planned buy is required for other displayed markets
 - runtime risk controls: show buy gas and sell gas as separate fields so event-specific high buy gas does not overwrite the low-priority auto-sell gas setting
 
+### Profile-Aware Strategy
+
+The Strategy page is a live profile readback, not one shared static description. `src/dashboard-strategy.js` converts the current profile config plus worker `watchConfig` into four operator stages: market scope, default buy, execution channel, and automatic exit. The frontend must render those stages, concrete facts, planned-buy priority, discovery/notification boundaries, and preflight state without guessing from legacy fields.
+
+The production profile mapping is:
+
+- Bot1: the Bot3-like FIFA/Sports exact-score low-price win-side selector, five outcomes at `10U` each, strict dual Builder T+20 with `2.1gwei` and `0.005 BNB`, and randomized T+23-27 full exit at `0.15gwei`; planned-buy sell overrides remain authoritative for existing long-dated holdings.
+- Bot2: Meme/Binance strong scope, first-three default selection, strict dual-Builder target-second execution, and `open_timed_exit` including the fast-exit window and stop loss.
+- Bot3: FIFA/Sports exact-score low-price win-side selector, five canonical scores at the configured per-outcome stake, strict dual-Builder execution, ten-hour pre-start exit, and event-level retained-position support.
+- Bot4: daily fixed-template display/buy boundary and planned-buy-driven outcome selection. Its selection stage and upcoming-market total use resolved outcome-level amounts, including OpenRouter `Hy3 (free)=20U` plus `MiMo - V2.5=10U`. Its execution stage derives each active plan separately: OpenRouter shows strict dual Builder T+20, T+19.300 private submission, `0.5gwei`, `0.001 BNB` tip, and no public fallback; BNB/USDT shows RPC T+22 and `0.15gwei`. Readiness and first-buy evidence are visible only on Bot4.
+- Bot5: Bot2-like scope with its own selection, strict dual Builder T+20 with `1.1gwei` and `0.001 BNB`, wallet/state, T+25 exit, and stop loss; it must not inherit Bot2's displayed values.
+
+`planned-buy` remains higher priority than every profile default. This includes event-specific Price markets that the automatic strategy would otherwise leave in observation state: when the worker accepts a matching planned row, both the upcoming list and market detail must show `计划买入` / `待买`, not the underlying `Price 场` decision. The UI says which fields can be overridden but does not flatten event-specific overrides into the global profile summary. Advanced write controls stay collapsed by default. The old delay/interval/chunk inputs are visible only for `ladder` or compatible legacy modes; `open_timed_exit` and `pre_start_exit` show their actual summary and do not present `10s/10s/10%` as active policy.
+
+Production acceptance requires `/api/overview` readback for ports `4242` through `4246`, desktop and `390px` Playwright screenshots for all five profiles, zero horizontal overflow, no old `10s/10s/10%` strategy text, and no Bot4 evidence outside Bot4. Bot4 must not collapse distinct plan transports into one global label or imply that a running auto-sell monitor means stop loss is enabled. Dashboard-only releases restart dashboard services, not event workers.
+
+The Strategy page also contains a live automation band. Each event worker writes its profile-local `runtime-health.json` every 5 seconds; the dashboard reads it through `/api/automation-status` every 10 seconds without invoking chain/REST overview jobs. The endpoint validates the heartbeat Node PID against the worker's systemd cgroup, then reports the main worker, automatic buy, and automatic sell separately. Auto-sell status preserves the last successful checked-position count when a scan is intentionally skipped by buy protection, and distinguishes buy protection, transient API degradation, scan errors, and circuit-breaker pauses from a stopped service.
+
+Bot4 additionally exposes a profile-local OpenRouter outcome price-exit editor on port `4245`. It reads and atomically updates only the `bot4-openrouter-python-daily` planned-buy `autoSell.priceTargets`, validates targets against that plan's selected outcomes, shows the current 42 REST price and reached/waiting state, and restarts only the Bot4 worker after an authenticated save. The editor supports enabling/disabling targets, changing thresholds, and explicitly opting existing positions into a new rule; production must set `DASHBOARD_ADMIN_TOKEN` before enabling public writes.
+
 ### Holdings
 
 `项目持仓` is an independent page. It combines default-followed strategy matches, manually followed markets, current holdings, and a hidden-by-default history section for projects that have been fully sold. The page uses project/event rows as the primary object: the event header shows identity, follow/status, market open time, and match start time when known; the header's right side shows only project-level financial totals. Option-level rows live under expansion and carry per-option prices, chips, PnL, and sell controls.
@@ -81,6 +101,8 @@ Show:
 - Gas is computed from the profile-local Gas ledger and allocated by tx metadata to market/outcome/action. Net profit/loss is gross profit/loss minus priced Gas cost; exact BNB Gas without USDT pricing remains visible as unpriced Gas until backfilled.
 - settlement/finalise activity is treated as recovered value plus realized profit/loss, so resolved hold-to-settlement projects do not disappear as zero-PnL closed positions
 - project statistics are ordered by latest project trade time first, so recently active historical projects stay at the top
+- Bot1's `4242` dashboard also shows a Bot1-Bot5 aggregate net-PnL panel. The line is cumulative realized net PnL after priced Gas, the bars are daily net increases, and the total card separately includes current unrealized PnL.
+- Bot1's `4242` dashboard exposes fixed World Cup orderflow-trigger monitor slots for Bot1/Bot3 Runner-Up and 3rd Place. Operators can edit each slot's market address, external-buy threshold, fixed token IDs, and current-position watch flag; saving rewrites only that known systemd unit, backs it up, runs `daemon-reload`, and restarts that monitor service.
 
 ### Activity
 
@@ -135,6 +157,8 @@ Feishu alerts should fire for:
 - receipt failure
 - auto-sell failure or circuit pause
 - low funds state changes
+
+Address transaction watchers are independent ops sidecars, not trading workers. `scripts/address-tx-watch.js` can poll BSC direct transactions plus ERC20/ERC721/ERC1155 `Transfer` logs for a configured wallet, write profile-local JSON state and JSONL logs, and send a concise Feishu card with `ADDRESS_TX_WATCH_COOLDOWN_MS` suppression. Definitions and historical state remain available for `0x96FDe...3650`, `0x1Bc7...A80b`, and `0x5134...9C41`, but all three services are disabled as of 2026-07-11 at operator request. The 4242 dashboard may continue to show historical state; it must not imply that live address alerts are running while the units are inactive.
 
 Event intelligence for close-open non-template new markets writes JSONL/Markdown reports first. Bot1 keeps the existing close-open non-template alert path. Bot2, Bot3, and staged Bot5 use notification paths for all events not hidden by their enabled display-filter rules; Meme, Binance strong, FIFA/Sports exact-score, and World Cup player-performance props are focus tags, not the only notification classes. The frontend exposes `价格`, `日常固定模板`, `总进球数`, and `净胜球数` as runtime checkbox filters; `价格` now hides only BTC Price classes, so non-BTC Meme price-range events remain visible/notifiable, and unchecking all filters shows all monitored data-complete live/not-started events. Strong Binance-relevance alerts remain available through `EVENT_INTEL_NOTIFY_STRONG=1`, and all event-intelligence notifications dedupe through `EVENT_INTEL_NOTIFY_SEEN_FILE`; shared watcher fanout uses profile scopes such as `bot2-focus`, `bot3-filtered`, and `bot5-focus` so chats do not suppress one another. Bot3 shares the display/notification filters only; Bot2's Meme/Binance strong default-follow buy filter is not part of the Bot3 migration. Bot5 deliberately opts into Bot2-like buy/filter summaries through `EVENT_PROFILE_ROLE=bot2_like` while keeping its state and webhook independent.
 

@@ -15,18 +15,43 @@ const DEFAULT_SELL_GAS_GWEI = "0.15";
 const DEFAULT_AUTO_SELL_STRATEGY = "open_timed_exit";
 const DEFAULT_AUTO_SELL_OPEN_EXIT_DELAY_SECONDS = 39600;
 const DEFAULT_AUTO_SELL_OPEN_EXIT_PERCENT = 100;
+const DEFAULT_AUTO_SELL_POLL_MS = 60000;
+const DEFAULT_TIMED_BUY_EXECUTOR_ADDRESS = "0xC2B2F78C620228Ea8d1B2E155664ceBbc7212148";
 const TARGETS = [
   {
     id: "openrouter-python",
     questionPattern: "highest Python usage on OpenRouter",
     sampleQuestion: "Which AI model will have the highest Python usage on OpenRouter on June 27th?",
     titleRe: /highest\s+Python\s+usage\s+on\s+OpenRouter|AI\s*模型.*OpenRouter.*Python.*使用量.*最高/iu,
-    outcomes: ["DeepSeek V4 Flash", "Owl Alpha", "Hy3 preview"],
+    outcomes: ["Hy3 (free)", "MiMo - V2.5"],
     stakeUsdt: 30,
     stakePerOutcomeUsdt: 10,
+    stakeByOutcomeUsdt: { "Hy3 (free)": 20 },
     expectedBroadcastDelayMs: 19900,
     latestAllowedBroadcastStartDelayMs: 20000,
-    gasPriceGwei: "0.5"
+    gasPriceGwei: "0.5",
+    builderBundle: {
+      enabled: true,
+      mode: "builder_only",
+      tipBnb: "0.001",
+      timeoutMs: 700,
+      timingMode: "first_20s_block",
+      targetSecond: 20,
+      prepositionLeadMs: 700,
+      exactSecond: true,
+      noMerge: true,
+      positionFirst: true
+    },
+    autoSell: {
+      priceTargets: [
+        { outcome: "Hy3 (free)", price: 0.002 },
+        { outcome: "MiMo - V2.5", price: 0.0017 }
+      ],
+      priceHotPollMs: 1000,
+      priceHotWindowSeconds: 600,
+      priceSellPercent: 100,
+      stopLossEnabled: false
+    }
   },
   {
     id: "bnbusdt-daily-volume",
@@ -38,11 +63,15 @@ const TARGETS = [
     stakePerOutcomeUsdt: 10,
     expectedBroadcastDelayMs: 22000,
     latestAllowedBroadcastStartDelayMs: 23000,
-    gasPriceGwei: "0.15"
+    gasPriceGwei: "0.15",
+    broadcastRpcCount: 1
   }
 ];
 const TARGET_TOTAL_STAKE_USDT = TARGETS.reduce((sum, target) => sum + target.stakeUsdt, 0);
 const TARGET_MAX_MARKET_STAKE_USDT = Math.max(...TARGETS.map((target) => target.stakeUsdt));
+const TARGET_MAX_OUTCOME_STAKE_USDT = Math.max(...TARGETS.flatMap((target) => (
+  target.outcomes.map((outcome) => Number(target.stakeByOutcomeUsdt?.[outcome] ?? expectedStakePerOutcomeUsdt(target)))
+)));
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -122,18 +151,29 @@ function profileChecks(env) {
     check("profile.namedOutcomeSelection", env.EVENT_OUTCOME_SELECTION === "names", env.EVENT_OUTCOME_SELECTION ?? null),
     check("profile.plannedBuyTargets", plannedBuyFileCoversTargets(env.EVENT_PLANNED_BUYS_FILE), env.EVENT_PLANNED_BUYS_FILE ?? null),
     check("profile.stakePerOutcome", Number(env.STAKE_PER_OUTCOME_USDT) === 5, env.STAKE_PER_OUTCOME_USDT ?? null),
-    check("profile.maxStake", Number(env.MAX_STAKE_USDT) === 5, env.MAX_STAKE_USDT ?? null),
+    check("profile.maxStake", Number(env.MAX_STAKE_USDT) === TARGET_MAX_OUTCOME_STAKE_USDT, env.MAX_STAKE_USDT ?? null),
     check("profile.maxMarketStake", Number(env.MAX_MARKET_STAKE_USDT) === TARGET_MAX_MARKET_STAKE_USDT, env.MAX_MARKET_STAKE_USDT ?? null),
     check("profile.maxBatchStake", Number(env.MAX_BATCH_STAKE_USDT) === TARGET_TOTAL_STAKE_USDT, env.MAX_BATCH_STAKE_USDT ?? null),
     check("profile.broadcastDelay", Number(env.OPEN_BROADCAST_DELAY_MS) === DEFAULT_OPEN_BROADCAST_DELAY_MS, env.OPEN_BROADCAST_DELAY_MS ?? null),
     check("profile.openWindow", Number(env.EVENT_OPEN_WINDOW_SECONDS) === DEFAULT_OPEN_WINDOW_SECONDS, env.EVENT_OPEN_WINDOW_SECONDS ?? null),
     check("profile.bundleDisabled", !truthy(env.BUNDLE_DUE_MARKETS), env.BUNDLE_DUE_MARKETS ?? null),
+    check("profile.globalBuilderDisabled", !truthy(env.BUILDER_BUNDLE_ENABLED), env.BUILDER_BUNDLE_ENABLED ?? null),
+    check("profile.blockrazorEnabled", truthy(env.BLOCKRAZOR_BUILDER_ENABLED), env.BLOCKRAZOR_BUILDER_ENABLED ?? null),
+    check("profile.blockrazorAuth", Boolean(env.BLOCKRAZOR_BUILDER_AUTH_TOKEN), Boolean(env.BLOCKRAZOR_BUILDER_AUTH_TOKEN)),
+    check("profile.timedExecutorEnabled", truthy(env.BUILDER_TIMED_BUY_EXECUTOR_ENABLED), env.BUILDER_TIMED_BUY_EXECUTOR_ENABLED ?? null),
+    check("profile.timedExecutorExactSecond", truthy(env.BUILDER_TIMED_BUY_EXECUTOR_EXACT_SECOND), env.BUILDER_TIMED_BUY_EXECUTOR_EXACT_SECOND ?? null),
+    check(
+      "profile.timedExecutorAddress",
+      sameAddress(env.BUILDER_TIMED_BUY_EXECUTOR_ADDRESS, DEFAULT_TIMED_BUY_EXECUTOR_ADDRESS),
+      env.BUILDER_TIMED_BUY_EXECUTOR_ADDRESS ?? null
+    ),
     check("profile.priceGateDisabled", !truthy(env.EVENT_PRICE_GATE_ENABLED), env.EVENT_PRICE_GATE_ENABLED ?? null),
     check("profile.buyGas", sameGasPrice(env.GAS_PRICE_GWEI, DEFAULT_BUY_GAS_GWEI), env.GAS_PRICE_GWEI ?? null),
     check("profile.sellGas", sameGasPrice(env.AUTO_SELL_GAS_PRICE_GWEI, DEFAULT_SELL_GAS_GWEI), env.AUTO_SELL_GAS_PRICE_GWEI ?? null),
     check("profile.autoSellStrategy", env.AUTO_SELL_STRATEGY === DEFAULT_AUTO_SELL_STRATEGY, env.AUTO_SELL_STRATEGY ?? null),
     check("profile.openTimedExitDelay", Number(env.AUTO_SELL_OPEN_EXIT_DELAY_SECONDS) === DEFAULT_AUTO_SELL_OPEN_EXIT_DELAY_SECONDS, env.AUTO_SELL_OPEN_EXIT_DELAY_SECONDS ?? null),
     check("profile.openTimedExitPercent", Number(env.AUTO_SELL_OPEN_EXIT_PERCENT) === DEFAULT_AUTO_SELL_OPEN_EXIT_PERCENT, env.AUTO_SELL_OPEN_EXIT_PERCENT ?? null),
+    check("profile.autoSellPollMs", Number(env.AUTO_SELL_POLL_MS) === DEFAULT_AUTO_SELL_POLL_MS, env.AUTO_SELL_POLL_MS ?? null),
     check("profile.autoSellApplyAfter", Number.isFinite(Date.parse(env.AUTO_SELL_APPLY_AFTER_ISO ?? "")), env.AUTO_SELL_APPLY_AFTER_ISO ?? null),
     check("profile.noTakeProfitSteps", Number(env.AUTO_SELL_TAKE_PROFIT_STEPS ?? 0) === 0, env.AUTO_SELL_TAKE_PROFIT_STEPS ?? null),
     check("profile.noPreStartExit", Number(env.AUTO_SELL_BEFORE_MARKET_START_SECONDS ?? 0) === 0, env.AUTO_SELL_BEFORE_MARKET_START_SECONDS ?? null),
@@ -162,6 +202,14 @@ function statusChecks(status, openingIso) {
     check("status.watchBroadcastDelay", Number(status?.watchConfig?.openBroadcastDelayMs) === DEFAULT_OPEN_BROADCAST_DELAY_MS, status?.watchConfig?.openBroadcastDelayMs ?? null),
     check("status.watchOpenWindow", Number(status?.watchConfig?.eventOpenWindowSeconds) === DEFAULT_OPEN_WINDOW_SECONDS, status?.watchConfig?.eventOpenWindowSeconds ?? null),
     check("status.watchBundleDisabled", status?.watchConfig?.bundleDueMarkets === false, status?.watchConfig?.bundleDueMarkets ?? null),
+    check("status.watchGlobalBuilderDisabled", status?.watchConfig?.builderBundle?.enabled === false, status?.watchConfig?.builderBundle?.enabled ?? null),
+    check("status.watchTimedExecutorEnabled", status?.watchConfig?.builderBundle?.timedBuyExecutor?.enabled === true, status?.watchConfig?.builderBundle?.timedBuyExecutor ?? null),
+    check("status.watchTimedExecutorExactSecond", status?.watchConfig?.builderBundle?.timedBuyExecutor?.exactSecond === true, status?.watchConfig?.builderBundle?.timedBuyExecutor ?? null),
+    check(
+      "status.watchTimedExecutorAddress",
+      sameAddress(status?.watchConfig?.builderBundle?.timedBuyExecutor?.address, DEFAULT_TIMED_BUY_EXECUTOR_ADDRESS),
+      status?.watchConfig?.builderBundle?.timedBuyExecutor?.address ?? null
+    ),
     check("status.watchBuyGas", sameGasPrice(status?.watchConfig?.gasPriceGwei, DEFAULT_BUY_GAS_GWEI), status?.watchConfig?.gasPriceGwei ?? null),
     check("status.watchOutcomeSelection", status?.watchConfig?.eventOutcomeSelection === "names", status?.watchConfig?.eventOutcomeSelection ?? null),
     check("status.watchStakePerOutcome", Number(status?.watchConfig?.stakePerOutcomeUsdt) === 5, status?.watchConfig?.stakePerOutcomeUsdt ?? null),
@@ -170,6 +218,7 @@ function statusChecks(status, openingIso) {
     check("status.watchAutoSellStrategy", status?.watchConfig?.autoSellStrategy === DEFAULT_AUTO_SELL_STRATEGY, status?.watchConfig?.autoSellStrategy ?? null),
     check("status.watchOpenTimedExitDelay", Number(status?.watchConfig?.autoSellOpenExitDelaySeconds) === DEFAULT_AUTO_SELL_OPEN_EXIT_DELAY_SECONDS, status?.watchConfig?.autoSellOpenExitDelaySeconds ?? null),
     check("status.watchOpenTimedExitPercent", Number(status?.watchConfig?.autoSellOpenExitPercent) === DEFAULT_AUTO_SELL_OPEN_EXIT_PERCENT, status?.watchConfig?.autoSellOpenExitPercent ?? null),
+    check("status.watchAutoSellPollMs", Number(status?.watchConfig?.autoSellPollMs) === DEFAULT_AUTO_SELL_POLL_MS, status?.watchConfig?.autoSellPollMs ?? null),
     check("status.watchStopLossDisabled", status?.watchConfig?.autoSellStopLossEnabled === false, {
       enabled: status?.watchConfig?.autoSellStopLossEnabled,
       percent: status?.watchConfig?.autoSellStopLossPercent
@@ -192,7 +241,11 @@ function dashboardChecks(payload, prefix) {
     check(`${prefix}.nonTargetEligibleEmpty`, nonTargetEligible.length === 0, nonTargetEligible.map((item) => item.title)),
     check(`${prefix}.displayDailyTemplates`, /日常固定模板/u.test(payload?.settings?.ruleSummary?.filterRule ?? ""), payload?.settings?.ruleSummary?.filterRule ?? null),
     check(`${prefix}.windowText`, /T\+19\.9(?:00)?s.*35s/u.test(payload?.settings?.windowText ?? ""), payload?.settings?.windowText ?? null),
-    check(`${prefix}.autoSellText`, /开盘\s*T\+39600s\s*卖\s*100%.*止损关闭/u.test(payload?.settings?.autoSellText ?? ""), payload?.settings?.autoSellText ?? null)
+    check(
+      `${prefix}.autoSellText`,
+      /(?:(?:开盘\s*T\+39600s|开盘后\s*11h)\s*卖\s*100%|价格阈值卖出\s*\+\s*19:00清仓).*(?:止损关闭|关闭)/u.test(payload?.settings?.autoSellText ?? ""),
+      payload?.settings?.autoSellText ?? null
+    )
   ];
 }
 
@@ -388,10 +441,72 @@ function plannedBuyRowCoversTarget(row, target) {
     : String(row.outcomes ?? row.outcomeNames ?? row.names ?? "");
   const delayOk = Number(row.openBroadcastDelayMs ?? row.buyDelayMs ?? row.broadcastDelayMs ?? row.openDelayMs) === target.expectedBroadcastDelayMs;
   const gasOk = sameGasPrice(row.gasPriceGwei ?? row.buyGasPriceGwei ?? row.gasGwei ?? row.buyGasGwei, target.gasPriceGwei);
-  return Number(row.stakePerOutcomeUsdt ?? row.stake ?? row.stakeUsdt) === expectedStakePerOutcomeUsdt(target) &&
+  const builderOk = plannedBuyBuilderBundleCoversTarget(row, target);
+  const autoSellOk = plannedBuyAutoSellCoversTarget(row, target);
+  const broadcastRpcUrls = Array.isArray(row.broadcastRpcUrls) ? row.broadcastRpcUrls : [];
+  const broadcastRpcOk = target.broadcastRpcCount === undefined ||
+    broadcastRpcUrls.length === Number(target.broadcastRpcCount);
+  return plannedBuyStakeCoversTarget(row, target) &&
     targetOutcomesPresent(outcomes, target) &&
     delayOk &&
-    gasOk;
+    gasOk &&
+    broadcastRpcOk &&
+    builderOk &&
+    autoSellOk;
+}
+
+function plannedBuyStakeCoversTarget(row, target) {
+  const fallback = Number(row.stakePerOutcomeUsdt ?? row.stake ?? row.stakeUsdt);
+  if (fallback !== expectedStakePerOutcomeUsdt(target)) return false;
+  const raw = row.stakeByOutcomeUsdt ?? row.outcomeStakesUsdt ?? row.stakesByOutcome ?? {};
+  const entries = Array.isArray(raw)
+    ? raw.map((item) => [item?.outcome ?? item?.name, item?.stakeUsdt ?? item?.amountUsdt ?? item?.stake])
+    : Object.entries(raw);
+  const configured = new Map(entries.map(([outcome, stake]) => [normalizeOutcomeText(outcome), Number(stake)]));
+  return target.outcomes.every((outcome) => {
+    const expected = Number(target.stakeByOutcomeUsdt?.[outcome] ?? expectedStakePerOutcomeUsdt(target));
+    const actual = configured.has(normalizeOutcomeText(outcome))
+      ? configured.get(normalizeOutcomeText(outcome))
+      : fallback;
+    return actual === expected;
+  });
+}
+
+function plannedBuyBuilderBundleCoversTarget(row, target) {
+  if (!target.builderBundle) return !row?.builderBundle || row.builderBundle.enabled === false;
+  const source = row?.builderBundle ?? row ?? {};
+  const enabled = source.enabled ?? source.builderBundleEnabled;
+  const mode = source.mode ?? source.builderBundleMode;
+  const tipBnb = source.tipBnb ?? source.tip ?? source.tipAmountBnb ?? source.builderBundleTipBnb;
+  const timeoutMs = source.timeoutMs ?? source.builderBundleTimeoutMs;
+  const timingMode = source.timingMode ?? source.builderBundleTimingMode;
+  const prepositionLeadMs = source.prepositionLeadMs ?? source.builderBundlePrepositionLeadMs;
+  const noMerge = source.noMerge ?? source.builderBundleNoMerge;
+  const positionFirst = source.positionFirst ?? source.builderBundlePositionFirst;
+  return truthy(enabled) &&
+    String(mode ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_") === target.builderBundle.mode &&
+    Number(tipBnb) === Number(target.builderBundle.tipBnb) &&
+    Number(timeoutMs) === Number(target.builderBundle.timeoutMs) &&
+    String(timingMode ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_") === target.builderBundle.timingMode &&
+    Number(prepositionLeadMs) === Number(target.builderBundle.prepositionLeadMs) &&
+    Boolean(noMerge) === Boolean(target.builderBundle.noMerge) &&
+    Boolean(positionFirst) === Boolean(target.builderBundle.positionFirst);
+}
+
+function plannedBuyAutoSellCoversTarget(row, target) {
+  if (!target.autoSell) return true;
+  const source = row?.autoSell ?? {};
+  const configuredTargets = Array.isArray(source.priceTargets) ? source.priceTargets : [];
+  const priceTargetsOk = target.autoSell.priceTargets.every((targetPrice) => configuredTargets.some((configured) => (
+    String(configured?.outcome ?? "").trim().toLowerCase() === targetPrice.outcome.toLowerCase() &&
+    Number(configured?.price) === Number(targetPrice.price) &&
+    configured?.enabled !== false
+  )));
+  return priceTargetsOk &&
+    Number(source.priceHotPollMs ?? 1000) === Number(target.autoSell.priceHotPollMs) &&
+    Number(source.priceHotWindowSeconds ?? 600) === Number(target.autoSell.priceHotWindowSeconds) &&
+    Number(source.priceSellPercent ?? 100) === Number(target.autoSell.priceSellPercent) &&
+    Boolean(source.stopLossEnabled ?? source.autoSellStopLossEnabled ?? false) === Boolean(target.autoSell.stopLossEnabled);
 }
 
 function expectedStakePerOutcomeUsdt(target) {
@@ -435,16 +550,24 @@ function targetReadinessSummary(target, openingMs) {
     outcomes: target.outcomes,
     stakeUsdt: target.stakeUsdt,
     stakePerOutcomeUsdt: expectedStakePerOutcomeUsdt(target),
+    stakeByOutcomeUsdt: target.stakeByOutcomeUsdt ?? {},
     expectedBroadcastDelayMs: target.expectedBroadcastDelayMs,
     expectedBroadcastIso: new Date(openingMs + target.expectedBroadcastDelayMs).toISOString(),
     latestAllowedBroadcastStartDelayMs: target.latestAllowedBroadcastStartDelayMs,
     latestAllowedBroadcastStartIso: new Date(openingMs + target.latestAllowedBroadcastStartDelayMs).toISOString(),
-    gasPriceGwei: target.gasPriceGwei
+    gasPriceGwei: target.gasPriceGwei,
+    builderBundle: target.builderBundle ?? null,
+    autoSell: target.autoSell ?? null
   };
 }
 
 function sameGasPrice(actual, expected) {
   return Number(actual) === Number(expected);
+}
+
+function sameAddress(actual, expected) {
+  return /^0x[a-fA-F0-9]{40}$/u.test(String(actual ?? "")) &&
+    String(actual).toLowerCase() === String(expected).toLowerCase();
 }
 
 function normalizeOutcomeText(value) {

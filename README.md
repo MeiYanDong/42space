@@ -45,10 +45,10 @@ npm run event:scan
 npm run event:positions -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
 ```
 
-查看下一批同期开盘 Event Markets 的实盘资金门槛、当前钱包缺多少 BUSDT/BNB、是否已经能直接 `event:arm`。当前 Bot2 Event Market 策略默认每场买中间 3 个 outcome，每个 outcome 买 `10U`，实盘前仍建议显式带上 `STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30`：
+查看下一批同期开盘 Event Markets 的实盘资金门槛、当前钱包缺多少 BUSDT/BNB、是否已经能直接 `event:arm`。当前 Bot2 Event Market 策略默认每场买前 3 个 outcome，每个 outcome 买 `10U`，实盘前仍建议显式带上 `STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=first EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30`：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:funding -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=first EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:funding -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
 ```
 
 查看某个 outcome 的卖出报价。默认 dry-run，只读链上余额并用 market 的 `redeemExactOtToCollateral` 报价；真实卖出会先给当前 market 设置 Router operator，再通过 `FTRouterProxy.swap(isMint=false)` 带滑点保护卖出：
@@ -82,28 +82,28 @@ DRY_RUN=0 EXECUTE=1 I_UNDERSTAND_42_PRICE_MARKET_RISK=YES I_AM_NOT_IN_RESTRICTED
 security add-generic-password -a 42space -s 42space-event-bot-private-key -w '0x...' -U
 ```
 
-模拟最近一个 Event Market，按当前 `EVENT_OUTCOME_SELECTION` 选择 outcome。当前 Bot2 生产策略是 `middle`，按 outcome 显示/token 顺序买入居中的 3 个选项；FDV/市值区间题材因此买入中间三个市值档，每档 `10U`。旧的 `lowest_odds` 策略仍可用：优先按 `payout` 从小到大选；如果 REST/链上数据没有完整 payout 但有 price，则按 price 从大到小选；如果刚开场链上日志还没有赔率字段，默认按 token 顺序兜底并在 plan 里标记 `rankSource: token_order`。这个命令会逐 outcome 调 `FTLensV2.simulateMint`，用于分析，不是最快路径：
+模拟最近一个 Event Market，按当前 `EVENT_OUTCOME_SELECTION` 选择 outcome。当前 Bot2 生产策略是 `first`，按 outcome 显示/token 顺序买入前 3 个选项；FDV/市值区间题材因此买入前三个市值档，每档 `10U`。旧的 `middle` 和 `lowest_odds` 策略仍可用：`middle` 买居中的 3 个选项；`lowest_odds` 优先按 `payout` 从小到大选；如果 REST/链上数据没有完整 payout 但有 price，则按 price 从大到小选；如果刚开场链上日志还没有赔率字段，默认按 token 顺序兜底并在 plan 里标记 `rankSource: token_order`。这个命令会逐 outcome 调 `FTLensV2.simulateMint`，用于分析，不是最快路径：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:plan
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=first EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:plan
 ```
 
 指定市场模拟：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 npm run event:plan -- --market 0x73CbB55E357fA4Ceb2d808FF7A908A7a045F6ca5
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=first EVENT_OUTCOME_COUNT=3 npm run event:plan -- --market 0x73CbB55E357fA4Ceb2d808FF7A908A7a045F6ca5
 ```
 
 监听新 Event Market。默认启动时会把现有 live Event Markets 标记为已见，只等新场；如果要启动后连现有场也买，设置 `WATCH_BUY_EXISTING=1`。
 
 ```bash
-POLL_MS=500 STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:watch
+POLL_MS=500 STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=first EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:watch
 ```
 
 实盘长期在线入口使用隐藏输入私钥，不把私钥写进 `.env`：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:arm
+STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=first EVENT_OUTCOME_COUNT=3 MAX_MARKET_STAKE_USDT=30 npm run event:arm
 ```
 
 速度模式：
@@ -129,7 +129,7 @@ STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 M
 - `BUNDLE_DUE_MARKETS=1`、`MAX_BATCH_STAKE_USDT=450`：同一 `startDate` 的多个 due Event Markets 会合并成一笔 `FTRouterProxy.multicall`，用批次上限控制总风险；资金不足或超过批次上限时只买优先级最高且能完整买入的 markets。
 - `EVENT_MAX_DUE_MARKETS_PER_OPEN=1`、`BUNDLE_DUE_MARKETS=0`：Bot2 当前生产单市场模式，同一开盘时间只保留最高优先级的 1 个 market，到达配置的 post-open action time 后直接广播已预签名交易。当前生产 action time 是 `T+19.5s`。`EVENT_PRICE_GATE_ENABLED` 可切回价格筛选模式；启用时并发 `simulateMint` 已选 outcomes，任意一个 `collateralFromUser / otToUser` 低于 `EVENT_PRICE_GATE_MAX_EFFECTIVE_PRICE` 就广播，这只是反狙击溢价探测，不是限价单。
 - `EVENT_INTEL_BUY_FILTER=strong`、`EVENT_INTEL_BUY_FILE=output/event-intel.jsonl`：可选的 Bot2 筛选买入策略。启用后，非归档 Meme 板块事件会默认关注；REST categories 为空时，会用题目里的 token-style FDV / `$...人生` / 已知中文 meme 名称兜底识别。非 Meme 事件仍要求本地题目/来源可直接判断为 Binance strong，或情报 JSONL 已记录 `binanceRelation=strong`。固定 daily/weekly/monthly 模板和 Price 事件即使归档报告里有 strong 关系也不会自动买入；`Tweet Count` 等低交易量题材会被排除，不因 `CZ` 命中而自动买入。默认 `off`，不影响 Bot1。
-- `EVENT_OUTCOME_SELECTION=middle`、`EVENT_OUTCOME_COUNT=3`、`STAKE_PER_OUTCOME_USDT=10`：当前 Bot2 生产默认买入策略。每个 Event Market 按 outcome 显示/token 顺序买居中的 3 个选项；如果是 FDV/市值题材，就是买中间三个市值档，每档 `10U`。
+- `EVENT_OUTCOME_SELECTION=first`、`EVENT_OUTCOME_COUNT=3`、`STAKE_PER_OUTCOME_USDT=10`：当前 Bot2 生产默认买入策略。每个 Event Market 按 outcome 显示/token 顺序买前 3 个选项；如果是 FDV/市值题材，就是买前三个市值档，每档 `10U`。
 - `EVENT_PLANNED_BUYS_FILE=data/planned-buys.json`：profile-local 的精确买入计划。用于世界杯比分这类需要逐场指定 outcome 的 market。命中计划的 market 会只买该计划里的 outcome names 和 stake，不会套用全局 `middle`；同一开盘时间若多个 market 都在计划里，会全部进入预签/到点队列，未计划 market 仍遵守 `EVENT_MAX_DUE_MARKETS_PER_OPEN`。
 - `EVENT_OUTCOME_SELECTION=lowest_odds`：旧策略。每个 Event Market 只买赔率最低的 outcome，数量由 `EVENT_OUTCOME_COUNT` 控制。链上日志缺少赔率字段时，程序会先用 42 单市场 REST 接口按地址补全 outcomes；赔率优先用 `payout` 排序，其次用 `price`。
 - `EVENT_OUTCOME_SELECTION_FALLBACK=token_order`：速度优先默认值。缺少完整赔率数据时按 token 顺序继续抢，不阻断开盘买入；设为 `error` 才会在缺 odds 时跳过/报错。
@@ -171,6 +171,9 @@ STAKE_PER_OUTCOME_USDT=10 EVENT_OUTCOME_SELECTION=middle EVENT_OUTCOME_COUNT=3 M
 - `FANOUT_BROADCAST=1`：fast 实盘广播时签一次 raw transaction，并向多个 HTTP RPC 同时发送；默认只用 `CHAINSTACK_BSC_RPC_URL` 和 `ANKR_BSC_RPC_URL`，没有专线时才回退主 `BSC_RPC_URL`。
 - `BROADCAST_TIMEOUT_MS=1200`：单个广播 RPC 的超时窗口。目标是尽快拿到第一个成功广播，而不是等所有 RPC 慢慢返回。
 - `REBROADCAST_INTERVAL_MS=100`、`REBROADCAST_DURATION_MS=2500`：首个 RPC 接收预签 raw tx 后，后台继续按固定间隔把同一笔 raw tx 推给专线 RPC；`already known` 视为正常传播。
+- `BUILDER_BUNDLE_ENABLED=1`、`BUILDER_BUNDLE_TIP_BNB=0.001`、`BUILDER_BUNDLE_MODE=builder_then_fanout`：启用共享 Builder 买入路径。计划买入里的 `builderBundle.tipBnb` 可以覆盖默认 tip；标准 RPC 回退只发送同一笔已预签买入交易，不发送 tip。
+- `BUILDER_BUNDLE_TIMING_MODE=auto`：只把 T+18.x/T+19.x 的买入映射到严格 19 秒/20 秒首区块模式。19 秒模式在 T+18 预提交，20 秒模式在 T+19 预提交，并统一设置 `minTimestamp=maxTimestamp`；T+22 等其他时间自动保持 RPC-only。
+- `BUILDER_BUNDLE_PREPOSITION_LEAD_MS=1000`、`BUILDER_BUNDLE_FALLBACK_SAFETY_MS=100`：Builder 请求必须在本地 RPC 回退前结束。Builder 接受后若错过唯一目标秒，程序放弃下一秒买入、清理相关预签名并重新同步 nonce。
 - `RPC_WARMUP_TIMEOUT_MS=2500`：`event:rpc` 和实盘 `event:watch` 启动时预热 broadcast RPC 的超时窗口。实盘开跑前会先创建并连通 raw-tx client，避免开盘瞬间才初始化 HTTP transport。
 - `DOCTOR_CHECK_WS=0`：`event:doctor` 默认不打开 WSS 长连接；要单独测 WSS 时设为 `1`。
 - `WATCH_STARTUP_RETRY_MS=5000`：启动时如果 REST 补种、链上回放或 chain watch 初始区块读取遇到瞬时网络错误，按这个间隔告警/重试；WS 模式下 REST/链上补种失败不会直接退出主进程。

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run 42space shared RPC observer shadow report every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=42space-shared-rpc-observer-report.service
+
+[Install]
+WantedBy=timers.target

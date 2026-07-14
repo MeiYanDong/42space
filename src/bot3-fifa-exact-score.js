@@ -1,8 +1,12 @@
 import { isSportsExactScoreMarket } from "./event-intel.js";
 
-const HOME_WIN_SCORES = Object.freeze(["1-0", "2-0", "2-1"]);
-const AWAY_WIN_SCORES = Object.freeze(["0-1", "0-2", "1-2"]);
-const CANONICAL_SCORES = Object.freeze([...HOME_WIN_SCORES, ...AWAY_WIN_SCORES]);
+const HOME_WIN_TIER_SCORES = Object.freeze(["1-0", "2-0", "2-1"]);
+const AWAY_WIN_TIER_SCORES = Object.freeze(["0-1", "0-2", "1-2"]);
+const HOME_WIN_SELECTION_SCORES = Object.freeze(["1-0", "2-0", "3-0", "2-1", "3-1"]);
+const AWAY_WIN_SELECTION_SCORES = Object.freeze(["0-1", "0-2", "0-3", "1-2", "1-3"]);
+const CANONICAL_SCORES = Object.freeze([...HOME_WIN_SELECTION_SCORES, ...AWAY_WIN_SELECTION_SCORES]);
+
+export const BOT3_FIFA_EXACT_SCORE_AUTO_OUTCOME_COUNT = HOME_WIN_SELECTION_SCORES.length;
 
 export function bot3FifaExactScoreAutoBuyActive(cfg = {}) {
   return Boolean(cfg.bot3FifaExactScoreAutoBuyEnabled) && isBot3Profile(cfg);
@@ -67,8 +71,8 @@ export function previewBot3FifaExactScoreMarket(market) {
     question: marketQuestion(market),
     homeTeam: null,
     awayTeam: null,
-    homeWin: { scores: HOME_WIN_SCORES.map(emptyScorePreview), tierPrice: null },
-    awayWin: { scores: AWAY_WIN_SCORES.map(emptyScorePreview), tierPrice: null },
+    homeWin: { scores: HOME_WIN_SELECTION_SCORES.map(emptyScorePreview), tierPrice: null },
+    awayWin: { scores: AWAY_WIN_SELECTION_SCORES.map(emptyScorePreview), tierPrice: null },
     draw: { scores: [], tierPrice: null },
     selectedSide: null,
     selectedTierPrice: null,
@@ -91,8 +95,8 @@ export function previewBot3FifaExactScoreMarket(market) {
     );
   }
 
-  const homeWin = buildTierPreview(HOME_WIN_SCORES, scoreIndex.byScore);
-  const awayWin = buildTierPreview(AWAY_WIN_SCORES, scoreIndex.byScore);
+  const homeWin = buildTierPreview(HOME_WIN_SELECTION_SCORES, scoreIndex.byScore, HOME_WIN_TIER_SCORES);
+  const awayWin = buildTierPreview(AWAY_WIN_SELECTION_SCORES, scoreIndex.byScore, AWAY_WIN_TIER_SCORES);
   const draw = buildDrawTierPreview(scoreIndex.byScore);
   const preview = {
     ...base,
@@ -132,7 +136,8 @@ export function previewBot3FifaExactScoreMarket(market) {
 
 function isBot3Profile(cfg = {}) {
   const botName = String(cfg.botName ?? "").trim().toLowerCase();
-  return botName === "42space-3" || botName === "bot3" || botName.startsWith("bot3") || botName.includes("bot3");
+  const profileRole = String(cfg.profileRole ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_");
+  return profileRole === "bot3_like" || botName === "42space-3" || botName === "bot3" || botName.startsWith("bot3") || botName.includes("bot3");
 }
 
 function marketQuestion(market) {
@@ -197,12 +202,14 @@ function parseScore(outcomeName) {
   };
 }
 
-function buildTierPreview(scores, byScore) {
+function buildTierPreview(scores, byScore, tierScores = scores) {
   const rows = scores.map((score) => scorePreview(score, byScore.get(score)));
+  const tierRows = tierScores.map((score) => scorePreview(score, byScore.get(score)));
   return {
     scores: rows,
-    tierPrice: uniformTierPrice(rows),
-    uniform: priceRowsUniform(rows)
+    tierPrice: uniformTierPrice(tierRows),
+    uniform: priceRowsUniform(tierRows),
+    tierScores: tierRows
   };
 }
 

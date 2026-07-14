@@ -6,13 +6,15 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createPublicClient, formatUnits, getAddress, http as viemHttp } from "viem";
+import { bsc } from "viem/chains";
 import { loadDotEnv, normalizeRuntimeConfig, readConfig, writeRuntimeConfig } from "./config.js";
 import {
   eventDisplayFilterRuleLabels,
   eventDisplayFilterRuleOptions,
   normalizeEventDisplayFilterRules
 } from "./event-display-rules.js";
-import { fetchActivity, fetchMarket, fetchMarkets } from "./fortytwo.js";
+import { ADDRESSES, fetchActivity, fetchMarket, fetchMarkets, fetchOpenPositions } from "./fortytwo.js";
 import { isSportsExactScoreMarket } from "./event-intel.js";
 import {
   eventDurationMs,
@@ -37,6 +39,7 @@ import {
   gasLedgerFileForConfig,
   readGasLedger
 } from "./gas-ledger.js";
+import { buildDashboardStrategyProfile, dashboardProfileKind } from "./dashboard-strategy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -64,6 +67,74 @@ const overviewHotPauseAfterMs = Number(process.env.DASHBOARD_OVERVIEW_HOT_PAUSE_
 const dashboardEventTimeoutMs = Number(process.env.DASHBOARD_EVENT_TIMEOUT_MS ?? 20000);
 const dashboardChildLowPriority = envBool("DASHBOARD_CHILD_LOW_PRIORITY", true);
 const dashboardChildNice = Number(process.env.DASHBOARD_CHILD_NICE ?? 10);
+const aggregatePnlEnabled = envBool("DASHBOARD_AGGREGATE_PNL_ENABLED", port === 4242);
+const aggregatePnlActivityLimit = Number(process.env.DASHBOARD_AGGREGATE_PNL_ACTIVITY_LIMIT ?? 5000);
+const aggregatePnlPositionLimit = Number(process.env.DASHBOARD_AGGREGATE_PNL_POSITION_LIMIT ?? 500);
+const aggregatePnlGasLimit = Number(process.env.DASHBOARD_AGGREGATE_PNL_GAS_LIMIT ?? 0);
+const aggregatePnlDays = Number(process.env.DASHBOARD_AGGREGATE_PNL_DAYS ?? 90);
+const aggregatePnlTimeZone = process.env.DASHBOARD_AGGREGATE_PNL_TIME_ZONE ?? "Asia/Shanghai";
+const orderflowConfigEnabled = envBool("DASHBOARD_ORDERFLOW_CONFIG_ENABLED", port === 4242);
+const plannedPriceExitPlanId = process.env.DASHBOARD_PRICE_EXIT_PLAN_ID ?? "bot4-openrouter-python-daily";
+const orderflowSystemdDir = process.env.DASHBOARD_ORDERFLOW_SYSTEMD_DIR ?? "/etc/systemd/system";
+const orderflowMonitorSlots = [
+  {
+    id: "bot1-runner-up",
+    label: "Bot1 Runner-Up",
+    profile: "Bot1",
+    service: "42space-bot1-runner-up-orderflow-sell.service"
+  },
+  {
+    id: "bot1-third-place",
+    label: "Bot1 3rd Place",
+    profile: "Bot1",
+    service: "42space-bot1-third-place-orderflow-sell.service"
+  },
+  {
+    id: "bot3-runner-up",
+    label: "Bot3 Runner-Up",
+    profile: "Bot3",
+    service: "42space-bot3-runner-up-orderflow-sell.service"
+  },
+  {
+    id: "bot3-third-place",
+    label: "Bot3 3rd Place",
+    profile: "Bot3",
+    service: "42space-bot3-third-place-orderflow-sell.service"
+  }
+];
+const watchedAddressActivityEnabled = envBool("DASHBOARD_WATCHED_ADDRESS_ACTIVITY_ENABLED", port === 4242);
+const watchedAddressSystemdDir = process.env.DASHBOARD_WATCHED_ADDRESS_SYSTEMD_DIR ?? orderflowSystemdDir;
+const watchedAddressLookbackMinutes = Number(process.env.DASHBOARD_WATCHED_ADDRESS_LOOKBACK_MINUTES ?? 60);
+const watchedAddressBlocksPerMinute = Number(process.env.DASHBOARD_WATCHED_ADDRESS_BLOCKS_PER_MINUTE ?? 80);
+const watchedAddressMaxScanBlocks = Number(process.env.DASHBOARD_WATCHED_ADDRESS_MAX_SCAN_BLOCKS ?? 9000);
+const watchedAddressScanChunkBlocks = Number(process.env.DASHBOARD_WATCHED_ADDRESS_SCAN_CHUNK_BLOCKS ?? 2500);
+const watchedAddressActivityLimit = Number(process.env.DASHBOARD_WATCHED_ADDRESS_ACTIVITY_LIMIT ?? 80);
+const watchedAddressSlots = [
+  {
+    id: "0x96fde",
+    label: "0x96FDe...3650",
+    address: "0x96FDe227f3863812464dC1320B505016837a3650",
+    service: "42space-address-tx-watch-0x96fde.service"
+  },
+  {
+    id: "0x1bc7df",
+    label: "0x1Bc7...A80b",
+    address: "0x1Bc7dF2AA0DBE1a489A7205f2D1fF92C3d51A80b",
+    service: "42space-address-tx-watch-0x1bc7df.service"
+  },
+  {
+    id: "0x51349f",
+    label: "0x5134...9C41",
+    address: "0x51349f0B9b8C21A34781273e37F16B0233239C41",
+    service: "42space-address-tx-watch-0x51349f.service"
+  }
+];
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC1155_TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f832d46ec942c18f8c8cf";
+const ERC1155_TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70b45c59d4ed6409018f8cbd4a6932f3c99907335bc54";
+const MARKET_TRADE_TOPIC = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
+const watchedAddressMarketCache = new Map();
+const watchedAddressTxCache = new Map();
 
 let overviewCache = null;
 let overviewPromise = null;
@@ -81,11 +152,29 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/overview" && req.method === "GET") {
       return sendJson(res, await getOverview({ force: url.searchParams.get("refresh") === "1" }));
     }
+    if (url.pathname === "/api/automation-status" && req.method === "GET") {
+      return sendJson(res, await automationStatusPayload());
+    }
     if (url.pathname === "/api/runtime-config" && req.method === "GET") {
       return sendJson(res, runtimeConfigPayload());
     }
     if (url.pathname === "/api/runtime-config" && req.method === "PUT") {
       return sendJson(res, await updateRuntimeConfig(req));
+    }
+    if (url.pathname === "/api/planned-price-exit" && req.method === "GET") {
+      return sendJson(res, await plannedPriceExitPayload());
+    }
+    if (url.pathname === "/api/planned-price-exit" && req.method === "PUT") {
+      return sendJson(res, await updatePlannedPriceExit(req));
+    }
+    if (url.pathname === "/api/orderflow-monitors" && req.method === "GET") {
+      return sendJson(res, await orderflowMonitorsPayload());
+    }
+    if (url.pathname === "/api/orderflow-monitors" && req.method === "PUT") {
+      return sendJson(res, await updateOrderflowMonitor(req));
+    }
+    if (url.pathname === "/api/watched-address-activity" && req.method === "GET") {
+      return sendJson(res, await watchedAddressActivityPayload(url));
     }
     if (url.pathname === "/api/upcoming-markets" && req.method === "GET") {
       return sendJson(res, (await getOverview()).newMarkets);
@@ -211,6 +300,12 @@ async function buildOverview() {
   const recentRows = readRecentActivity();
   const newMarketFeed = normalizeNewMarkets(newMarkets, status, walletActivity, recentRows, strategyCfg, followState);
   const analytics = buildAnalytics(positions, walletActivity, gasSummary);
+  const aggregatePnl = await buildAggregatePnl(cfg);
+  if (aggregatePnl) analytics.aggregatePnl = aggregatePnl;
+  const strategyProfile = buildDashboardStrategyProfile(cfg, {
+    ...status.watchConfig,
+    plannedBuyPlans: readDashboardPlannedBuys(cfg)
+  });
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
@@ -223,19 +318,250 @@ async function buildOverview() {
     projectBoard: buildProjectBoard(newMarketFeed, holdings, walletActivity, followState, cfg, gasSummary),
     analytics,
     activity: normalizeActivity(recentRows, walletActivity),
-    evidence: evidenceSummary(),
+    evidence: evidenceSummary(cfg),
     settings: {
       appName,
       runtimeConfig: runtimeConfigSummary(cfg, status.watchConfig),
       ruleSummary: botRuleSummary(cfg),
+      strategyProfile,
       stakeText: `${status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5} 档 / ${status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5}U`,
       windowText: broadcastWindowText(status.watchConfig, cfg),
-      autoSellText: autoSellText(status.watchConfig, cfg)
+      autoSellText: strategyProfile.sellSummary
     }
   };
 }
 
-function evidenceSummary() {
+async function automationStatusPayload() {
+  const cfg = readConfig();
+  const worker = await getBotState();
+  const health = safeReadJson(cfg.runtimeHealthFile);
+  const now = Date.now();
+  const heartbeatAt = health?.updatedAt ?? health?.buy?.lastHeartbeatAt ?? null;
+  const heartbeatMs = Date.parse(heartbeatAt ?? "");
+  const heartbeatAgeMs = Number.isFinite(heartbeatMs) ? Math.max(0, now - heartbeatMs) : null;
+  const staleAfterMs = Math.max(10000, Number(process.env.EVENT_RUNTIME_HEALTH_STALE_MS ?? 20000));
+  const pidMatches = runtimePidBelongsToWorker(worker, health?.pid);
+  const heartbeatFresh = Boolean(
+    worker.running &&
+    pidMatches &&
+    heartbeatAgeMs !== null &&
+    heartbeatAgeMs <= staleAfterMs
+  );
+  const activity = readRecentActivity();
+  const lastBuy = latestAutomationActivity(activity, (row) => ["买入成功", "等待确认", "买入失败"].includes(row.label));
+  const lastSell = latestAutomationActivity(activity, (row) => row.label === "自动卖出");
+  const circuit = safeReadJson(cfg.autoSellCircuitStateFile);
+  const circuitPausedUntilMs = Date.parse(circuit?.pausedUntil ?? "");
+  const circuitOpen = Number.isFinite(circuitPausedUntilMs) && circuitPausedUntilMs > now;
+  const live = Boolean(!cfg.dryRun && cfg.execute !== false);
+  const buyPolicy = health?.buy?.policy ?? dashboardBuyPolicy(cfg);
+
+  return {
+    ok: true,
+    updatedAt: new Date(now).toISOString(),
+    heartbeat: {
+      at: heartbeatAt,
+      ageMs: heartbeatAgeMs,
+      fresh: heartbeatFresh,
+      staleAfterMs,
+      pidMatches
+    },
+    worker: automationWorkerStatus(worker, { heartbeatFresh, heartbeatAt, heartbeatAgeMs, pidMatches }),
+    buy: automationBuyStatus(cfg, health?.buy, {
+      live,
+      worker,
+      heartbeatFresh,
+      heartbeatAt,
+      heartbeatAgeMs,
+      buyPolicy,
+      lastAction: lastBuy
+    }),
+    sell: automationSellStatus(cfg, health?.sell, {
+      worker,
+      heartbeatFresh,
+      heartbeatAt,
+      heartbeatAgeMs,
+      circuitOpen,
+      circuitPausedUntil: circuitOpen ? circuit.pausedUntil : null,
+      lastAction: lastSell
+    })
+  };
+}
+
+function automationWorkerStatus(worker, context) {
+  const healthy = Boolean(worker.running && context.heartbeatFresh);
+  const label = !worker.running
+    ? "服务停止"
+    : context.heartbeatFresh
+      ? "运行中"
+      : context.pidMatches
+        ? "心跳超时"
+        : "进程已更换";
+  return {
+    ...worker,
+    healthy,
+    label,
+    tone: healthy ? "good" : "bad",
+    heartbeatAt: context.heartbeatAt,
+    heartbeatAgeMs: context.heartbeatAgeMs
+  };
+}
+
+function runtimePidBelongsToWorker(worker, runtimePid) {
+  const pid = Number(runtimePid ?? 0);
+  if (!worker.pid || !pid) return true;
+  if (Number(worker.pid) === pid) return true;
+  if (!worker.controlGroup || process.platform === "darwin") return true;
+  try {
+    const cgroup = fs.readFileSync(`/proc/${pid}/cgroup`, "utf8");
+    return cgroup.split(/\r?\n/).some((line) => {
+      const current = line.split(":").slice(2).join(":");
+      return current === worker.controlGroup || current.startsWith(`${worker.controlGroup}/`);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function automationBuyStatus(cfg, buy = {}, context = {}) {
+  const enabled = Boolean(context.live && buy.enabled !== false);
+  const state = String(buy.state ?? "starting");
+  const pendingCount = Math.max(0, Number(buy.pendingCount ?? 0));
+  const preparedCount = Math.max(0, Number(buy.preparedCount ?? 0));
+  const running = Boolean(enabled && context.worker?.running && context.heartbeatFresh);
+  let label = "已关闭";
+  let tone = "neutral";
+  if (enabled && !context.worker?.running) {
+    label = "服务停止";
+    tone = "bad";
+  } else if (enabled && !context.heartbeatFresh) {
+    label = "心跳超时";
+    tone = "bad";
+  } else if (running && state === "executing") {
+    label = "正在执行";
+    tone = "warn";
+  } else if (running && pendingCount > 0) {
+    label = `已准备 ${preparedCount}/${pendingCount} 场`;
+    tone = "good";
+  } else if (running) {
+    label = "运行中 · 等待新盘";
+    tone = "good";
+  }
+  return {
+    enabled,
+    running,
+    state,
+    label,
+    tone,
+    policy: context.buyPolicy,
+    policyLabel: dashboardBuyPolicyLabel(context.buyPolicy, cfg),
+    pendingCount,
+    preparedCount,
+    heartbeatAt: buy.lastHeartbeatAt ?? context.heartbeatAt,
+    lastAction: context.lastAction
+  };
+}
+
+function automationSellStatus(cfg, sell = {}, context = {}) {
+  const enabled = Boolean(cfg.autoSellEnabled && sell.enabled !== false);
+  const state = String(sell.state ?? (enabled ? "starting" : "disabled"));
+  const hasTickError = state === "error" || state === "degraded" || Number(sell.errors ?? 0) > 0;
+  const guarded = state === "guarded" || ["open-buy-window", "buy-hot-window", "transaction-busy"].includes(sell.skippedReason);
+  const running = Boolean(enabled && context.worker?.running && context.heartbeatFresh && !context.circuitOpen && !hasTickError);
+  let label = "已关闭";
+  let tone = "neutral";
+  if (enabled && !context.worker?.running) {
+    label = "服务停止";
+    tone = "bad";
+  } else if (enabled && !context.heartbeatFresh) {
+    label = "心跳超时";
+    tone = "bad";
+  } else if (context.circuitOpen || state === "paused") {
+    label = "熔断暂停";
+    tone = "bad";
+  } else if (hasTickError) {
+    label = state === "degraded" ? "接口异常 · 自动重试" : "扫描异常";
+    tone = "bad";
+  } else if (guarded) {
+    label = "买入保护中 · 自动恢复";
+    tone = "warn";
+  } else if (state === "checking") {
+    label = "正在扫描";
+    tone = "warn";
+  } else if (enabled) {
+    label = "运行中";
+    tone = "good";
+  }
+  return {
+    enabled,
+    running,
+    state,
+    label,
+    tone,
+    strategy: cfg.autoSellStrategy,
+    strategyLabel: dashboardSellStrategyLabel(cfg),
+    pollMs: Number(cfg.autoSellPollMs ?? 0),
+    lastTickStartedAt: sell.lastTickStartedAt ?? null,
+    lastTickCompletedAt: sell.lastTickCompletedAt ?? null,
+    lastSuccessfulScanAt: sell.lastSuccessfulScanAt ?? null,
+    checked: Number(sell.checked ?? 0),
+    triggered: Number(sell.triggered ?? 0),
+    executed: Number(sell.executed ?? 0),
+    errors: Number(sell.errors ?? 0),
+    skippedReason: sell.skippedReason ?? null,
+    guardUntil: sell.guardUntil ?? null,
+    lastErrorAt: sell.lastErrorAt ?? null,
+    lastError: sell.lastError ?? null,
+    circuitPausedUntil: context.circuitPausedUntil,
+    lastAction: context.lastAction
+  };
+}
+
+function dashboardBuyPolicy(cfg) {
+  const kind = dashboardProfileKind(cfg);
+  const role = String(cfg.profileRole ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_");
+  if (Boolean(cfg.bot3FifaExactScoreAutoBuyEnabled) && (kind === "bot3" || role === "bot3_like")) {
+    return "fifa_exact_score_lowest_price_tier";
+  }
+  if (String(cfg.eventIntelBuyFilter ?? "").trim().toLowerCase() === "strong") return "meme_binance_strong";
+  return "planned_or_manual_follow";
+}
+
+function dashboardBuyPolicyLabel(policy, cfg) {
+  if (policy === "fifa_exact_score_lowest_price_tier") {
+    return `精确比分最低胜方档 · 5项 x ${Number(cfg.bot3FifaExactScoreAutoStakeUsdt ?? 0)}U`;
+  }
+  if (policy === "meme_binance_strong") return "Meme / Binance strong 自动关注";
+  return "planned-buy / 手动关注";
+}
+
+function dashboardSellStrategyLabel(cfg) {
+  if (!cfg.autoSellEnabled) return "自动卖出关闭";
+  if (cfg.autoSellStrategy === "pre_start_exit") {
+    const hours = Number(cfg.autoSellBeforeMarketStartSeconds ?? 0) / 3600;
+    return `比赛前 ${Number.isInteger(hours) ? hours : hours.toFixed(1)}h 自动卖出`;
+  }
+  if (cfg.autoSellStrategy === "open_timed_exit") return `开盘后 ${Number(cfg.autoSellOpenExitDelaySeconds ?? 0)}s 自动卖出`;
+  if (cfg.autoSellStrategy === "ladder") return "阶梯自动卖出";
+  return "自动卖出监控";
+}
+
+function latestAutomationActivity(rows, predicate) {
+  const row = rows.find(predicate);
+  if (!row) return null;
+  return {
+    at: row.at,
+    label: row.label,
+    title: row.title,
+    tx: row.tx ?? null,
+    amount: row.amount ?? ""
+  };
+}
+
+function evidenceSummary(cfg) {
+  if (dashboardProfileKind(cfg) !== "bot4") {
+    return { readiness: null, firstBuy: null };
+  }
   const readiness = safeReadJson(bot4ReadinessFile);
   const firstBuy = safeReadJson(bot4FirstBuyEvidenceFile);
   return {
@@ -337,6 +663,9 @@ function runtimeConfigSummary(cfg, watchConfig) {
     autoSellLadderProfitPercent: Number(watchConfig?.autoSellLadderProfitPercent ?? cfg.autoSellLadderProfitPercent ?? 0),
     autoSellOpenExitDelaySeconds: Number(watchConfig?.autoSellOpenExitDelaySeconds ?? cfg.autoSellOpenExitDelaySeconds ?? 36),
     autoSellOpenExitPercent: Number(watchConfig?.autoSellOpenExitPercent ?? cfg.autoSellOpenExitPercent ?? 100),
+    autoSellFastOpenExitEnabled: Boolean(watchConfig?.autoSellFastOpenExitEnabled ?? cfg.autoSellFastOpenExitEnabled),
+    autoSellFastOpenExitMinDelayMs: Number(watchConfig?.autoSellFastOpenExitMinDelayMs ?? cfg.autoSellFastOpenExitMinDelayMs ?? 0),
+    autoSellFastOpenExitMaxDelayMs: Number(watchConfig?.autoSellFastOpenExitMaxDelayMs ?? cfg.autoSellFastOpenExitMaxDelayMs ?? 0),
     autoSellTakeProfitSteps: Number(watchConfig?.autoSellTakeProfitSteps ?? cfg.autoSellTakeProfitSteps ?? 0),
     autoSellBeforeMarketStartSeconds: Number(watchConfig?.autoSellBeforeMarketStartSeconds ?? cfg.autoSellBeforeMarketStartSeconds ?? 0),
     autoSellMarketStartEndOffsetSeconds: Number(watchConfig?.autoSellMarketStartEndOffsetSeconds ?? cfg.autoSellMarketStartEndOffsetSeconds ?? 0),
@@ -360,23 +689,13 @@ function runtimeConfigSummary(cfg, watchConfig) {
 }
 
 function botRuleSummary(cfg) {
-  const normalizedBotName = String(cfg?.botName ?? appName).trim().toLowerCase();
-  const normalizedProfileRole = String(cfg?.profileRole ?? "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  const isBot2 = normalizedBotName === "42space-2"
-    || normalizedBotName === "bot2"
-    || normalizedBotName.startsWith("bot2");
-  const isBot5 = normalizedBotName === "42space-5"
-    || normalizedBotName === "bot5"
-    || normalizedBotName.startsWith("bot5")
-    || normalizedBotName.includes("bot5");
-  const isBot2Like = isBot2 || isBot5 || normalizedProfileRole === "bot2_like";
-  const isBot3 = normalizedBotName === "42space-3"
-    || normalizedBotName === "bot3"
-    || normalizedBotName.startsWith("bot3");
-  const isBot4 = normalizedBotName === "42space-4"
-    || normalizedBotName === "bot4"
-    || normalizedBotName.startsWith("bot4")
-    || normalizedBotName.includes("bot4");
+  const profileKind = dashboardProfileKind(cfg);
+  const isBot2 = profileKind === "bot2";
+  const isBot3 = profileKind === "bot3";
+  const isBot3Like = isBot3 || String(cfg?.profileRole ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_") === "bot3_like";
+  const isBot4 = profileKind === "bot4";
+  const isBot5 = profileKind === "bot5";
+  const isBot2Like = isBot2 || isBot5;
   const focusBuyEnabled = String(cfg?.eventIntelBuyFilter ?? "off").trim().toLowerCase() === "strong";
   const buyQuestionAllowlistEnabled = Boolean(cfg?.marketBuyQuestionAllowlistRegex);
   const enabledIncludeLabels = eventDisplayFilterRuleLabels(cfg?.eventDisplayIncludeRules ?? []);
@@ -389,7 +708,9 @@ function botRuleSummary(cfg) {
   const displayRule = enabledIncludeLabels.length
     ? "默认显示并通知：只展示命中显示白名单且数据完整的 live/not_started 事件"
     : "默认显示并通知：除上述过滤外的所有 live/not_started 事件；Meme、Binance strong、准确比分、球员表现会重点标记";
-  const followRule = buyQuestionAllowlistEnabled
+  const followRule = isBot3Like && Boolean(cfg?.bot3FifaExactScoreAutoBuyEnabled)
+    ? "默认关注：仅 FIFA/Sports 精确比分最低胜方价格档自动买入；平局和边盘不买；planned-buy 优先"
+    : buyQuestionAllowlistEnabled
     ? isBot4
       ? "默认关注：仅命中 Bot4 买入题目白名单的日常模板符合买入；其他日常模板只展示/通知，不买入"
       : "默认关注：买入题目白名单是硬边界；未命中的显示事件只展示/通知，不买入"
@@ -403,8 +724,8 @@ function botRuleSummary(cfg) {
     followRule,
     notificationRule: isBot4
       ? "Bot4 飞书通知：命中日常模板显示白名单的新事件；买入仍受 Bot4 买入题目白名单限制"
-      : isBot2Like || isBot3
-      ? `${isBot3 ? "Bot3" : isBot5 ? "Bot5" : "Bot2-like"} 飞书通知：所有未被基础过滤的新事件；过滤项不通知`
+      : isBot2Like || isBot3Like
+      ? `${isBot3Like ? (isBot3 ? "Bot3" : "Bot1") : isBot5 ? "Bot5" : "Bot2"} 飞书通知：所有未被基础过滤的新事件；过滤项不通知`
       : "飞书通知按当前 profile 配置执行"
   };
 }
@@ -474,14 +795,1020 @@ async function updateRuntimeConfig(req) {
   };
 }
 
+async function plannedPriceExitPayload() {
+  const cfg = readConfig();
+  if (dashboardProfileKind(cfg) !== "bot4") {
+    return {
+      ok: true,
+      enabled: false,
+      plan: null,
+      outcomes: [],
+      targets: [],
+      writeProtected: Boolean(process.env.DASHBOARD_ADMIN_TOKEN)
+    };
+  }
+
+  const document = readPlannedBuysDocument(cfg.eventPlannedBuysFile);
+  const plan = findRawPlannedBuy(document.rows, plannedPriceExitPlanId);
+  if (!plan) {
+    return {
+      ok: true,
+      enabled: false,
+      plan: null,
+      outcomes: [],
+      targets: [],
+      message: `未找到计划 ${plannedPriceExitPlanId}`,
+      writeProtected: Boolean(process.env.DASHBOARD_ADMIN_TOKEN)
+    };
+  }
+
+  const normalizedPlan = normalizeDashboardPlannedBuy(plan);
+  const autoSell = plan.autoSell && typeof plan.autoSell === "object" && !Array.isArray(plan.autoSell)
+    ? plan.autoSell
+    : {};
+  const targets = normalizeDashboardPriceTargets(autoSell.priceTargets, normalizedPlan?.outcomes ?? []);
+  let openPositions = [];
+  let positionError = null;
+  try {
+    openPositions = await fetchOpenPositions(cfg, { user: botWallet || cfg.walletAddress, limit: 500 });
+  } catch (error) {
+    positionError = cleanError(error);
+  }
+  const matchingPositions = openPositions
+    .filter((position) => dashboardPlannedBuyMatches(normalizedPlan, {
+      address: position.marketAddress,
+      question: position.question?.title
+    }))
+    .sort((a, b) => safeTime(b.market?.startDate ?? b.question?.startDate) - safeTime(a.market?.startDate ?? a.question?.startDate));
+  const enrichedTargets = targets.map((target) => {
+    const position = matchingPositions.find((item) => normQuestion(item.outcome?.name) === normQuestion(target.outcome));
+    const currentPrice = position ? normalizeDashboardPositiveNumber(position.curPrice) : null;
+    return {
+      ...target,
+      currentPrice,
+      reached: Boolean(target.enabled && currentPrice !== null && currentPrice >= Number(target.price)),
+      market: position?.marketAddress ?? null,
+      question: position?.question?.title ?? null
+    };
+  });
+
+  return {
+    ok: true,
+    enabled: true,
+    plan: {
+      id: String(plan.id ?? plannedPriceExitPlanId),
+      label: "OpenRouter Python",
+      enabled: plan.enabled !== false && plan.disabled !== true
+    },
+    outcomes: normalizedPlan?.outcomes ?? [],
+    targets: enrichedTargets,
+    priceSource: "42 REST positions.curPrice",
+    priceHotPollMs: normalizeDashboardPositiveNumber(autoSell.priceHotPollMs) ?? 1000,
+    priceHotWindowSeconds: normalizeDashboardPositiveNumber(autoSell.priceHotWindowSeconds) ?? 600,
+    normalPollMs: Number(cfg.autoSellPollMs ?? 60000),
+    sellPercent: normalizeDashboardPositiveNumber(autoSell.priceSellPercent) ?? 100,
+    applyToExisting: !normalizeDashboardDate(autoSell.priceApplyAfterIso),
+    priceApplyAfterIso: normalizeDashboardDate(autoSell.priceApplyAfterIso),
+    positionError,
+    writeProtected: Boolean(process.env.DASHBOARD_ADMIN_TOKEN)
+  };
+}
+
+async function updatePlannedPriceExit(req) {
+  const body = await readJsonBody(req);
+  requireAdminToken(req, body);
+  const cfg = readConfig();
+  if (dashboardProfileKind(cfg) !== "bot4") throw new Error("Price exit editing is only enabled for Bot4");
+
+  const document = readPlannedBuysDocument(cfg.eventPlannedBuysFile);
+  const planId = String(body.planId ?? plannedPriceExitPlanId).trim();
+  const plan = findRawPlannedBuy(document.rows, planId);
+  if (!plan) throw new Error(`Planned buy not found: ${planId}`);
+  const normalizedPlan = normalizeDashboardPlannedBuy(plan);
+  const selectedByKey = new Map((normalizedPlan?.outcomes ?? []).map((outcome) => [normQuestion(outcome), outcome]));
+  const rows = Array.isArray(body.targets) ? body.targets : [];
+  if (rows.length > 24) throw new Error("Too many price targets");
+  const seen = new Set();
+  const targets = rows.map((row, index) => {
+    const key = normQuestion(row?.outcome);
+    if (!key) throw new Error(`Price target ${index + 1} is missing an outcome`);
+    if (seen.has(key)) throw new Error(`Duplicate price target outcome: ${row.outcome}`);
+    const selectedOutcome = selectedByKey.get(key);
+    if (!selectedOutcome) throw new Error(`Price target outcome is not selected by the planned buy: ${row.outcome}`);
+    const price = normalizeDashboardPriceValue(row?.price);
+    seen.add(key);
+    return {
+      outcome: selectedOutcome,
+      price,
+      enabled: row?.enabled !== false
+    };
+  });
+
+  const priorAutoSell = plan.autoSell && typeof plan.autoSell === "object" && !Array.isArray(plan.autoSell)
+    ? plan.autoSell
+    : {};
+  const autoSell = {
+    ...priorAutoSell,
+    priceTargets: targets,
+    priceHotPollMs: 1000,
+    priceHotWindowSeconds: 600,
+    priceSellPercent: 100,
+    stopLossEnabled: false
+  };
+  for (const key of ["ladderProfitPercent", "profitPercent", "chunkPercent", "takeProfitSteps", "startDelaySeconds", "intervalSeconds"]) {
+    delete autoSell[key];
+  }
+  if (body.applyToExisting === true) {
+    delete autoSell.priceApplyAfterIso;
+  } else if (!normalizeDashboardDate(autoSell.priceApplyAfterIso)) {
+    autoSell.priceApplyAfterIso = new Date().toISOString();
+  }
+  plan.autoSell = autoSell;
+  writePlannedBuysDocument(cfg.eventPlannedBuysFile, document);
+  const restarted = await restartWorker();
+  overviewCache = null;
+  const payload = await plannedPriceExitPayload();
+  return {
+    ...payload,
+    restarted,
+    message: restarted ? "价格卖出配置已保存，worker 已重启" : "价格卖出配置已保存"
+  };
+}
+
+function readPlannedBuysDocument(file) {
+  if (!file || !fs.existsSync(file)) throw new Error("Planned buys file not found");
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (Array.isArray(value)) return { value, rows: value, wrapped: false };
+  if (value && typeof value === "object" && Array.isArray(value.plans)) {
+    return { value, rows: value.plans, wrapped: true };
+  }
+  throw new Error("Planned buys file must be an array or contain plans[]");
+}
+
+function writePlannedBuysDocument(file, document) {
+  const mode = fs.statSync(file).mode & 0o777;
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  const backup = `${file}.bak-dashboard-price-exit`;
+  fs.copyFileSync(file, backup);
+  fs.chmodSync(backup, mode);
+  fs.writeFileSync(tmp, `${JSON.stringify(document.value, null, 2)}\n`, { mode });
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, mode);
+}
+
+function findRawPlannedBuy(rows, id) {
+  return rows.find((row) => String(row?.id ?? "").trim() === String(id ?? "").trim()) ?? null;
+}
+
+function normalizeDashboardPriceTargets(value, selectedOutcomes = []) {
+  if (value === undefined || value === null || value === "") return [];
+  const rows = Array.isArray(value)
+    ? value
+    : Object.entries(value).map(([outcome, item]) => (
+        item && typeof item === "object" && !Array.isArray(item)
+          ? { outcome, ...item }
+          : { outcome, price: item }
+      ));
+  const selectedByKey = new Map(selectedOutcomes.map((outcome) => [normQuestion(outcome), outcome]));
+  const seen = new Set();
+  return rows.map((row) => {
+    const key = normQuestion(row?.outcome ?? row?.name);
+    const outcome = selectedByKey.get(key) ?? String(row?.outcome ?? row?.name ?? "").trim();
+    const price = normalizeDashboardPriceValue(row?.price ?? row?.threshold ?? row?.targetPrice);
+    if (!outcome || seen.has(key)) return null;
+    seen.add(key);
+    return { outcome, price, enabled: row?.enabled !== false };
+  }).filter(Boolean);
+}
+
+function normalizeDashboardPriceValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0 || number > 1) throw new Error("Price target must be > 0 and <= 1");
+  return number.toFixed(18).replace(/0+$/u, "").replace(/\.$/u, "");
+}
+
+async function orderflowMonitorsPayload() {
+  if (!orderflowConfigEnabled) {
+    return {
+      ok: true,
+      enabled: false,
+      monitors: [],
+      writeProtected: Boolean(process.env.DASHBOARD_ADMIN_TOKEN)
+    };
+  }
+  const monitors = await Promise.all(orderflowMonitorSlots.map(readOrderflowMonitor));
+  return {
+    ok: true,
+    enabled: true,
+    monitors,
+    writeProtected: Boolean(process.env.DASHBOARD_ADMIN_TOKEN)
+  };
+}
+
+async function updateOrderflowMonitor(req) {
+  if (!orderflowConfigEnabled) throw new Error("Orderflow config is disabled");
+  const body = await readJsonBody(req);
+  requireAdminToken(req, body);
+  const slot = orderflowMonitorSlots.find((item) => item.id === body.id);
+  if (!slot) throw new Error("Unknown orderflow monitor");
+  const unitPath = orderflowUnitPath(slot.service);
+  if (!unitPath || !fs.existsSync(unitPath)) throw new Error("Orderflow service file not found");
+
+  const text = fs.readFileSync(unitPath, "utf8");
+  const env = parseSystemdEnvironment(text);
+  const market = normalizeOrderflowMarket(body.market ?? env.ORDERFLOW_TRIGGER_MARKET);
+  const thresholdUsdt = normalizeOrderflowThreshold(body.thresholdUsdt ?? env.ORDERFLOW_TRIGGER_THRESHOLD_USDT);
+  const tokenIds = normalizeOrderflowTokenIds(
+    body.tokenIds !== undefined ? body.tokenIds : env.ORDERFLOW_TRIGGER_TOKEN_IDS
+  );
+  const watchCurrentPositions = normalizeOrderflowBoolean(
+    body.watchCurrentPositions !== undefined
+      ? body.watchCurrentPositions
+      : env.ORDERFLOW_TRIGGER_WATCH_CURRENT_POSITIONS,
+    false
+  );
+  if (tokenIds.length === 0 && !watchCurrentPositions) {
+    throw new Error("Token IDs are required when current-position watch is disabled");
+  }
+
+  const nextText = [
+    ["ORDERFLOW_TRIGGER_MARKET", market],
+    ["ORDERFLOW_TRIGGER_THRESHOLD_USDT", String(thresholdUsdt)],
+    ["ORDERFLOW_TRIGGER_TOKEN_IDS", tokenIds.join(",")],
+    ["ORDERFLOW_TRIGGER_WATCH_CURRENT_POSITIONS", watchCurrentPositions ? "1" : "0"]
+  ].reduce((acc, [key, value]) => setSystemdEnvironment(acc, key, value), text);
+
+  if (nextText !== text) {
+    const backup = `${unitPath}.bak-dashboard-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    fs.copyFileSync(unitPath, backup);
+    fs.writeFileSync(unitPath, nextText);
+  }
+  const restarted = await restartOrderflowMonitor(slot);
+  appendJsonl(actionsFile, {
+    type: "orderflow-monitor-config",
+    source: "dashboard",
+    service: slot.service,
+    monitorId: slot.id,
+    market,
+    thresholdUsdt,
+    tokenIds,
+    watchCurrentPositions,
+    restarted,
+    at: new Date().toISOString()
+  });
+  const monitor = await readOrderflowMonitor(slot);
+  return {
+    ok: true,
+    monitor,
+    restarted,
+    message: restarted ? "监控配置已保存并重启" : "监控配置已保存"
+  };
+}
+
+async function readOrderflowMonitor(slot) {
+  const unitPath = orderflowUnitPath(slot.service);
+  const unitExists = Boolean(unitPath && fs.existsSync(unitPath));
+  const text = unitExists ? fs.readFileSync(unitPath, "utf8") : "";
+  const env = parseSystemdEnvironment(text);
+  const stateFile = env.ORDERFLOW_TRIGGER_STATE_FILE ?? "";
+  const logFile = env.ORDERFLOW_TRIGGER_LOG_FILE ?? "";
+  const state = safeReadJson(stateFile) ?? {};
+  const latestStarted = latestOrderflowStarted(logFile);
+  const serviceState = await orderflowServiceState(slot.service);
+  return {
+    id: slot.id,
+    label: slot.label,
+    profile: slot.profile,
+    service: slot.service,
+    unitPath: unitPath ?? null,
+    unitExists,
+    running: serviceState.running,
+    activeState: serviceState.activeState,
+    subState: serviceState.subState,
+    restarts: serviceState.restarts,
+    market: env.ORDERFLOW_TRIGGER_MARKET ?? "",
+    tokenIds: parseOrderflowTokenIds(env.ORDERFLOW_TRIGGER_TOKEN_IDS),
+    watchCurrentPositions: normalizeOrderflowBoolean(env.ORDERFLOW_TRIGGER_WATCH_CURRENT_POSITIONS, false),
+    thresholdUsdt: Number(env.ORDERFLOW_TRIGGER_THRESHOLD_USDT ?? 0),
+    sellMode: env.ORDERFLOW_TRIGGER_SELL_MODE ?? "",
+    sellPercent: Number(env.ORDERFLOW_TRIGGER_SELL_PERCENT ?? 0),
+    pollMs: Number(env.ORDERFLOW_TRIGGER_POLL_MS ?? 0),
+    stateFile,
+    logFile,
+    lastProcessedBlock: state.lastProcessedBlock ?? null,
+    failedTxCount: Object.keys(state.failedTxs ?? {}).length,
+    processingTxCount: Object.keys(state.processingTxs ?? {}).length,
+    soldTokenIds: Object.keys(state.soldTokenIds ?? {}),
+    latestStartedAt: latestStarted?.at ?? null,
+    latestStartedThresholdUsdt: latestStarted?.thresholdUsdt ?? null,
+    latestStartedWatchedTokenIds: latestStarted?.watchedTokenIds ?? []
+  };
+}
+
+function orderflowUnitPath(service) {
+  const systemdPath = path.join(orderflowSystemdDir, service);
+  if (fs.existsSync(systemdPath)) return systemdPath;
+  const opsPath = path.join(rootDir, "ops", service);
+  if (fs.existsSync(opsPath)) return opsPath;
+  return systemdPath;
+}
+
+async function orderflowServiceState(service) {
+  if (process.platform === "darwin") {
+    return { running: false, activeState: "unknown", subState: "unsupported", restarts: null };
+  }
+  try {
+    const { stdout } = await execFileAsync("systemctl", [
+      "show",
+      service,
+      "--property=ActiveState",
+      "--property=SubState",
+      "--property=NRestarts"
+    ], { timeoutMs: 5000 });
+    const values = Object.fromEntries(stdout.trim().split(/\r?\n/)
+      .map((line) => {
+        const index = line.indexOf("=");
+        return index >= 0 ? [line.slice(0, index), line.slice(index + 1)] : [line, ""];
+      }));
+    const activeState = values.ActiveState ?? "";
+    const subState = values.SubState ?? "";
+    const restarts = values.NRestarts ?? "";
+    return {
+      running: activeState === "active" && subState === "running",
+      activeState,
+      subState,
+      restarts: Number.isFinite(Number(restarts)) ? Number(restarts) : null
+    };
+  } catch {
+    return { running: false, activeState: "unknown", subState: "unknown", restarts: null };
+  }
+}
+
+async function restartOrderflowMonitor(slot) {
+  if (process.env.DASHBOARD_ORDERFLOW_RESTART === "0") return false;
+  if (process.platform === "darwin") return false;
+  await execFileAsync("systemctl", ["daemon-reload"], { timeoutMs: 30000 });
+  await execFileAsync("systemctl", ["restart", slot.service], { timeoutMs: 30000 });
+  return true;
+}
+
+function latestOrderflowStarted(logFile) {
+  if (!logFile || !fs.existsSync(logFile)) return null;
+  return readJsonl(logFile, 300)
+    .filter((row) => row.level === "orderflow-trigger-sell-started")
+    .at(-1) ?? null;
+}
+
+async function watchedAddressActivityPayload(url) {
+  if (!watchedAddressActivityEnabled) {
+    return {
+      ok: true,
+      enabled: false,
+      monitors: [],
+      activity: [],
+      warnings: []
+    };
+  }
+
+  const lookbackMinutes = clampInteger(
+    url.searchParams.get("lookbackMinutes") ?? watchedAddressLookbackMinutes,
+    5,
+    240,
+    watchedAddressLookbackMinutes
+  );
+  const limit = clampInteger(
+    url.searchParams.get("limit") ?? watchedAddressActivityLimit,
+    1,
+    200,
+    watchedAddressActivityLimit
+  );
+  const cfg = readConfig();
+  const publicClient = createPublicClient({
+    chain: bsc,
+    transport: viemHttp(cfg.rpcUrl)
+  });
+  const monitors = await Promise.all(watchedAddressSlots.map(readWatchedAddressMonitor));
+  const warnings = [];
+  let scan = {
+    latestBlock: null,
+    fromBlock: null,
+    toBlock: null,
+    rows: []
+  };
+
+  try {
+    scan = await scanWatchedAddressTokenActivity(publicClient, watchedAddressSlots, lookbackMinutes);
+  } catch (error) {
+    warnings.push(`链上回看失败：${cleanError(error)}`);
+  }
+
+  const rows = mergeWatchedAddressRows([
+    ...readWatchedAddressLogActivity(monitors),
+    ...scan.rows
+  ])
+    .sort(compareWatchedAddressRows)
+    .slice(0, limit);
+  const activity = await enrichWatchedAddressRows(cfg, publicClient, rows);
+  return {
+    ok: true,
+    enabled: true,
+    generatedAt: new Date().toISOString(),
+    lookbackMinutes,
+    latestBlock: scan.latestBlock,
+    fromBlock: scan.fromBlock,
+    toBlock: scan.toBlock,
+    monitors,
+    activity,
+    warnings
+  };
+}
+
+async function readWatchedAddressMonitor(slot) {
+  const unitPath = watchedAddressUnitPath(slot.service);
+  const unitExists = Boolean(unitPath && fs.existsSync(unitPath));
+  const text = unitExists ? fs.readFileSync(unitPath, "utf8") : "";
+  const env = parseSystemdEnvironment(text);
+  const stateFile = env.ADDRESS_TX_WATCH_STATE_FILE ?? "";
+  const logFile = env.ADDRESS_TX_WATCH_LOG_FILE ?? "";
+  const state = safeReadJson(stateFile) ?? {};
+  const logs = readJsonl(logFile, 300);
+  const serviceState = await orderflowServiceState(slot.service);
+  const hits = logs.filter((row) => row.level === "address-tx-watch-hit");
+  const alerts = logs.filter((row) => row.level === "address-tx-watch-alert-sent");
+  const suppressed = logs.filter((row) => row.level === "address-tx-watch-alert-suppressed");
+  const errors = logs.filter((row) => row.level === "address-tx-watch-error");
+  const latestStarted = logs.filter((row) => row.level === "address-tx-watch-started").at(-1) ?? null;
+  const address = addressOrFallback(env.ADDRESS_TX_WATCH_ADDRESS, slot.address);
+  return {
+    id: slot.id,
+    label: env.ADDRESS_TX_WATCH_LABEL ?? slot.label,
+    address,
+    service: slot.service,
+    unitPath: unitPath ?? null,
+    unitExists,
+    running: serviceState.running,
+    activeState: serviceState.activeState,
+    subState: serviceState.subState,
+    restarts: serviceState.restarts,
+    cooldownMs: Number(env.ADDRESS_TX_WATCH_COOLDOWN_MS ?? 0),
+    pollMs: Number(env.ADDRESS_TX_WATCH_POLL_MS ?? 0),
+    stateFile,
+    logFile,
+    lastProcessedBlock: state.lastProcessedBlock ?? null,
+    seenTxCount: Object.keys(state.seenTxs ?? {}).length,
+    lastAlertAt: state.alert?.lastSentAt ?? null,
+    lastAlertTxHash: state.alert?.lastTxHash ?? null,
+    latestStartedAt: latestStarted?.at ?? null,
+    recentHitCount: hits.length,
+    recentAlertCount: alerts.length,
+    recentSuppressedCount: suppressed.length,
+    lastHitAt: hits.at(-1)?.at ?? null,
+    lastHitBlock: hits.at(-1)?.blockNumber ?? null,
+    lastErrorAt: errors.at(-1)?.at ?? null,
+    lastError: errors.at(-1)?.message ?? null
+  };
+}
+
+function watchedAddressUnitPath(service) {
+  const systemdPath = path.join(watchedAddressSystemdDir, service);
+  if (fs.existsSync(systemdPath)) return systemdPath;
+  const opsPath = path.join(rootDir, "ops", service);
+  if (fs.existsSync(opsPath)) return opsPath;
+  return systemdPath;
+}
+
+function readWatchedAddressLogActivity(monitors) {
+  const rows = [];
+  for (const monitor of monitors) {
+    for (const row of readJsonl(monitor.logFile, 160)) {
+      if (row.level !== "address-tx-watch-hit" || !row.txHash) continue;
+      rows.push({
+        address: monitor.address,
+        addressLabel: row.label ?? monitor.label,
+        txHash: row.txHash,
+        blockNumber: parseBlockNumber(row.blockNumber),
+        transactionIndex: parseBlockNumber(row.transactionIndex),
+        logIndex: null,
+        directions: Array.isArray(row.directions) ? row.directions : [],
+        direct: Boolean(row.direct),
+        tokenTransferCount: Number(row.tokenTransferCount ?? 0),
+        contracts: Array.isArray(row.contracts) ? row.contracts : [],
+        sentUsdt: 0,
+        receivedUsdt: 0,
+        source: "watcher",
+        seenAt: row.at ?? null
+      });
+    }
+  }
+  return rows;
+}
+
+async function scanWatchedAddressTokenActivity(publicClient, slots, lookbackMinutes) {
+  const latestBlock = await publicClient.getBlockNumber();
+  const scanBlocks = Math.min(
+    Math.max(1, Math.ceil(Number(lookbackMinutes) * watchedAddressBlocksPerMinute) + 120),
+    Math.max(1, watchedAddressMaxScanBlocks)
+  );
+  const fromBlock = latestBlock > BigInt(scanBlocks) ? latestBlock - BigInt(scanBlocks) + 1n : 0n;
+  const toBlock = latestBlock;
+  const rows = new Map();
+  const specs = [
+    {
+      kind: "erc20",
+      topic: ERC20_TRANSFER_TOPIC,
+      fromIndex: 1,
+      toIndex: 2,
+      topicsForFrom: (topic) => [ERC20_TRANSFER_TOPIC, topic],
+      topicsForTo: (topic) => [ERC20_TRANSFER_TOPIC, null, topic]
+    },
+    {
+      kind: "erc1155-single",
+      topic: ERC1155_TRANSFER_SINGLE_TOPIC,
+      fromIndex: 2,
+      toIndex: 3,
+      topicsForFrom: (topic) => [ERC1155_TRANSFER_SINGLE_TOPIC, null, topic],
+      topicsForTo: (topic) => [ERC1155_TRANSFER_SINGLE_TOPIC, null, null, topic]
+    },
+    {
+      kind: "erc1155-batch",
+      topic: ERC1155_TRANSFER_BATCH_TOPIC,
+      fromIndex: 2,
+      toIndex: 3,
+      topicsForFrom: (topic) => [ERC1155_TRANSFER_BATCH_TOPIC, null, topic],
+      topicsForTo: (topic) => [ERC1155_TRANSFER_BATCH_TOPIC, null, null, topic]
+    }
+  ];
+
+  for (const slot of slots) {
+    const address = getAddressOrNull(slot.address);
+    if (!address) continue;
+    const addressTopic = addressToTopic(address);
+    for (const spec of specs) {
+      for (const topics of [spec.topicsForFrom(addressTopic), spec.topicsForTo(addressTopic)]) {
+        const logs = await getWatchedAddressLogs(publicClient, { fromBlock, toBlock, topics });
+        for (const log of logs) {
+          addWatchedAddressTransferLog(rows, slot, address, spec, log);
+        }
+      }
+    }
+  }
+
+  return {
+    latestBlock: latestBlock.toString(),
+    fromBlock: fromBlock.toString(),
+    toBlock: toBlock.toString(),
+    rows: [...rows.values()].map(finalizeWatchedAddressMapRow)
+  };
+}
+
+async function getWatchedAddressLogs(publicClient, { fromBlock, toBlock, topics }) {
+  const rows = [];
+  let cursor = BigInt(fromBlock);
+  const end = BigInt(toBlock);
+  const chunkBlocks = BigInt(Math.max(1, watchedAddressScanChunkBlocks));
+  while (cursor <= end) {
+    const chunkTo = minBigInt(end, cursor + chunkBlocks - 1n);
+    const logs = await publicClient.request({
+      method: "eth_getLogs",
+      params: [{
+        fromBlock: rpcBlockTag(cursor),
+        toBlock: rpcBlockTag(chunkTo),
+        topics
+      }]
+    });
+    rows.push(...logs);
+    cursor = chunkTo + 1n;
+  }
+  return rows;
+}
+
+function addWatchedAddressTransferLog(rows, slot, address, spec, log) {
+  if (String(log.topics?.[0] ?? "").toLowerCase() !== spec.topic) return;
+  const txHash = log.transactionHash;
+  if (!txHash) return;
+  const row = ensureWatchedAddressMapRow(rows, slot, address, txHash);
+  const logIndex = parseBlockNumber(log.logIndex);
+  const blockNumber = parseBlockNumber(log.blockNumber);
+  const transactionIndex = parseBlockNumber(log.transactionIndex);
+  const logKey = `${String(txHash).toLowerCase()}:${String(logIndex ?? "")}`;
+  const firstSeenLog = !row.logKeys.has(logKey);
+  row.blockNumber = maxNumber(row.blockNumber, blockNumber);
+  row.transactionIndex = maxNumber(row.transactionIndex, transactionIndex);
+  row.logIndex = minNullableNumber(row.logIndex, logIndex);
+  row.contracts.add(addressOrFallback(log.address, log.address));
+  row.sources.add("scan");
+
+  const from = topicAddress(log.topics?.[spec.fromIndex]);
+  const to = topicAddress(log.topics?.[spec.toIndex]);
+  const normalized = address.toLowerCase();
+  const isOut = from?.toLowerCase() === normalized;
+  const isIn = to?.toLowerCase() === normalized;
+  if (isOut) row.directions.add("out");
+  if (isIn) row.directions.add("in");
+
+  if (firstSeenLog) {
+    row.logKeys.add(logKey);
+    row.tokenTransferCount += 1;
+    if (spec.kind === "erc20" && normAddress(log.address) === normAddress(ADDRESSES.busdt)) {
+      const amount = numberFromTokenUnits(log.data, 18);
+      if (isOut) row.sentUsdt += amount;
+      if (isIn) row.receivedUsdt += amount;
+    }
+  }
+}
+
+function ensureWatchedAddressMapRow(rows, slot, address, txHash) {
+  const key = watchedAddressActivityKey(address, txHash);
+  if (!rows.has(key)) {
+    rows.set(key, {
+      key,
+      address,
+      addressLabel: slot.label,
+      txHash,
+      blockNumber: null,
+      transactionIndex: null,
+      logIndex: null,
+      directions: new Set(),
+      direct: false,
+      tokenTransferCount: 0,
+      contracts: new Set(),
+      sentUsdt: 0,
+      receivedUsdt: 0,
+      sources: new Set(),
+      seenAt: null,
+      logKeys: new Set()
+    });
+  }
+  return rows.get(key);
+}
+
+function mergeWatchedAddressRows(rows) {
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!row.address || !row.txHash) continue;
+    const key = watchedAddressActivityKey(row.address, row.txHash);
+    const existing = grouped.get(key) ?? {
+      key,
+      address: addressOrFallback(row.address, row.address),
+      addressLabel: row.addressLabel ?? shortAddress(row.address),
+      txHash: row.txHash,
+      blockNumber: null,
+      transactionIndex: null,
+      logIndex: null,
+      directions: new Set(),
+      direct: false,
+      tokenTransferCount: 0,
+      contracts: new Set(),
+      sentUsdt: 0,
+      receivedUsdt: 0,
+      sources: new Set(),
+      seenAt: null
+    };
+    existing.addressLabel = row.addressLabel ?? existing.addressLabel;
+    existing.blockNumber = maxNumber(existing.blockNumber, row.blockNumber);
+    existing.transactionIndex = maxNumber(existing.transactionIndex, row.transactionIndex);
+    existing.logIndex = minNullableNumber(existing.logIndex, row.logIndex);
+    existing.direct = existing.direct || Boolean(row.direct);
+    existing.tokenTransferCount = Math.max(existing.tokenTransferCount, Number(row.tokenTransferCount ?? 0));
+    existing.sentUsdt = Math.max(existing.sentUsdt, Number(row.sentUsdt ?? 0));
+    existing.receivedUsdt = Math.max(existing.receivedUsdt, Number(row.receivedUsdt ?? 0));
+    existing.seenAt = newestIso(existing.seenAt, row.seenAt);
+    for (const direction of row.directions ?? []) existing.directions.add(direction);
+    for (const contract of row.contracts ?? []) existing.contracts.add(contract);
+    for (const source of Array.isArray(row.source) ? row.source : [row.source]) {
+      if (source) existing.sources.add(source);
+    }
+    grouped.set(key, existing);
+  }
+  return [...grouped.values()].map(finalizeWatchedAddressMapRow);
+}
+
+function finalizeWatchedAddressMapRow(row) {
+  const sentUsdt = roundMoney(Number(row.sentUsdt ?? 0));
+  const receivedUsdt = roundMoney(Number(row.receivedUsdt ?? 0));
+  const netUsdt = roundMoney(receivedUsdt - sentUsdt);
+  return {
+    key: row.key,
+    address: addressOrFallback(row.address, row.address),
+    addressLabel: row.addressLabel,
+    txHash: row.txHash,
+    blockNumber: row.blockNumber,
+    transactionIndex: row.transactionIndex,
+    logIndex: row.logIndex,
+    directions: [...(row.directions ?? [])].sort(),
+    direct: Boolean(row.direct),
+    tokenTransferCount: Number(row.tokenTransferCount ?? 0),
+    contracts: [...(row.contracts ?? [])].sort(),
+    sentUsdt,
+    receivedUsdt,
+    netUsdt,
+    source: [...(row.sources ?? [])].sort(),
+    seenAt: row.seenAt ?? null
+  };
+}
+
+async function enrichWatchedAddressRows(cfg, publicClient, rows) {
+  const enriched = [];
+  for (const row of rows) {
+    enriched.push(await enrichWatchedAddressRow(cfg, publicClient, row));
+  }
+  return enriched.sort(compareWatchedAddressRows);
+}
+
+async function enrichWatchedAddressRow(cfg, publicClient, row) {
+  const base = {
+    ...row,
+    shortTx: shortHash(row.txHash),
+    explorerUrl: `https://bscscan.com/tx/${row.txHash}`,
+    directionsText: watchedDirectionsText(row.directions),
+    amountText: watchedAmountText(row),
+    status: null,
+    at: row.seenAt,
+    events: [],
+    event: null
+  };
+  try {
+    const tx = await getWatchedAddressTxContext(publicClient, row.txHash);
+    const blockTime = tx.block?.timestamp !== undefined
+      ? new Date(Number(tx.block.timestamp) * 1000).toISOString()
+      : null;
+    const events = await decodeWatchedAddressTxEvents(cfg, tx.receipt, row.address);
+    const primary = primaryWatchedAddressEvent(events);
+    return {
+      ...base,
+      blockNumber: row.blockNumber ?? parseBlockNumber(tx.receipt?.blockNumber),
+      status: tx.receipt?.status ?? null,
+      at: blockTime ?? row.seenAt,
+      events,
+      event: primary
+    };
+  } catch (error) {
+    return {
+      ...base,
+      error: cleanError(error)
+    };
+  }
+}
+
+async function getWatchedAddressTxContext(publicClient, txHash) {
+  const key = normHash(txHash);
+  if (watchedAddressTxCache.has(key)) return watchedAddressTxCache.get(key);
+  const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
+  const block = receipt?.blockNumber !== undefined && receipt?.blockNumber !== null
+    ? await publicClient.getBlock({ blockNumber: toBigInt(receipt.blockNumber) }).catch(() => null)
+    : null;
+  const context = { receipt, block };
+  watchedAddressTxCache.set(key, context);
+  pruneMap(watchedAddressTxCache, 240);
+  return context;
+}
+
+async function decodeWatchedAddressTxEvents(cfg, receipt, watchedAddress) {
+  const normalized = normAddress(watchedAddress);
+  const rawEvents = [];
+  for (const log of receipt?.logs ?? []) {
+    const topic0 = String(log.topics?.[0] ?? "").toLowerCase();
+    if (topic0 === MARKET_TRADE_TOPIC) {
+      const event = parseWatchedMarketTradeLog(log, normalized);
+      if (event) rawEvents.push(event);
+      continue;
+    }
+    if (topic0 === ERC1155_TRANSFER_SINGLE_TOPIC) {
+      const event = parseWatchedErc1155TransferSingleLog(log, normalized);
+      if (event) rawEvents.push(event);
+    }
+  }
+
+  const deduped = dedupeWatchedAddressEvents(rawEvents);
+  const events = [];
+  for (const event of deduped) {
+    events.push(await enrichWatchedAddressEvent(cfg, event));
+  }
+  return events.filter((event) => event.market || event.question);
+}
+
+function parseWatchedMarketTradeLog(log, normalizedWatchedAddress) {
+  if ((log.topics?.length ?? 0) < 4) return null;
+  const user = topicAddress(log.topics[2]);
+  if (!user || normAddress(user) !== normalizedWatchedAddress) return null;
+  const dataWords = dataWords64(log.data);
+  if (dataWords.length < 2) return null;
+  const netCollateral = int256FromWord(dataWords[0]);
+  const size = int256FromWord(dataWords[1]);
+  return {
+    kind: "market_trade",
+    action: netCollateral >= 0n ? "buy" : "sell",
+    actionLabel: netCollateral >= 0n ? "买入" : "卖出",
+    market: addressOrFallback(log.address, log.address),
+    tokenId: BigInt(log.topics[3]).toString(),
+    amountUsdt: roundMoney(numberFromTokenUnits(absBigInt(netCollateral), 18)),
+    size: chips(numberFromTokenUnits(absBigInt(size), 18)),
+    logIndex: parseBlockNumber(log.logIndex)
+  };
+}
+
+function parseWatchedErc1155TransferSingleLog(log, normalizedWatchedAddress) {
+  if ((log.topics?.length ?? 0) < 4) return null;
+  const from = topicAddress(log.topics[2]);
+  const to = topicAddress(log.topics[3]);
+  const isOut = from && normAddress(from) === normalizedWatchedAddress;
+  const isIn = to && normAddress(to) === normalizedWatchedAddress;
+  if (!isOut && !isIn) return null;
+  const dataWords = dataWords64(log.data);
+  if (dataWords.length < 2) return null;
+  return {
+    kind: "market_token_transfer",
+    action: isOut ? "transfer_out" : "transfer_in",
+    actionLabel: isOut ? "转出/赎回" : "转入",
+    market: addressOrFallback(log.address, log.address),
+    tokenId: BigInt(`0x${dataWords[0]}`).toString(),
+    amountUsdt: "",
+    size: chips(numberFromTokenUnits(BigInt(`0x${dataWords[1]}`), 18)),
+    logIndex: parseBlockNumber(log.logIndex)
+  };
+}
+
+function dedupeWatchedAddressEvents(events) {
+  const hasTrade = new Set(events
+    .filter((event) => event.kind === "market_trade")
+    .map((event) => `${normAddress(event.market)}:${event.tokenId}`));
+  const deduped = new Map();
+  for (const event of events) {
+    const marketTokenKey = `${normAddress(event.market)}:${event.tokenId}`;
+    if (event.kind !== "market_trade" && hasTrade.has(marketTokenKey)) continue;
+    const key = `${marketTokenKey}:${event.kind}:${event.action}`;
+    if (!deduped.has(key)) deduped.set(key, event);
+  }
+  return [...deduped.values()].sort((a, b) => Number(a.logIndex ?? 0) - Number(b.logIndex ?? 0));
+}
+
+async function enrichWatchedAddressEvent(cfg, event) {
+  const market = await fetchWatchedAddressMarket(cfg, event.market);
+  const outcome = findOutcomeByTokenId(market, event.tokenId);
+  return {
+    ...event,
+    question: market?.question ?? market?.title ?? "",
+    status: market?.status ?? "",
+    category: market ? firstCategory(market) : "",
+    startsAt: market?.startDate ?? "",
+    endsAt: market?.endDate ?? "",
+    outcome: outcome?.name ?? outcome?.title ?? (event.tokenId ? `Token ${event.tokenId}` : "")
+  };
+}
+
+async function fetchWatchedAddressMarket(cfg, address) {
+  const key = normAddress(address);
+  if (!key) return null;
+  if (watchedAddressMarketCache.has(key)) return watchedAddressMarketCache.get(key);
+  try {
+    const market = await fetchMarket(cfg, address);
+    watchedAddressMarketCache.set(key, market);
+    pruneMap(watchedAddressMarketCache, 240);
+    return market;
+  } catch {
+    watchedAddressMarketCache.set(key, null);
+    pruneMap(watchedAddressMarketCache, 240);
+    return null;
+  }
+}
+
+function primaryWatchedAddressEvent(events) {
+  return events.find((event) => event.kind === "market_trade")
+    ?? events.find((event) => event.question)
+    ?? events[0]
+    ?? null;
+}
+
+function findOutcomeByTokenId(market, tokenId) {
+  const id = String(tokenId ?? "");
+  return (market?.outcomes ?? []).find((outcome) => String(outcome.tokenId ?? "") === id) ?? null;
+}
+
+function parseSystemdEnvironment(text) {
+  const env = {};
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line.startsWith("Environment=")) continue;
+    const body = line.slice("Environment=".length).trim();
+    for (const item of splitSystemdEnvironmentWords(body)) {
+      const index = item.indexOf("=");
+      if (index <= 0) continue;
+      env[item.slice(0, index)] = unquoteSystemdValue(item.slice(index + 1));
+    }
+  }
+  return env;
+}
+
+function splitSystemdEnvironmentWords(value) {
+  const words = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  for (const char of String(value ?? "")) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = "";
+      else current += char;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      if (current) words.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current) words.push(current);
+  return words;
+}
+
+function unquoteSystemdValue(value) {
+  const text = String(value ?? "");
+  if ((text.startsWith("\"") && text.endsWith("\"")) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
+
+function setSystemdEnvironment(text, key, value) {
+  const safeKey = String(key);
+  const safeValue = String(value ?? "");
+  if (!/^[A-Z0-9_]+$/u.test(safeKey)) throw new Error("Invalid environment key");
+  if (/[\r\n\s"']/u.test(safeValue)) throw new Error(`Invalid value for ${safeKey}`);
+  const line = `Environment=${safeKey}=${safeValue}`;
+  const pattern = new RegExp(`^Environment=${escapeRegExp(safeKey)}=.*$`, "m");
+  if (pattern.test(text)) return text.replace(pattern, line);
+  const anchor = /^Environment=ORDERFLOW_TRIGGER_EXECUTE=.*$/m;
+  if (anchor.test(text)) return text.replace(anchor, (match) => `${match}\n${line}`);
+  return text.replace(/^(\[Service\])$/m, `$1\n${line}`);
+}
+
+function normalizeOrderflowMarket(value) {
+  const market = String(value ?? "").trim();
+  if (!/^0x[a-fA-F0-9]{40}$/u.test(market)) throw new Error("Invalid market address");
+  return market;
+}
+
+function normalizeOrderflowThreshold(value) {
+  const threshold = Number(value);
+  if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 1000000) {
+    throw new Error("Invalid threshold");
+  }
+  return roundMoney(threshold);
+}
+
+function normalizeOrderflowTokenIds(value) {
+  const ids = parseOrderflowTokenIds(value);
+  if (ids.length > 64) throw new Error("Too many token IDs");
+  for (const id of ids) {
+    if (!/^\d+$/u.test(id) || BigInt(id) <= 0n) throw new Error("Invalid token ID");
+  }
+  return [...new Set(ids)];
+}
+
+function parseOrderflowTokenIds(value) {
+  const items = Array.isArray(value) ? value : String(value ?? "").split(/[,\s]+/u);
+  return items.map((item) => String(item ?? "").trim()).filter(Boolean);
+}
+
+function normalizeOrderflowBoolean(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function marketDetail(url) {
   const address = url.searchParams.get("market");
   if (!address) throw new Error("Missing market");
   const cfg = readConfig();
   const followState = readMarketFollowState(cfg.marketFollowFile);
+  const plannedBuys = readDashboardPlannedBuys(cfg);
   const market = await fetchMarket(cfg, address);
   const baseDecision = getBaseEventMarketDecision(market, cfg);
-  const decision = getEventMarketDecision(market, { ...cfg, marketFollowState: followState });
+  const rawDecision = getEventMarketDecision(market, { ...cfg, marketFollowState: followState });
+  const plannedBuy = findDashboardPlannedBuy(plannedBuys, market);
+  const decision = dashboardPlannedBuyDecision(rawDecision, plannedBuy);
+  const follow = dashboardPlannedBuyFollow(
+    marketFollowStatus(followState, market, baseDecision, decision),
+    plannedBuy,
+    decision
+  );
   return {
     ok: true,
     market: {
@@ -500,7 +1827,7 @@ async function marketDetail(url) {
         reason: decision.reason,
         reasonText: decision.reasonText
       },
-      follow: marketFollowStatus(followState, market, baseDecision, decision),
+      follow,
       outcomes: sortOutcomesForDashboard(market.outcomes ?? []).map((outcome) => ({
         tokenId: String(outcome.tokenId ?? ""),
         name: outcome.name ?? outcome.title ?? "Outcome",
@@ -593,46 +1920,6 @@ async function restartWorker() {
 
 function roundMoney(value) {
   return Math.round(Number(value) * 1000000) / 1000000;
-}
-
-function autoSellText(watchConfig, cfg) {
-  const enabled = Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled);
-  if (!enabled) return "关闭";
-  const strategy = watchConfig?.autoSellStrategy ?? cfg.autoSellStrategy;
-  if (strategy === "open_timed_exit") {
-    const delay = watchConfig?.autoSellOpenExitDelaySeconds ?? cfg.autoSellOpenExitDelaySeconds ?? 36;
-    const percent = watchConfig?.autoSellOpenExitPercent ?? cfg.autoSellOpenExitPercent ?? 100;
-    return `开盘 T+${delay}s 卖 ${percent}% / ${autoSellStopLossText(watchConfig, cfg)}`;
-  }
-  if (strategy === "pre_start_exit") {
-    const beforeStart = Number(watchConfig?.autoSellBeforeMarketStartSeconds ?? cfg.autoSellBeforeMarketStartSeconds ?? 0);
-    const preStart = beforeStart > 0 ? `赛前 ${Math.round(beforeStart / 60)}min 清仓` : "赛前清仓未配置";
-    return `持有不分批卖 / ${preStart} / ${autoSellStopLossText(watchConfig, cfg)}`;
-  }
-  if (strategy === "ladder") {
-    const delay = watchConfig?.autoSellStartDelaySeconds ?? cfg.autoSellStartDelaySeconds;
-    const interval = watchConfig?.autoSellIntervalSeconds ?? cfg.autoSellIntervalSeconds;
-    const chunk = watchConfig?.autoSellChunkPercent ?? cfg.autoSellChunkPercent;
-    const profit = Number(watchConfig?.autoSellLadderProfitPercent ?? cfg.autoSellLadderProfitPercent ?? 0);
-    const takeProfitSteps = Number(watchConfig?.autoSellTakeProfitSteps ?? cfg.autoSellTakeProfitSteps ?? 0);
-    const beforeStart = Number(watchConfig?.autoSellBeforeMarketStartSeconds ?? cfg.autoSellBeforeMarketStartSeconds ?? 0);
-    const gate = profit > 0 ? `盈 ${profit}% 后` : `${delay}s 后`;
-    const takeProfit = takeProfitSteps > 0
-      ? `${gate}卖 ${chunk}% ${takeProfitSteps} 次`
-      : `${gate}每 ${interval}s 卖 ${chunk}%`;
-    const preStart = beforeStart > 0 ? ` / 赛前 ${Math.round(beforeStart / 60)}min 清剩余` : "";
-    return `${takeProfit}${preStart} / ${autoSellStopLossText(watchConfig, cfg)}`;
-  }
-  const takeProfit = `${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x 卖 ${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`;
-  return `${takeProfit} / ${autoSellStopLossText(watchConfig, cfg)}`;
-}
-
-function autoSellStopLossText(watchConfig, cfg) {
-  const enabled = Boolean(watchConfig?.autoSellStopLossEnabled ?? cfg.autoSellStopLossEnabled);
-  if (!enabled) return "止损关闭";
-  const percent = watchConfig?.autoSellStopLossPercent ?? cfg.autoSellStopLossPercent;
-  const sellPercent = Number(watchConfig?.autoSellStopLossSellPercent ?? cfg.autoSellStopLossSellPercent ?? 100);
-  return sellPercent >= 100 ? `亏 ${percent}% 全卖` : `亏 ${percent}% 卖 ${sellPercent}%`;
 }
 
 function broadcastWindowText(watchConfig, cfg) {
@@ -905,7 +2192,9 @@ function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readC
     const choices = state === "已买" && boughtInfo?.outcomeCount > 0
       ? boughtInfo.outcomeCount
       : Math.min(displayChoices, market.outcomes?.length ?? 0);
-    const plannedStake = displayStakePerOutcome * Math.min(displayChoices, market.outcomes?.length ?? 0);
+    const plannedStake = plannedBuy
+      ? dashboardPlannedBuyTotalStake(plannedBuy, displayStakePerOutcome, market.outcomes?.length ?? 0)
+      : displayStakePerOutcome * Math.min(displayChoices, market.outcomes?.length ?? 0);
     const stake = state === "已买" && boughtInfo?.amount > 0 ? boughtInfo.amount : plannedStake;
     rows.push({
       title: market.question,
@@ -945,7 +2234,7 @@ function normalizeNewMarkets(markets, status, walletRows, localRows, cfg = readC
 
 function dashboardPlannedBuyDecision(decision, plannedBuy) {
   if (!plannedBuy) return decision;
-  if (["missing-market", "status", "no-outcomes", "price-market", "follow-blocked"].includes(decision?.reason)) {
+  if (["missing-market", "status", "no-outcomes", "follow-blocked"].includes(decision?.reason)) {
     return decision;
   }
   return {
@@ -990,29 +2279,98 @@ function normalizeDashboardPlannedBuy(row) {
   const questionRegex = normQuestionRegex(row.questionRegex ?? row.titleRegex);
   if (!market && !question && !questionRegex) return null;
   const stakePerOutcomeUsdt = Number(row.stakePerOutcomeUsdt ?? row.stake ?? row.stakeUsdt);
+  const stakeByOutcomeUsdt = normalizeDashboardStakeByOutcome(
+    row.stakeByOutcomeUsdt ?? row.outcomeStakesUsdt ?? row.stakesByOutcome,
+    outcomes
+  );
   const kickoffAt = normalizeDashboardDate(row.kickoffAt ?? row.marketStartAt ?? row.matchStartAt);
   return {
+    id: String(row.id ?? "").trim() || null,
     enabled: row.enabled !== false && row.disabled !== true,
     market,
     question,
     questionRegex,
     outcomes,
     stakePerOutcomeUsdt: Number.isFinite(stakePerOutcomeUsdt) && stakePerOutcomeUsdt > 0 ? stakePerOutcomeUsdt : null,
+    stakeByOutcomeUsdt,
+    openBroadcastDelayMs: normalizeDashboardNonNegativeNumber(row.openBroadcastDelayMs),
+    gasPriceGwei: normalizeDashboardPositiveNumber(row.gasPriceGwei),
+    builderBundle: normalizeDashboardBuilderBundle(row.builderBundle),
+    autoSell: normalizeDashboardPlannedAutoSell(row.autoSell, outcomes),
     kickoffAt
   };
 }
 
+function normalizeDashboardStakeByOutcome(value, outcomes = []) {
+  if (!value || typeof value !== "object") return {};
+  const entries = Array.isArray(value)
+    ? value.map((row) => [row?.outcome ?? row?.name, row?.stakeUsdt ?? row?.amountUsdt ?? row?.stake])
+    : Object.entries(value);
+  const selectedByKey = new Map(outcomes.map((outcome) => [normQuestion(outcome), outcome]));
+  const result = {};
+  for (const [rawOutcome, rawStake] of entries) {
+    const selectedOutcome = selectedByKey.get(normQuestion(rawOutcome));
+    const stakeUsdt = Number(rawStake);
+    if (!selectedOutcome || !Number.isFinite(stakeUsdt) || stakeUsdt <= 0) continue;
+    result[selectedOutcome] = stakeUsdt;
+  }
+  return result;
+}
+
+function dashboardPlannedBuyTotalStake(plan, fallbackStake, availableOutcomeCount) {
+  const selected = (plan?.outcomes ?? []).slice(0, Math.min(plan?.outcomes?.length ?? 0, availableOutcomeCount));
+  return selected.reduce((sum, outcome) => (
+    sum + Number(plan?.stakeByOutcomeUsdt?.[outcome] ?? fallbackStake)
+  ), 0);
+}
+
+function normalizeDashboardPlannedAutoSell(value, outcomes = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    priceTargets: normalizeDashboardPriceTargets(value.priceTargets, outcomes),
+    priceHotPollMs: normalizeDashboardPositiveNumber(value.priceHotPollMs),
+    priceHotWindowSeconds: normalizeDashboardPositiveNumber(value.priceHotWindowSeconds),
+    priceSellPercent: normalizeDashboardPositiveNumber(value.priceSellPercent),
+    priceApplyAfterIso: normalizeDashboardDate(value.priceApplyAfterIso),
+    stopLossEnabled: value.stopLossEnabled === true
+  };
+}
+
+function normalizeDashboardBuilderBundle(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    enabled: value.enabled === true,
+    mode: String(value.mode ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_"),
+    timingMode: String(value.timingMode ?? "").trim().toLowerCase().replace(/[-\s]+/gu, "_"),
+    tipBnb: String(value.tipBnb ?? "").trim() || null,
+    prepositionLeadMs: normalizeDashboardNonNegativeNumber(value.prepositionLeadMs),
+    noMerge: value.noMerge === true,
+    positionFirst: value.positionFirst === true
+  };
+}
+
+function normalizeDashboardNonNegativeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function normalizeDashboardPositiveNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
 function findDashboardPlannedBuy(plans, market) {
+  return plans.find((plan) => plan.enabled && dashboardPlannedBuyMatches(plan, market)) ?? null;
+}
+
+function dashboardPlannedBuyMatches(plan, market) {
+  if (!plan || !market) return false;
   const marketAddress = normAddress(market?.address);
   const marketQuestion = normQuestion(market?.question);
   const marketQuestionText = String(market?.question ?? "").trim().replace(/\s+/gu, " ");
-  return plans.find((plan) => {
-    if (!plan.enabled) return false;
-    if (plan.market && marketAddress && plan.market === marketAddress) return true;
-    if (plan.question && marketQuestion && plan.question === marketQuestion) return true;
-    if (plan.questionRegex && marketQuestionText && questionRegexMatches(plan.questionRegex, marketQuestionText)) return true;
-    return false;
-  }) ?? null;
+  if (plan.market && marketAddress && plan.market === marketAddress) return true;
+  if (plan.question && marketQuestion && plan.question === marketQuestion) return true;
+  return Boolean(plan.questionRegex && marketQuestionText && questionRegexMatches(plan.questionRegex, marketQuestionText));
 }
 
 function normQuestion(value) {
@@ -1766,6 +3124,404 @@ function normalizeProject(project) {
   };
 }
 
+async function buildAggregatePnl(baseCfg = readConfig()) {
+  if (!aggregatePnlEnabled) return null;
+  const profiles = resolveAggregatePnlProfiles(baseCfg);
+  if (profiles.length === 0) return null;
+
+  const profileResults = await Promise.all(profiles.map((profile) => buildAggregateProfilePnl(profile, baseCfg)));
+  const daily = new Map();
+  const totals = {
+    bought: 0,
+    sold: 0,
+    realized: 0,
+    openValue: 0,
+    openPnl: 0,
+    gasUsdt: 0,
+    gasBnb: 0,
+    unpricedGasBnb: 0,
+    txCount: 0
+  };
+
+  for (const profile of profileResults) {
+    totals.bought += profile.values.bought;
+    totals.sold += profile.values.sold;
+    totals.realized += profile.values.realized;
+    totals.openValue += profile.values.openValue;
+    totals.openPnl += profile.values.openPnl;
+    totals.gasUsdt += profile.values.gasUsdt;
+    totals.gasBnb += profile.values.gasBnb;
+    totals.unpricedGasBnb += profile.values.unpricedGasBnb;
+    totals.txCount += profile.values.txCount;
+    for (const [day, value] of profile.daily.entries()) {
+      daily.set(day, (daily.get(day) ?? 0) + value);
+    }
+  }
+
+  const realizedNet = totals.realized - totals.gasUsdt;
+  const totalNet = realizedNet + totals.openPnl;
+  const invested = totals.bought;
+  const todayKey = dashboardDayKey(new Date(), aggregatePnlTimeZone);
+  const series = aggregatePnlSeries(daily, todayKey);
+
+  return {
+    enabled: true,
+    title: "Bot1-Bot5 总净盈亏",
+    timeZone: aggregatePnlTimeZone,
+    updatedAt: new Date().toISOString(),
+    cards: {
+      totalNet: money(totalNet, { sign: true }),
+      totalNetValue: roundMoney(totalNet),
+      totalPositive: totalNet >= 0,
+      realizedNet: money(realizedNet, { sign: true }),
+      realizedNetValue: roundMoney(realizedNet),
+      realizedPositive: realizedNet >= 0,
+      dailyNet: money(daily.get(todayKey) ?? 0, { sign: true }),
+      dailyNetValue: roundMoney(daily.get(todayKey) ?? 0),
+      dailyPositive: (daily.get(todayKey) ?? 0) >= 0,
+      openPnl: money(totals.openPnl, { sign: true }),
+      openPnlValue: roundMoney(totals.openPnl),
+      openPositive: totals.openPnl >= 0,
+      gasFee: money(totals.gasUsdt),
+      gasFeeValue: roundMoney(totals.gasUsdt),
+      gasFeeBnb: money(totals.gasBnb),
+      unpricedGasFeeBnb: money(totals.unpricedGasBnb),
+      gasTxCount: totals.txCount,
+      roi: pct(invested > 0 ? (totalNet / invested) * 100 : 0)
+    },
+    profiles: profileResults.map((profile) => ({
+      label: profile.label,
+      wallet: shortAddress(profile.wallet),
+      netPnl: money(profile.values.netPnl, { sign: true }),
+      netPnlValue: roundMoney(profile.values.netPnl),
+      positive: profile.values.netPnl >= 0,
+      realizedNet: money(profile.values.realizedNet, { sign: true }),
+      openPnl: money(profile.values.openPnl, { sign: true }),
+      gas: money(profile.values.gasUsdt),
+      txCount: profile.values.txCount,
+      ok: profile.errors.length === 0,
+      warning: profile.errors.join("；")
+    })),
+    series: series.map((row) => ({
+      ...row,
+      dailyNetText: money(row.dailyNet, { sign: true }),
+      cumulativeNetText: money(row.cumulativeNet, { sign: true })
+    })),
+    warnings: profileResults.flatMap((profile) => profile.errors.map((error) => `${profile.label}: ${error}`))
+  };
+}
+
+function resolveAggregatePnlProfiles(baseCfg) {
+  return defaultAggregatePnlProfiles().map((spec) => {
+    const fileEnv = readEnvFileSafe(spec.envFile);
+    const env = { ...(spec.current ? currentProfileAggregateEnv(baseCfg) : {}), ...fileEnv };
+    const runtimeConfigFile = resolveDashboardPath(
+      env.RUNTIME_CONFIG_FILE,
+      spec.current ? baseCfg.runtimeConfigFile : path.join(spec.dataDir, "runtime-config.json")
+    );
+    const dataDir = path.dirname(runtimeConfigFile);
+    const wallet = String(env.DASHBOARD_WALLET ?? env.WALLET_ADDRESS ?? "").trim();
+    if (!wallet) return null;
+    return {
+      id: spec.id,
+      label: spec.label,
+      wallet,
+      restUrl: env.FORTYTWO_REST_URL || baseCfg.restUrl,
+      activitySince: env.DASHBOARD_ACTIVITY_SINCE ?? "",
+      fillsFile: resolveDashboardPath(env.FILLS_FILE, path.join(dataDir, "fills.jsonl")),
+      actionsFile: resolveDashboardPath(env.DASHBOARD_ACTIONS_FILE, path.join(dataDir, "dashboard-actions.jsonl")),
+      gasLedgerFile: resolveDashboardPath(env.GAS_LEDGER_FILE, path.join(dataDir, "gas-ledger.jsonl"))
+    };
+  }).filter(Boolean);
+}
+
+function defaultAggregatePnlProfiles() {
+  return [
+    {
+      id: "42space",
+      label: "Bot1",
+      envFile: "/etc/42space/profiles/42space.env",
+      dataDir: "/opt/42space/data/42space",
+      current: true
+    },
+    {
+      id: "42space-2",
+      label: "Bot2",
+      envFile: "/etc/42space/profiles/42space-2.env",
+      dataDir: "/opt/42space/data/42space-2"
+    },
+    {
+      id: "42space-3",
+      label: "Bot3",
+      envFile: "/etc/42space/profiles/42space-3.env",
+      dataDir: "/opt/42space/data/42space-3"
+    },
+    {
+      id: "42space-4",
+      label: "Bot4",
+      envFile: "/etc/42space/profiles/42space-4.env",
+      dataDir: "/opt/42space/data/42space-4"
+    },
+    {
+      id: "42space-5",
+      label: "Bot5",
+      envFile: "/etc/42space/profiles/42space-5.env",
+      dataDir: "/opt/42space/data/42space-5"
+    }
+  ];
+}
+
+function currentProfileAggregateEnv(baseCfg) {
+  return {
+    BOT_NAME: baseCfg.botName ?? appName,
+    DASHBOARD_WALLET: botWallet,
+    WALLET_ADDRESS: baseCfg.walletAddress,
+    FORTYTWO_REST_URL: baseCfg.restUrl,
+    RUNTIME_CONFIG_FILE: baseCfg.runtimeConfigFile,
+    FILLS_FILE: baseCfg.fillsFile,
+    DASHBOARD_ACTIONS_FILE: actionsFile,
+    GAS_LEDGER_FILE: gasLedgerFileForConfig(baseCfg),
+    DASHBOARD_ACTIVITY_SINCE: dashboardActivitySince
+  };
+}
+
+async function buildAggregateProfilePnl(profile, baseCfg) {
+  const errors = [];
+  const cfg = { ...baseCfg, restUrl: profile.restUrl };
+  const [activityResult, positionsResult] = await Promise.all([
+    safeProfileFetch(() => fetchActivity(cfg, {
+      user: profile.wallet,
+      limit: aggregatePnlActivityLimit
+    }), "activity"),
+    safeProfileFetch(() => fetchOpenPositions(cfg, {
+      user: profile.wallet,
+      limit: aggregatePnlPositionLimit
+    }), "positions")
+  ]);
+  if (activityResult.error) errors.push(activityResult.error);
+  if (positionsResult.error) errors.push(positionsResult.error);
+
+  const activityRows = filterActivitySince(activityResult.rows, profile.activitySince);
+  const positions = positionsResult.rows;
+  const gasEntries = filterGasSince(
+    dedupeGasEntries(readGasLedger(profile.gasLedgerFile, { limit: aggregatePnlGasLimit })),
+    profile.activitySince
+  );
+  const gasSummary = buildGasSummary(gasEntries);
+  const ledger = buildTradeLedger(activityRows);
+  const daily = profileDailyNet(activityRows, gasEntries);
+  const totals = [...ledger.markets.values()].reduce((acc, trade) => {
+    acc.bought += Number(trade.bought ?? 0);
+    acc.sold += Number(trade.sold ?? 0);
+    acc.realized += Number(trade.realized ?? 0);
+    return acc;
+  }, { bought: 0, sold: 0, realized: 0, openValue: 0, openPnl: 0 });
+  for (const row of positions) {
+    totals.openValue += aggregatePositionMarkValue(row);
+    totals.openPnl += aggregatePositionCashPnl(row);
+  }
+
+  const gasUsdt = Number(gasSummary.totalGasFeeUsdt ?? 0);
+  const realizedNet = totals.realized - gasUsdt;
+  const netPnl = realizedNet + totals.openPnl;
+  return {
+    label: profile.label,
+    wallet: profile.wallet,
+    errors,
+    daily,
+    values: {
+      bought: totals.bought,
+      sold: totals.sold,
+      realized: totals.realized,
+      openValue: totals.openValue,
+      openPnl: totals.openPnl,
+      gasUsdt,
+      gasBnb: Number(gasSummary.totalGasFeeBnb ?? 0),
+      unpricedGasBnb: Number(gasSummary.unpricedGasFeeBnb ?? 0),
+      txCount: Number(gasSummary.txCount ?? 0),
+      realizedNet,
+      netPnl
+    }
+  };
+}
+
+function aggregatePositionCostBasis(row) {
+  return num(row.costBasisUsdt ?? row.costBasis);
+}
+
+function aggregatePositionCashPnl(row) {
+  return num(row.cashPnlUsdt ?? row.cashPnl);
+}
+
+function aggregatePositionMarkValue(row) {
+  if (row.markValueUsdt !== undefined && row.markValueUsdt !== null) return num(row.markValueUsdt);
+  return aggregatePositionCostBasis(row) + aggregatePositionCashPnl(row);
+}
+
+async function safeProfileFetch(fn, label) {
+  try {
+    const rows = await fn();
+    return { rows: Array.isArray(rows) ? rows : [] };
+  } catch (error) {
+    return { rows: [], error: `${label} 读取失败：${cleanError(error)}` };
+  }
+}
+
+function profileDailyNet(activityRows, gasEntries) {
+  const daily = new Map();
+  for (const row of activityRows) {
+    const type = String(row.type ?? "").toUpperCase();
+    if (!isLedgerExitType(type)) continue;
+    const day = dashboardDayKey(activityRowTime(row), aggregatePnlTimeZone);
+    if (!day) continue;
+    daily.set(day, (daily.get(day) ?? 0) + num(row.realizedPnlDelta));
+  }
+  for (const entry of gasEntries) {
+    const gasUsdt = Number(entry.totalFeeUsdt ?? entry.gasFeeUsdt ?? 0);
+    if (!Number.isFinite(gasUsdt) || gasUsdt <= 0) continue;
+    const day = dashboardDayKey(entry.blockTime ?? entry.at, aggregatePnlTimeZone);
+    if (!day) continue;
+    daily.set(day, (daily.get(day) ?? 0) - gasUsdt);
+  }
+  return daily;
+}
+
+function aggregatePnlSeries(daily, todayKey) {
+  if (daily.size === 0) return [];
+  const keys = [...daily.keys()].sort();
+  const firstKey = keys[0];
+  const lastKey = [keys.at(-1), todayKey].filter(Boolean).sort().at(-1);
+  const rows = [];
+  let cumulative = 0;
+  for (const day of enumerateDayKeys(firstKey, lastKey)) {
+    const dailyNet = daily.get(day) ?? 0;
+    cumulative += dailyNet;
+    rows.push({
+      date: day,
+      label: day.slice(5).replace("-", "/"),
+      dailyNet: roundMoney(dailyNet),
+      cumulativeNet: roundMoney(cumulative)
+    });
+  }
+  const maxDays = Number.isFinite(aggregatePnlDays) && aggregatePnlDays > 0 ? aggregatePnlDays : 90;
+  return rows.slice(-maxDays);
+}
+
+function enumerateDayKeys(startKey, endKey) {
+  const start = Date.parse(`${startKey}T00:00:00Z`);
+  const end = Date.parse(`${endKey}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) return [];
+  const days = [];
+  for (let time = start; time <= end; time += 86400000) {
+    days.push(new Date(time).toISOString().slice(0, 10));
+  }
+  return days;
+}
+
+function dashboardDayKey(value, timeZone) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(date).reduce((acc, part) => {
+      acc[part.type] = part.value;
+      return acc;
+    }, {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
+
+function filterGasSince(rows, since) {
+  const cutoffMs = Date.parse(String(since ?? ""));
+  if (!Number.isFinite(cutoffMs)) return rows;
+  return rows.filter((row) => {
+    const time = Date.parse(row?.blockTime ?? row?.at ?? "");
+    return Number.isFinite(time) && time >= cutoffMs;
+  });
+}
+
+function dedupeGasEntries(entries = []) {
+  const byTx = new Map();
+  for (const entry of entries) {
+    const txHash = normHash(entry?.txHash);
+    if (!txHash) continue;
+    const current = byTx.get(txHash);
+    if (!current || preferDashboardGasEntry(entry, current)) byTx.set(txHash, entry);
+  }
+  return [...byTx.values()];
+}
+
+function preferDashboardGasEntry(candidate, current) {
+  const candidateExtra = Number(candidate?.extraFeeBnb ?? 0);
+  const currentExtra = Number(current?.extraFeeBnb ?? 0);
+  if (candidateExtra > 0 && currentExtra <= 0) return true;
+  if (candidateExtra <= 0 && currentExtra > 0) return false;
+  const candidateUsdt = Number(candidate?.totalFeeUsdt ?? candidate?.gasFeeUsdt ?? 0);
+  const currentUsdt = Number(current?.totalFeeUsdt ?? current?.gasFeeUsdt ?? 0);
+  if (candidateUsdt > 0 && currentUsdt <= 0) return true;
+  if (candidateUsdt <= 0 && currentUsdt > 0) return false;
+  return safeTime(candidate?.at) >= safeTime(current?.at);
+}
+
+function readEnvFileSafe(file) {
+  if (!file || !fs.existsSync(file)) return {};
+  const result = {};
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return {};
+  }
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim().replace(/^export\s+/, "");
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u);
+    if (!match) continue;
+    const key = match[1];
+    if (![
+      "BOT_NAME",
+      "DASHBOARD_WALLET",
+      "WALLET_ADDRESS",
+      "FORTYTWO_REST_URL",
+      "RUNTIME_CONFIG_FILE",
+      "FILLS_FILE",
+      "DASHBOARD_ACTIONS_FILE",
+      "GAS_LEDGER_FILE",
+      "DASHBOARD_ACTIVITY_SINCE"
+    ].includes(key)) continue;
+    result[key] = parseEnvFileValue(match[2]);
+  }
+  return result;
+}
+
+function parseEnvFileValue(value) {
+  const trimmed = String(value ?? "").trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function resolveDashboardPath(value, fallback) {
+  const selected = String(value ?? fallback ?? "").trim();
+  if (!selected) return "";
+  return path.isAbsolute(selected) ? selected : path.resolve(rootDir, selected);
+}
+
+function shortAddress(value) {
+  const text = String(value ?? "").trim();
+  return text.length > 12 ? `${text.slice(0, 6)}...${text.slice(-4)}` : text;
+}
+
 function buildTradeLedger(activityRows = []) {
   const markets = new Map();
   const outcomes = new Map();
@@ -2087,14 +3843,27 @@ async function getSystemdBotState() {
     const { stdout } = await execFileAsync("systemctl", [
       "show",
       systemdService,
-      "--property=ActiveState,SubState",
-      "--value"
+      "--property=ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestamp,ControlGroup",
+      "--no-pager"
     ], { timeoutMs: 5000 });
-    const [activeState = "", subState = ""] = stdout.trim().split(/\r?\n/);
+    const properties = Object.fromEntries(stdout.trim().split(/\r?\n/).map((line) => {
+      const index = line.indexOf("=");
+      return index > 0 ? [line.slice(0, index), line.slice(index + 1)] : [line, ""];
+    }));
+    const activeState = properties.ActiveState ?? "";
+    const subState = properties.SubState ?? "";
     const running = activeState === "active" && subState === "running";
     return {
       running,
-      message: running ? "运行中" : "未运行"
+      message: running ? "运行中" : "未运行",
+      activeState,
+      subState,
+      pid: Number(properties.MainPID ?? 0) || null,
+      restartCount: Number(properties.NRestarts ?? 0) || 0,
+      controlGroup: properties.ControlGroup || null,
+      activeSince: properties.ActiveEnterTimestamp && properties.ActiveEnterTimestamp !== "n/a"
+        ? properties.ActiveEnterTimestamp
+        : null
     };
   } catch {
     return { running: false, message: "未运行" };
@@ -2378,6 +4147,150 @@ function normAddress(value) {
 
 function normHash(value) {
   return value ? String(value).toLowerCase() : "";
+}
+
+function watchedAddressActivityKey(address, txHash) {
+  return `${normAddress(address)}:${normHash(txHash)}`;
+}
+
+function compareWatchedAddressRows(a, b) {
+  const blockDelta = Number(b.blockNumber ?? 0) - Number(a.blockNumber ?? 0);
+  if (blockDelta !== 0) return blockDelta;
+  const txDelta = Number(b.transactionIndex ?? 0) - Number(a.transactionIndex ?? 0);
+  if (txDelta !== 0) return txDelta;
+  const logDelta = Number(b.logIndex ?? 0) - Number(a.logIndex ?? 0);
+  if (logDelta !== 0) return logDelta;
+  return safeTime(b.at ?? b.seenAt) - safeTime(a.at ?? a.seenAt);
+}
+
+function watchedDirectionsText(directions = []) {
+  const set = new Set(directions);
+  if (set.has("in") && set.has("out")) return "转入/转出";
+  if (set.has("in")) return "转入";
+  if (set.has("out")) return "转出";
+  return "相关";
+}
+
+function watchedAmountText(row) {
+  const sent = Number(row.sentUsdt ?? 0);
+  const received = Number(row.receivedUsdt ?? 0);
+  const net = Number(row.netUsdt ?? received - sent);
+  if (sent > 0 && received > 0) return `出 ${money(sent)} U / 入 ${money(received)} U / 净 ${money(net, { sign: true })} U`;
+  if (sent > 0) return `出 ${money(sent)} U`;
+  if (received > 0) return `入 ${money(received)} U`;
+  return row.tokenTransferCount ? `Token Transfer x${row.tokenTransferCount}` : (row.direct ? "原生交易" : "");
+}
+
+function getAddressOrNull(value) {
+  try {
+    return getAddress(value);
+  } catch {
+    return null;
+  }
+}
+
+function addressOrFallback(value, fallback) {
+  return getAddressOrNull(value) ?? String(fallback ?? value ?? "");
+}
+
+function addressToTopic(address) {
+  return `0x${"0".repeat(24)}${String(address).toLowerCase().slice(2)}`;
+}
+
+function topicAddress(topic) {
+  try {
+    if (!topic) return null;
+    return getAddress(`0x${String(topic).slice(-40)}`);
+  } catch {
+    return null;
+  }
+}
+
+function rpcBlockTag(value) {
+  return `0x${BigInt(value).toString(16)}`;
+}
+
+function parseBlockNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+  try {
+    return Number(BigInt(value));
+  } catch {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+}
+
+function numberFromTokenUnits(value, decimals) {
+  try {
+    return Number(formatUnits(BigInt(value), decimals));
+  } catch {
+    return 0;
+  }
+}
+
+function dataWords64(data) {
+  const raw = String(data ?? "").replace(/^0x/u, "");
+  const words = [];
+  for (let index = 0; index + 64 <= raw.length; index += 64) words.push(raw.slice(index, index + 64));
+  return words;
+}
+
+function int256FromWord(word) {
+  const value = BigInt(`0x${word}`);
+  const signBit = 1n << 255n;
+  return value >= signBit ? value - (1n << 256n) : value;
+}
+
+function absBigInt(value) {
+  return value < 0n ? -value : value;
+}
+
+function maxNumber(a, b) {
+  const left = Number(a);
+  const right = Number(b);
+  if (!Number.isFinite(left)) return Number.isFinite(right) ? right : null;
+  if (!Number.isFinite(right)) return left;
+  return Math.max(left, right);
+}
+
+function minNullableNumber(a, b) {
+  const left = Number(a);
+  const right = Number(b);
+  if (!Number.isFinite(left)) return Number.isFinite(right) ? right : null;
+  if (!Number.isFinite(right)) return left;
+  return Math.min(left, right);
+}
+
+function minBigInt(a, b) {
+  return a < b ? a : b;
+}
+
+function toBigInt(value) {
+  return typeof value === "bigint" ? value : BigInt(value);
+}
+
+function newestIso(a, b) {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return safeTime(b) >= safeTime(a) ? b : a;
+}
+
+function clampInteger(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(number)));
+}
+
+function pruneMap(map, maxSize) {
+  while (map.size > maxSize) {
+    const first = map.keys().next().value;
+    map.delete(first);
+  }
+}
+
+function shortHash(value) {
+  const text = String(value ?? "");
+  return text.length > 18 ? `${text.slice(0, 10)}...${text.slice(-8)}` : text;
 }
 
 function cleanError(error) {

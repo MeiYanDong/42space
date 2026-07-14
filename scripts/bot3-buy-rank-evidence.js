@@ -72,7 +72,7 @@ async function main() {
   const startMs = Date.parse(target.startDate ?? "");
   const windowSeconds = nonNegativeInteger(args.windowSeconds, DEFAULT_MARKET_WINDOW_SECONDS);
   const topN = positiveInteger(args.top, DEFAULT_TOP);
-  const targetBoundaryOffsetMs = targetBoundaryOffsetFrom(target.openBroadcastTiming, env, startMs);
+  const targetBoundaryOffsetMs = targetBoundaryOffsetFrom(target, env, startMs);
   const targetBoundaryMs = Number.isFinite(startMs) && Number.isFinite(targetBoundaryOffsetMs)
     ? startMs + targetBoundaryOffsetMs
     : null;
@@ -150,6 +150,7 @@ async function main() {
       market,
       txHash,
       startDate: target.startDate ?? null,
+      builderBundleTargetSecond: target.builderBundleTargetSecond ?? null,
       selectedOutcomes: [...target.outcomeMap.entries()].map(([tokenId, name]) => ({ tokenId, name }))
     },
     timing: {
@@ -233,6 +234,8 @@ function resolveTarget(args, fills) {
       broadcastStartedAt: row.result.broadcastStartedAt,
       firstAcceptedAt: row.result.firstAcceptedAt,
       firstAcceptedLatencyMs: row.result.firstAcceptedLatencyMs,
+      builderBundleTargetSecond: row.result.builderBundleTargetSecond ?? null,
+      builderBundleTargetBoundaryAtMs: row.result.builderBundleTargetBoundaryAtMs ?? null,
       openBroadcastTiming: row.result.openBroadcastTiming ?? null,
       outcomeMap
     };
@@ -246,6 +249,8 @@ function resolveTarget(args, fills) {
       broadcastStartedAt: null,
       firstAcceptedAt: null,
       firstAcceptedLatencyMs: null,
+      builderBundleTargetSecond: args.targetSecond ?? null,
+      builderBundleTargetBoundaryAtMs: null,
       openBroadcastTiming: null,
       outcomeMap: new Map()
     };
@@ -599,9 +604,18 @@ function leadMs(value, targetBoundaryMs) {
   return Number.isFinite(ms) && Number.isFinite(targetBoundaryMs) ? targetBoundaryMs - ms : null;
 }
 
-function targetBoundaryOffsetFrom(timing, env, startMs) {
-  const fromTiming = Date.parse(timing?.targetBoundaryAt ?? "");
+function targetBoundaryOffsetFrom(target, env, startMs) {
+  const fromTiming = Date.parse(target?.openBroadcastTiming?.targetBoundaryAt ?? "");
   if (Number.isFinite(fromTiming) && Number.isFinite(startMs)) return fromTiming - startMs;
+  const absoluteBoundary = Number(target?.builderBundleTargetBoundaryAtMs);
+  if (Number.isFinite(absoluteBoundary) && absoluteBoundary > 0 && Number.isFinite(startMs)) {
+    return absoluteBoundary - startMs;
+  }
+  const targetSecond = Number(target?.builderBundleTargetSecond);
+  if (Number.isFinite(targetSecond) && targetSecond >= 0) return targetSecond * 1000;
+  const timingMode = String(env.BUILDER_BUNDLE_TIMING_MODE ?? "").trim().toLowerCase();
+  const timingMatch = timingMode.match(/^first_(\d+)s_block$/u);
+  if (timingMatch) return Number(timingMatch[1]) * 1000;
   const configured = Number(env.OPEN_BROADCAST_BLOCK_TARGET_OFFSET_MS ?? "");
   if (Number.isFinite(configured) && configured > 0) return configured;
   return 20000;

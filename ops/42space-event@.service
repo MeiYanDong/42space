@@ -1,0 +1,22 @@
+[Unit]
+Description=42space Event Market worker (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+EnvironmentFile=-/etc/42space/shared-builder.env
+EnvironmentFile=/etc/42space/profiles/%i.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash -lc 'exec npm run "${BOT_ENTRYPOINT:-event:arm}"'
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

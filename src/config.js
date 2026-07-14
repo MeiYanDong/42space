@@ -86,6 +86,14 @@ export function readConfig() {
     eventDiscoveryFeedFile: envString("EVENT_DISCOVERY_FEED_FILE", ""),
     eventDiscoveryFeedPollMs: envInteger("EVENT_DISCOVERY_FEED_POLL_MS", 1000),
     eventDiscoveryFeedTailBytes: envInteger("EVENT_DISCOVERY_FEED_TAIL_BYTES", 2 * 1024 * 1024),
+    memeRangeSelectionEnabled: envBool("MEME_RANGE_SELECTION_ENABLED", false),
+    memeRangeSelectionFile: envString("MEME_RANGE_SELECTION_FILE", "output/meme-range-selection-locks.jsonl"),
+    memeRangeSelectionOutcomeCount: envInteger("MEME_RANGE_SELECTION_OUTCOME_COUNT", 3),
+    memeRangeSelectionFetchTimeoutMs: envInteger("MEME_RANGE_SELECTION_FETCH_TIMEOUT_MS", 2500),
+    memeRangeSelectionFetchAttempts: envInteger("MEME_RANGE_SELECTION_FETCH_ATTEMPTS", 2),
+    pythHermesUrl: envString("PYTH_HERMES_URL", "https://hermes.pyth.network"),
+    pythApiKey: envString("PYTH_API_KEY", ""),
+    pythMaxAgeSeconds: envInteger("PYTH_MAX_AGE_SECONDS", 120),
     restDiscoveryEnabled: envBool("REST_DISCOVERY_ENABLED", true),
     restDiscoveryPollMs: envInteger("REST_DISCOVERY_POLL_MS", 1000),
     watchFundingMode: envString("WATCH_FUNDING_MODE", "next_batch"),
@@ -124,6 +132,40 @@ export function readConfig() {
     fanoutBroadcast: envBool("FANOUT_BROADCAST", true),
     broadcastRpcUrls: [],
     broadcastTimeoutMs: envInteger("BROADCAST_TIMEOUT_MS", 1200),
+    builderBundleKillSwitch: envBool("BUILDER_BUNDLE_KILL_SWITCH", false),
+    builderBundleEnabled: envBool("BUILDER_BUNDLE_ENABLED", false),
+    builderBundleUrl: envString("BUILDER_BUNDLE_URL", "https://puissant-builder.48.club/"),
+    builderBundleTipTo: envString("BUILDER_BUNDLE_TIP_TO", "0x4848489f0b2BEdd788c696e2D79b6b69D7484848"),
+    builderBundleTipBnb: envString("BUILDER_BUNDLE_TIP_BNB", "0.001"),
+    builderBundleTipGasPriceGwei: envString("BUILDER_BUNDLE_TIP_GAS_PRICE_GWEI", "1"),
+    builderBundleMaxBlocks: envInteger("BUILDER_BUNDLE_MAX_BLOCKS", 3),
+    builderBundleMaxBlockLookup: envBool("BUILDER_BUNDLE_MAX_BLOCK_LOOKUP", false),
+    builderBundleMaxTimestampOffsetSeconds: envInteger("BUILDER_BUNDLE_MAX_TIMESTAMP_OFFSET_SECONDS", 10),
+    builderBundleTimeoutMs: envInteger("BUILDER_BUNDLE_TIMEOUT_MS", 500),
+    builderBundleMode: envString("BUILDER_BUNDLE_MODE", "concurrent").trim().toLowerCase().replace(/[-\s]+/gu, "_"),
+    builderBundleFanoutDelayMs: envInteger("BUILDER_BUNDLE_FANOUT_DELAY_MS", 120),
+    builderBundleTimingMode: envString("BUILDER_BUNDLE_TIMING_MODE", "legacy").trim().toLowerCase().replace(/[-\s]+/gu, "_"),
+    builderBundlePrepositionLeadMs: envInteger("BUILDER_BUNDLE_PREPOSITION_LEAD_MS", 300),
+    builderBundleFallbackSafetyMs: envInteger("BUILDER_BUNDLE_FALLBACK_SAFETY_MS", 100),
+    builderBundleEarlySubmitLeadMs: envInteger("BUILDER_BUNDLE_EARLY_SUBMIT_LEAD_MS", 0),
+    builderBundleMinTimestampOffsetMs: envInteger("BUILDER_BUNDLE_MIN_TIMESTAMP_OFFSET_MS", 0),
+    builderBundleNoMerge: envBool("BUILDER_BUNDLE_NO_MERGE", false),
+    builderBundlePositionFirst: envBool("BUILDER_BUNDLE_POSITION_FIRST", false),
+    builderBundle48spSign: envString("BUILDER_BUNDLE_48SP_SIGN", ""),
+    blockrazorBuilderEnabled: envBool("BLOCKRAZOR_BUILDER_ENABLED", false),
+    blockrazorBuilderUrl: envString("BLOCKRAZOR_BUILDER_URL", "https://rpc.blockrazor.builders"),
+    blockrazorBuilderTipTo: envString("BLOCKRAZOR_BUILDER_TIP_TO", "0x1266C6bE60392A8Ff346E8d5ECCd3E69dD9c5F20"),
+    blockrazorBuilderAuthToken: envString("BLOCKRAZOR_BUILDER_AUTH_TOKEN", ""),
+    builderTimedBuyExecutorEnabled: envBool("BUILDER_TIMED_BUY_EXECUTOR_ENABLED", false),
+    builderTimedBuyExecutorAddress: envString("BUILDER_TIMED_BUY_EXECUTOR_ADDRESS", ""),
+    builderTimedBuyExecutorExactSecond: envBool("BUILDER_TIMED_BUY_EXECUTOR_EXACT_SECOND", false),
+    builderTimedBuyExecutorReleasePollMs: envInteger("BUILDER_TIMED_BUY_EXECUTOR_RELEASE_POLL_MS", 25),
+    builderTimestampGuardEnabled: envBool("BUILDER_TIMESTAMP_GUARD_ENABLED", false),
+    builderTimestampGuardAddress: envString("BUILDER_TIMESTAMP_GUARD_ADDRESS", ""),
+    builderTimestampGuardGasLimit: envInteger("BUILDER_TIMESTAMP_GUARD_GAS_LIMIT", 50000),
+    builderTimestampGuardRetryIntervalMs: envInteger("BUILDER_TIMESTAMP_GUARD_RETRY_INTERVAL_MS", 100),
+    builderTimestampGuardRetryUntilLeadMs: envInteger("BUILDER_TIMESTAMP_GUARD_RETRY_UNTIL_LEAD_MS", 0),
+    builderTimestampGuardReleasePollMs: envInteger("BUILDER_TIMESTAMP_GUARD_RELEASE_POLL_MS", 50),
     rpcKeepaliveMs: envInteger("RPC_KEEPALIVE_MS", 5000),
     rebroadcastIntervalMs: envInteger("REBROADCAST_INTERVAL_MS", 100),
     rebroadcastDurationMs: envInteger("REBROADCAST_DURATION_MS", 2500),
@@ -177,6 +219,7 @@ export function readConfig() {
     feishuWebhook: envString("FEISHU_WEBHOOK", ""),
     feishuAlertCooldownMs: envInteger("FEISHU_ALERT_COOLDOWN_MS", 60000),
     alertStateFile: envString("ALERT_STATE_FILE", path.join(path.dirname(runtimeConfigFile), "alert-state.json")),
+    runtimeHealthFile: envString("EVENT_RUNTIME_HEALTH_FILE", path.join(path.dirname(runtimeConfigFile), "runtime-health.json")),
     eventPlannedBuysFile: envString("EVENT_PLANNED_BUYS_FILE", path.join(path.dirname(runtimeConfigFile), "planned-buys.json")),
     autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
     autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 5000),
@@ -253,8 +296,8 @@ export function readConfig() {
   if (cfg.slippageBps < 0 || cfg.slippageBps > 5000) {
     throw new Error("SLIPPAGE_BPS must be between 0 and 5000");
   }
-  if (!["all", "lowest_odds", "middle", "names"].includes(cfg.eventOutcomeSelection)) {
-    throw new Error("EVENT_OUTCOME_SELECTION must be all, lowest_odds, middle, or names");
+  if (!["all", "lowest_odds", "middle", "first", "names"].includes(cfg.eventOutcomeSelection)) {
+    throw new Error("EVENT_OUTCOME_SELECTION must be all, lowest_odds, middle, first, or names");
   }
   if (!["token_order", "error"].includes(cfg.eventOutcomeSelectionFallback)) {
     throw new Error("EVENT_OUTCOME_SELECTION_FALLBACK must be token_order or error");
@@ -265,8 +308,8 @@ export function readConfig() {
   if (!["ws", "chain", "rest", "feed"].includes(cfg.eventDiscovery)) {
     throw new Error("EVENT_DISCOVERY must be ws, chain, rest, or feed");
   }
-  if (cfg.profileRole && !["bot2_like"].includes(cfg.profileRole)) {
-    throw new Error("EVENT_PROFILE_ROLE must be empty or bot2_like");
+  if (cfg.profileRole && !["bot2_like", "bot3_like"].includes(cfg.profileRole)) {
+    throw new Error("EVENT_PROFILE_ROLE must be empty, bot2_like, or bot3_like");
   }
   if (cfg.eventDiscovery === "feed" && !cfg.eventDiscoveryFeedFile) {
     throw new Error("EVENT_DISCOVERY=feed requires EVENT_DISCOVERY_FEED_FILE");
@@ -276,6 +319,21 @@ export function readConfig() {
   }
   if (cfg.eventDiscoveryFeedTailBytes < 0) {
     throw new Error("EVENT_DISCOVERY_FEED_TAIL_BYTES must be 0 or a positive integer");
+  }
+  if (cfg.memeRangeSelectionFetchTimeoutMs <= 0) {
+    throw new Error("MEME_RANGE_SELECTION_FETCH_TIMEOUT_MS must be positive");
+  }
+  if (cfg.memeRangeSelectionOutcomeCount <= 0 || cfg.memeRangeSelectionOutcomeCount % 2 === 0) {
+    throw new Error("MEME_RANGE_SELECTION_OUTCOME_COUNT must be a positive odd integer");
+  }
+  if (cfg.memeRangeSelectionOutcomeCount > cfg.maxOutcomesPerMarket) {
+    throw new Error("MEME_RANGE_SELECTION_OUTCOME_COUNT exceeds MAX_OUTCOMES_PER_MARKET");
+  }
+  if (cfg.memeRangeSelectionFetchAttempts <= 0) {
+    throw new Error("MEME_RANGE_SELECTION_FETCH_ATTEMPTS must be positive");
+  }
+  if (cfg.pythMaxAgeSeconds <= 0) {
+    throw new Error("PYTH_MAX_AGE_SECONDS must be positive");
   }
   if (cfg.restDiscoveryPollMs <= 0) {
     throw new Error("REST_DISCOVERY_POLL_MS must be positive");
@@ -466,6 +524,100 @@ export function readConfig() {
   if (cfg.broadcastTimeoutMs <= 0) {
     throw new Error("BROADCAST_TIMEOUT_MS must be positive");
   }
+  if (cfg.builderBundleEnabled) {
+    if (!/^https?:\/\//iu.test(String(cfg.builderBundleUrl ?? ""))) {
+      throw new Error("BUILDER_BUNDLE_URL must be an HTTP(S) URL when BUILDER_BUNDLE_ENABLED=1");
+    }
+    try {
+      new URL(cfg.builderBundleUrl);
+    } catch {
+      throw new Error("BUILDER_BUNDLE_URL must be a valid URL when BUILDER_BUNDLE_ENABLED=1");
+    }
+    if (!/^0x[a-fA-F0-9]{40}$/u.test(String(cfg.builderBundleTipTo ?? ""))) {
+      throw new Error("BUILDER_BUNDLE_TIP_TO must be a valid address when BUILDER_BUNDLE_ENABLED=1");
+    }
+    if (cfg.blockrazorBuilderEnabled) {
+      try {
+        new URL(cfg.blockrazorBuilderUrl);
+      } catch {
+        throw new Error("BLOCKRAZOR_BUILDER_URL must be a valid URL when BLOCKRAZOR_BUILDER_ENABLED=1");
+      }
+      if (!/^https?:\/\//iu.test(String(cfg.blockrazorBuilderUrl ?? ""))) {
+        throw new Error("BLOCKRAZOR_BUILDER_URL must be an HTTP(S) URL when BLOCKRAZOR_BUILDER_ENABLED=1");
+      }
+      if (!/^0x[a-fA-F0-9]{40}$/u.test(String(cfg.blockrazorBuilderTipTo ?? ""))) {
+        throw new Error("BLOCKRAZOR_BUILDER_TIP_TO must be a valid address when BLOCKRAZOR_BUILDER_ENABLED=1");
+      }
+    }
+  }
+  const builderTipBnb = Number(cfg.builderBundleTipBnb);
+  if (!Number.isFinite(builderTipBnb) || builderTipBnb < 0 || builderTipBnb > 10) {
+    throw new Error("BUILDER_BUNDLE_TIP_BNB must be between 0 and 10");
+  }
+  const builderTipGasGwei = Number(cfg.builderBundleTipGasPriceGwei);
+  if (!Number.isFinite(builderTipGasGwei) || builderTipGasGwei < 0.01 || builderTipGasGwei > 50) {
+    throw new Error("BUILDER_BUNDLE_TIP_GAS_PRICE_GWEI must be between 0.01 and 50");
+  }
+  if (cfg.builderBundleMaxBlocks <= 0) {
+    throw new Error("BUILDER_BUNDLE_MAX_BLOCKS must be positive");
+  }
+  if (cfg.builderBundleMaxTimestampOffsetSeconds <= 0) {
+    throw new Error("BUILDER_BUNDLE_MAX_TIMESTAMP_OFFSET_SECONDS must be positive");
+  }
+  if (cfg.builderBundleTimeoutMs <= 0) {
+    throw new Error("BUILDER_BUNDLE_TIMEOUT_MS must be positive");
+  }
+  if (!["concurrent", "builder_only", "builder_then_fanout"].includes(cfg.builderBundleMode)) {
+    throw new Error("BUILDER_BUNDLE_MODE must be concurrent, builder_only, or builder_then_fanout");
+  }
+  if (cfg.builderBundleFanoutDelayMs < 0 || cfg.builderBundleFanoutDelayMs > 5000) {
+    throw new Error("BUILDER_BUNDLE_FANOUT_DELAY_MS must be between 0 and 5000");
+  }
+  if (!["legacy", "auto", "first_19s_block", "first_20s_block"].includes(cfg.builderBundleTimingMode)) {
+    throw new Error("BUILDER_BUNDLE_TIMING_MODE must be legacy, auto, first_19s_block, or first_20s_block");
+  }
+  if (cfg.builderBundlePrepositionLeadMs <= 0 || cfg.builderBundlePrepositionLeadMs > 5000) {
+    throw new Error("BUILDER_BUNDLE_PREPOSITION_LEAD_MS must be between 1 and 5000");
+  }
+  if (cfg.builderBundleFallbackSafetyMs < 0 || cfg.builderBundleFallbackSafetyMs > 5000) {
+    throw new Error("BUILDER_BUNDLE_FALLBACK_SAFETY_MS must be between 0 and 5000");
+  }
+  if (cfg.builderBundleEarlySubmitLeadMs < 0 || cfg.builderBundleEarlySubmitLeadMs > 5000) {
+    throw new Error("BUILDER_BUNDLE_EARLY_SUBMIT_LEAD_MS must be between 0 and 5000");
+  }
+  if (cfg.builderBundleMinTimestampOffsetMs < 0 || cfg.builderBundleMinTimestampOffsetMs > 24 * 60 * 60 * 1000) {
+    throw new Error("BUILDER_BUNDLE_MIN_TIMESTAMP_OFFSET_MS must be between 0 and 86400000");
+  }
+  if (
+    cfg.builderTimedBuyExecutorEnabled &&
+    !/^0x[a-fA-F0-9]{40}$/u.test(String(cfg.builderTimedBuyExecutorAddress ?? ""))
+  ) {
+    throw new Error("BUILDER_TIMED_BUY_EXECUTOR_ADDRESS must be a valid address when BUILDER_TIMED_BUY_EXECUTOR_ENABLED=1");
+  }
+  if (cfg.builderTimedBuyExecutorEnabled && cfg.builderTimestampGuardEnabled) {
+    throw new Error("BUILDER_TIMED_BUY_EXECUTOR_ENABLED and BUILDER_TIMESTAMP_GUARD_ENABLED cannot both be enabled");
+  }
+  if (cfg.builderTimedBuyExecutorExactSecond && !cfg.builderTimedBuyExecutorEnabled) {
+    throw new Error("BUILDER_TIMED_BUY_EXECUTOR_EXACT_SECOND requires BUILDER_TIMED_BUY_EXECUTOR_ENABLED=1");
+  }
+  if (cfg.builderTimedBuyExecutorReleasePollMs < 10 || cfg.builderTimedBuyExecutorReleasePollMs > 1000) {
+    throw new Error("BUILDER_TIMED_BUY_EXECUTOR_RELEASE_POLL_MS must be between 10 and 1000");
+  }
+  if (cfg.builderTimestampGuardEnabled && !/^0x[a-fA-F0-9]{40}$/u.test(String(cfg.builderTimestampGuardAddress ?? ""))) {
+    throw new Error("BUILDER_TIMESTAMP_GUARD_ADDRESS must be a valid address when BUILDER_TIMESTAMP_GUARD_ENABLED=1");
+  }
+  if (cfg.builderTimestampGuardGasLimit < 21000 || cfg.builderTimestampGuardGasLimit > 500000) {
+    throw new Error("BUILDER_TIMESTAMP_GUARD_GAS_LIMIT must be between 21000 and 500000");
+  }
+  if (cfg.builderTimestampGuardRetryIntervalMs < 25 || cfg.builderTimestampGuardRetryIntervalMs > 1000) {
+    throw new Error("BUILDER_TIMESTAMP_GUARD_RETRY_INTERVAL_MS must be between 25 and 1000");
+  }
+  if (cfg.builderTimestampGuardRetryUntilLeadMs < 0 || cfg.builderTimestampGuardRetryUntilLeadMs > 1000) {
+    throw new Error("BUILDER_TIMESTAMP_GUARD_RETRY_UNTIL_LEAD_MS must be between 0 and 1000");
+  }
+  if (cfg.builderTimestampGuardReleasePollMs < 25 || cfg.builderTimestampGuardReleasePollMs > 1000) {
+    throw new Error("BUILDER_TIMESTAMP_GUARD_RELEASE_POLL_MS must be between 25 and 1000");
+  }
   if (cfg.rpcKeepaliveMs < 0) {
     throw new Error("RPC_KEEPALIVE_MS must be 0 or a positive integer");
   }
@@ -553,11 +705,13 @@ export function readConfig() {
 
   ensureParentDir(cfg.stateFile);
   if (cfg.eventDiscoveryFeedFile) ensureParentDir(cfg.eventDiscoveryFeedFile);
+  if (cfg.memeRangeSelectionFile) ensureParentDir(cfg.memeRangeSelectionFile);
   ensureParentDir(cfg.fillsFile);
   ensureParentDir(cfg.gasLedgerFile);
   ensureParentDir(cfg.decisionFile);
   ensureParentDir(cfg.marketFollowFile);
   ensureParentDir(cfg.alertStateFile);
+  ensureParentDir(cfg.runtimeHealthFile);
   ensureParentDir(cfg.autoSellStateFile);
   ensureParentDir(cfg.autoSellPositionStateFile);
   ensureParentDir(cfg.autoSellCircuitStateFile);

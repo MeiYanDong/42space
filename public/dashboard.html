@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>42space Bot Console</title>
-    <link rel="stylesheet" href="/assets/dashboard.css?v=gas-ledger-20260706">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=price-exit-20260711">
   </head>
   <body>
     <main class="shell">
@@ -60,6 +60,11 @@
             <span data-icon="activity"></span>
             <span>Execution</span>
             <small>执行记录</small>
+          </button>
+          <button class="navItem" type="button" data-route="watchlist">
+            <span data-icon="radio"></span>
+            <span>地址监控</span>
+            <small>关注地址</small>
           </button>
           <button class="navItem" type="button" data-route="strategy">
             <span data-icon="sliders-horizontal"></span>
@@ -168,6 +173,7 @@
 
           <section id="positionsView" class="view" data-view="positions">
             <div id="positionSummary" class="summaryStrip"></div>
+            <section id="aggregatePnlPanel" class="panel aggregatePanel isHidden"></section>
             <section class="panel positionsPanel">
               <div class="panelHead">
                 <div>
@@ -205,46 +211,143 @@
             </section>
           </section>
 
+          <section id="watchlistView" class="view" data-view="watchlist">
+            <div class="viewToolbar">
+              <div class="segmented" aria-label="地址活动回看">
+                <button type="button" data-watch-lookback="30">30 分钟</button>
+                <button type="button" class="isActive" data-watch-lookback="60">1 小时</button>
+                <button type="button" data-watch-lookback="120">2 小时</button>
+              </div>
+            </div>
+            <section class="panel watchAddressPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="radio"></i>关注地址</h3>
+                  <p>后台 watcher、冷却和区块游标</p>
+                </div>
+                <span id="watchedAddressStatus">--</span>
+              </div>
+              <div id="watchedAddressMonitorList" class="watchAddressGrid"></div>
+            </section>
+            <section class="panel watchActivityPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="activity"></i>地址活动事件</h3>
+                  <p>最近活动对应的 42 market 和 outcome</p>
+                </div>
+                <span id="watchedAddressActivityStatus">--</span>
+              </div>
+              <div id="watchedAddressActivityList" class="watchActivityList"></div>
+            </section>
+          </section>
+
           <section id="strategyView" class="view" data-view="strategy">
             <div class="strategyGrid">
-              <section class="panel">
+              <section class="panel strategyProfilePanel">
+                <div class="strategyProfileHead">
+                  <div class="strategyProfileIdentity">
+                    <span id="strategyProfileEyebrow" class="strategyProfileEyebrow">PROFILE</span>
+                    <h3><i data-icon="radio"></i><span id="strategyProfileTitle">当前策略</span></h3>
+                    <p id="strategyProfileSummary">--</p>
+                  </div>
+                  <div id="strategyProfileBadges" class="strategyProfileBadges" aria-label="策略状态"></div>
+                </div>
+                <section class="automationRuntime" aria-labelledby="automationRuntimeTitle">
+                  <div class="automationRuntimeHead">
+                    <div>
+                      <span>LIVE AUTOMATION</span>
+                      <strong id="automationRuntimeTitle">自动化运行状态</strong>
+                    </div>
+                    <span id="automationRuntimeUpdated">读取中</span>
+                  </div>
+                  <div id="automationRuntimeGrid" class="automationRuntimeGrid"></div>
+                </section>
+                <div id="strategyFlow" class="strategyFlow"></div>
+                <div class="strategyOverride">
+                  <span data-icon="check-square"></span>
+                  <div>
+                    <strong>事件级配置优先</strong>
+                    <p id="strategyOverrideText">--</p>
+                  </div>
+                </div>
+              </section>
+
+              <div class="strategySecondaryGrid">
+                <section class="panel strategyFactsPanel">
+                  <div class="panelHead">
+                    <div>
+                      <h3><i data-icon="receipt"></i>实际策略明细</h3>
+                      <p>当前 profile 的生产参数</p>
+                    </div>
+                  </div>
+                  <div id="strategyFacts" class="strategyFacts"></div>
+                </section>
+                <section class="panel strategyPreflightPanel">
+                  <div class="panelHead">
+                    <div>
+                      <h3><i data-icon="wallet"></i>Preflight</h3>
+                      <p>资金和运行状态</p>
+                    </div>
+                  </div>
+                  <div id="preflightList" class="preflightList"></div>
+                </section>
+              </div>
+
+              <section class="panel strategyRulesPanel">
                 <div class="panelHead">
                   <div>
-                    <h3><i data-icon="sliders-horizontal"></i>Watch Config</h3>
-                    <p>当前买入策略参数</p>
+                    <h3><i data-icon="sparkles"></i>发现与通知边界</h3>
+                    <p>显示、关注和通知各自独立</p>
                   </div>
                 </div>
-                <div class="settingsGrid">
-                  <div class="settingItem">
-                    <span>买入档位</span>
-                    <strong id="stakeText">--</strong>
+                <div class="strategyRuleList">
+                  <div class="strategyRuleRow"><span>自动过滤</span><strong id="ruleFilterText">--</strong></div>
+                  <div class="strategyRuleRow"><span>默认显示</span><strong id="ruleDisplayText">--</strong></div>
+                  <div class="strategyRuleRow"><span>默认关注</span><strong id="ruleFollowText">--</strong></div>
+                  <div class="strategyRuleRow"><span>飞书通知</span><strong id="ruleNotifyText">--</strong></div>
+                </div>
+              </section>
+
+              <section id="priceExitPanel" class="panel priceExitPanel isHidden">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="circle-dollar-sign"></i>Outcome 价格卖出</h3>
+                    <p id="priceExitPlanLabel">OpenRouter Python</p>
                   </div>
-                  <div class="settingItem">
-                    <span>广播/窗口</span>
-                    <strong id="windowText">--</strong>
-                  </div>
-                  <div class="settingItem">
-                    <span>自动止盈</span>
-                    <strong id="autoSellText">--</strong>
-                  </div>
-                  <div class="settingItem ruleItem">
-                    <span>自动过滤</span>
-                    <strong id="ruleFilterText">--</strong>
-                  </div>
-                  <div class="settingItem ruleItem">
-                    <span>默认显示</span>
-                    <strong id="ruleDisplayText">--</strong>
-                  </div>
-                  <div class="settingItem ruleItem">
-                    <span>默认关注</span>
-                    <strong id="ruleFollowText">--</strong>
-                  </div>
-                  <div class="settingItem ruleItem">
-                    <span>飞书通知</span>
-                    <strong id="ruleNotifyText">--</strong>
+                  <span id="priceExitStatus">--</span>
+                </div>
+                <div id="priceExitCadence" class="priceExitCadence"></div>
+                <div class="priceExitColumnHead" aria-hidden="true">
+                  <span>启用</span><span>Outcome</span><span>当前价格</span><span>卖出阈值</span><span></span>
+                </div>
+                <div id="priceExitRows" class="priceExitRows"></div>
+                <div class="priceExitControls">
+                  <label class="toggleField">
+                    <input id="priceExitApplyExisting" type="checkbox">
+                    <span>包括已有持仓</span>
+                  </label>
+                  <label id="priceExitAdminField" class="field compactField">
+                    <span>管理令牌</span>
+                    <input id="priceExitAdminToken" type="password" autocomplete="off">
+                  </label>
+                  <div class="priceExitActions">
+                    <button id="addPriceExitTarget" class="ghost iconButton" type="button"><span data-icon="plus"></span><span>添加</span></button>
+                    <button id="savePriceExitConfig" class="iconButton primaryAction" type="button"><span data-icon="send"></span><span>应用价格</span></button>
                   </div>
                 </div>
-                <form id="runtimeConfigForm" class="configForm">
+                <p id="priceExitMessage" class="configStatus">--</p>
+              </section>
+
+              <details id="strategyAdvancedConfig" class="panel advancedConfigPanel">
+                <summary class="advancedConfigSummary">
+                  <div>
+                    <h3><i data-icon="sliders-horizontal"></i>高级参数</h3>
+                    <p>修改 profile 的可写运行参数</p>
+                  </div>
+                  <span class="advancedConfigChevron" data-icon="chevron-down"></span>
+                </summary>
+                <form id="runtimeConfigForm" class="configForm strategyConfigForm">
+                  <div id="configActiveSellMode" class="configActiveSellMode">--</div>
                   <div class="configGrid">
                     <label class="field">
                       <span>过滤模式</span>
@@ -253,86 +356,40 @@
                         <option value="production">生产过滤：基础过滤 + 时长门槛</option>
                       </select>
                     </label>
-                    <label class="field">
-                      <span>买入选项</span>
-                      <input id="configOutcomeCount" type="number" min="1" max="12" step="1">
-                    </label>
-                    <label class="field">
-                      <span>每项金额</span>
-                      <input id="configStakePerOutcome" type="number" min="0.1" max="100" step="0.1">
-                    </label>
-                    <label class="field">
-                      <span>批次上限</span>
-                      <input id="configMaxBatchStake" type="number" min="0.1" max="5000" step="0.1">
-                    </label>
-                    <label class="field">
-                      <span>买入 Gas gwei</span>
-                      <input id="configGasPriceGwei" type="number" min="0.01" max="50" step="0.01">
-                    </label>
-                    <label class="field">
-                      <span>卖出 Gas gwei</span>
-                      <input id="configAutoSellGasPriceGwei" type="number" min="0.01" max="50" step="0.01" placeholder="默认同买入">
-                    </label>
+                    <label class="field"><span>买入选项</span><input id="configOutcomeCount" type="number" min="1" max="12" step="1"></label>
+                    <label class="field"><span>每项金额</span><input id="configStakePerOutcome" type="number" min="0.1" max="100" step="0.1"></label>
+                    <label class="field"><span>批次上限</span><input id="configMaxBatchStake" type="number" min="0.1" max="5000" step="0.1"></label>
+                    <label class="field"><span>买入 Gas gwei</span><input id="configGasPriceGwei" type="number" min="0.01" max="50" step="0.01"></label>
+                    <label class="field"><span>卖出 Gas gwei</span><input id="configAutoSellGasPriceGwei" type="number" min="0.01" max="50" step="0.01" placeholder="默认同买入"></label>
                     <label class="field">
                       <span>自动卖出</span>
-                      <select id="configAutoSellEnabled">
-                        <option value="1">开启</option>
-                        <option value="0">关闭</option>
-                      </select>
+                      <select id="configAutoSellEnabled"><option value="1">开启</option><option value="0">关闭</option></select>
                     </label>
-                    <label class="field tokenField">
-                      <span>显示过滤规则</span>
-                      <div id="configDisplayFilters" class="filterRuleGrid"></div>
-                    </label>
-                    <label class="field">
-                      <span>卖出延迟秒</span>
-                      <input id="configAutoSellStartDelay" type="number" min="0" max="3600" step="1">
-                    </label>
-                    <label class="field">
-                      <span>卖出间隔秒</span>
-                      <input id="configAutoSellInterval" type="number" min="1" max="3600" step="1">
-                    </label>
-                    <label class="field">
-                      <span>每次卖出 %</span>
-                      <input id="configAutoSellChunk" type="number" min="0.1" max="100" step="0.1">
-                    </label>
+                    <label class="field tokenField"><span>显示过滤规则</span><div id="configDisplayFilters" class="filterRuleGrid"></div></label>
+                    <label class="field sellModeField" data-sell-config="ladder legacy"><span>卖出延迟秒</span><input id="configAutoSellStartDelay" type="number" min="0" max="3600" step="1"></label>
+                    <label class="field sellModeField" data-sell-config="ladder"><span>卖出间隔秒</span><input id="configAutoSellInterval" type="number" min="1" max="3600" step="1"></label>
+                    <label class="field sellModeField" data-sell-config="ladder legacy"><span>每次卖出 %</span><input id="configAutoSellChunk" type="number" min="0.1" max="100" step="0.1"></label>
                     <label class="field">
                       <span>止损</span>
-                      <select id="configAutoSellStopLossEnabled">
-                        <option value="1">开启</option>
-                        <option value="0">关闭</option>
-                      </select>
+                      <select id="configAutoSellStopLossEnabled"><option value="1">开启</option><option value="0">关闭</option></select>
                     </label>
-                    <label class="field">
-                      <span>止损触发 %</span>
-                      <input id="configAutoSellStopLoss" type="number" min="0.1" max="100" step="0.1">
-                    </label>
-                    <label class="field">
-                      <span>止损卖出 %</span>
-                      <input id="configAutoSellStopLossSell" type="number" min="0.1" max="100" step="0.1">
-                    </label>
-                    <label class="field tokenField">
-                      <span>管理令牌</span>
-                      <input id="configAdminToken" type="password" autocomplete="off">
-                    </label>
+                    <label class="field"><span>止损触发 %</span><input id="configAutoSellStopLoss" type="number" min="0.1" max="100" step="0.1"></label>
+                    <label class="field"><span>止损卖出 %</span><input id="configAutoSellStopLossSell" type="number" min="0.1" max="100" step="0.1"></label>
+                    <label class="field tokenField"><span>管理令牌</span><input id="configAdminToken" type="password" autocomplete="off"></label>
                     <div class="configActions">
-                      <button id="saveConfigBtn" class="iconButton primaryAction" type="submit">
-                        <span data-icon="send"></span>
-                        <span>应用配置</span>
-                      </button>
+                      <button id="saveConfigBtn" class="iconButton primaryAction" type="submit"><span data-icon="send"></span><span>应用配置</span></button>
                     </div>
                   </div>
                   <p id="configStatus" class="configStatus">--</p>
                 </form>
-              </section>
-              <section class="panel">
+              </details>
+
+              <section id="orderflowPanel" class="panel orderflowPanel isHidden">
                 <div class="panelHead">
-                  <div>
-                    <h3><i data-icon="wallet"></i>Preflight</h3>
-                    <p>资金和运行状态</p>
-                  </div>
+                  <div><h3><i data-icon="radio"></i>Orderflow 监控卖出</h3><p>监控事件和触发阈值</p></div>
+                  <span id="orderflowStatus">--</span>
                 </div>
-                <div id="preflightList" class="preflightList"></div>
+                <div id="orderflowMonitorList" class="orderflowList"></div>
               </section>
             </div>
           </section>
@@ -385,6 +442,6 @@
     </aside>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="/assets/dashboard.js?v=gas-ledger-20260706"></script>
+    <script type="module" src="/assets/dashboard.js?v=automation-health-20260711"></script>
   </body>
 </html>

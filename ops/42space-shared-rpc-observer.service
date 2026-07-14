@@ -1,0 +1,35 @@
+[Unit]
+Description=42space shared read-only BSC RPC observer (shadow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/42space
+EnvironmentFile=/etc/42space/profiles/42space-shared-observer.env
+Environment=SHARED_OBSERVER_MARKETS=0x6B7F30fb52B26814BB49312442010450e43e226D,0x86308B8059183eA443fd1885D5493cF6C5222F1f,0x94FA631F5A8d830919db6d5B1571e438f0222Fb0
+Environment=SHARED_OBSERVER_ADDRESSES=0x96FDe227f3863812464dC1320B505016837a3650,0x1Bc7dF2AA0DBE1a489A7205f2D1fF92C3d51A80b,0x51349f0B9b8C21A34781273e37F16B0233239C41
+Environment=SHARED_OBSERVER_AUDIT_MS=60000
+Environment=SHARED_OBSERVER_TRANSFER_SCAN_MS=3000
+Environment=SHARED_OBSERVER_AUDIT_CONFIRMATIONS=3
+Environment=SHARED_OBSERVER_DIRECT_CONFIRMATIONS=2
+Environment=SHARED_OBSERVER_MAX_RANGE_BLOCKS=1000
+Environment=SHARED_OBSERVER_STATE_FILE=/opt/42space/data/shared-rpc-observer/state.json
+Environment=SHARED_OBSERVER_LOG_FILE=/opt/42space/data/shared-rpc-observer/observer.jsonl
+Environment=SHARED_OBSERVER_FEED_FILE=/opt/42space/data/shared-rpc-observer/feed.jsonl
+Environment=SHARED_OBSERVER_HEALTH_FILE=/opt/42space/data/shared-rpc-observer/health.json
+ExecStart=/usr/bin/node /opt/42space/scripts/shared-rpc-observer.js
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=10
+IOWeight=10
+MemoryMax=384M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

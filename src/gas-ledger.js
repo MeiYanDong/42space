@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { formatUnits } from "viem";
+import { formatUnits, parseUnits } from "viem";
 
 export const GAS_LEDGER_SCHEMA = "42space-gas-ledger/v1";
 const BNBUSDT_SPOT = "https://api.binance.com/api/v3/klines";
@@ -59,6 +59,8 @@ export function buildGasLedgerEntry({
   allocations = [],
   bnbUsdtPrice = null,
   bnbUsdtSource = "",
+  extraFeeWei = null,
+  extraFeeBnb = null,
   metadata = {}
 } = {}) {
   const normalizedTxHash = normalizeTxHash(txHash ?? receipt?.transactionHash);
@@ -67,8 +69,21 @@ export function buildGasLedgerEntry({
   const effectiveGasPrice = toBigInt(receipt?.effectiveGasPrice ?? transaction?.gasPrice);
   const gasFeeWei = gasUsed * effectiveGasPrice;
   const gasFeeBnb = formatUnits(gasFeeWei, 18);
+  const normalizedExtraFeeWei = normalizeExtraFeeWei({
+    action,
+    transaction,
+    extraFeeWei,
+    extraFeeBnb
+  });
+  const normalizedExtraFeeBnb = formatUnits(normalizedExtraFeeWei, 18);
+  const totalFeeWei = gasFeeWei + normalizedExtraFeeWei;
+  const totalFeeBnb = formatUnits(totalFeeWei, 18);
   const price = finitePositiveNumber(bnbUsdtPrice);
   const gasFeeUsdt = price ? roundMoney(Number(gasFeeBnb) * price, 8) : null;
+  const extraFeeUsdt = price && normalizedExtraFeeWei > 0n
+    ? roundMoney(Number(normalizedExtraFeeBnb) * price, 8)
+    : null;
+  const totalFeeUsdt = price ? roundMoney(Number(totalFeeBnb) * price, 8) : null;
   const normalizedAllocations = normalizeAllocations(allocations);
 
   return {
@@ -89,9 +104,15 @@ export function buildGasLedgerEntry({
     effectiveGasPriceGwei: formatUnits(effectiveGasPrice, 9),
     gasFeeWei: gasFeeWei.toString(),
     gasFeeBnb,
+    extraFeeWei: normalizedExtraFeeWei.toString(),
+    extraFeeBnb: normalizedExtraFeeBnb,
+    totalFeeWei: totalFeeWei.toString(),
+    totalFeeBnb,
     bnbUsdtPrice: price === null ? null : roundMoney(price, 8),
     bnbUsdtSource: price === null ? null : (bnbUsdtSource || "BNBUSDT"),
     gasFeeUsdt,
+    extraFeeUsdt,
+    totalFeeUsdt,
     blockTime: blockTimeIso(block),
     allocations: normalizedAllocations,
     metadata,
@@ -121,8 +142,8 @@ export function buildGasSummary(entries = []) {
   };
 
   for (const entry of byTx.values()) {
-    const gasBnb = Number(entry.gasFeeBnb ?? 0);
-    const gasUsdt = Number(entry.gasFeeUsdt ?? 0);
+    const gasBnb = Number(entry.totalFeeBnb ?? entry.gasFeeBnb ?? 0);
+    const gasUsdt = Number(entry.totalFeeUsdt ?? entry.gasFeeUsdt ?? 0);
     const hasUsdt = Number.isFinite(gasUsdt) && gasUsdt > 0;
     if (!Number.isFinite(gasBnb) || gasBnb <= 0) continue;
     summary.txCount += 1;
@@ -152,8 +173,12 @@ export function buildGasSummary(entries = []) {
 }
 
 function preferGasLedgerEntry(candidate, current) {
-  const candidateUsdt = finitePositiveNumber(candidate?.gasFeeUsdt);
-  const currentUsdt = finitePositiveNumber(current?.gasFeeUsdt);
+  const candidateExtra = finitePositiveNumber(candidate?.extraFeeBnb);
+  const currentExtra = finitePositiveNumber(current?.extraFeeBnb);
+  if (candidateExtra !== null && currentExtra === null) return true;
+  if (candidateExtra === null && currentExtra !== null) return false;
+  const candidateUsdt = finitePositiveNumber(candidate?.totalFeeUsdt ?? candidate?.gasFeeUsdt);
+  const currentUsdt = finitePositiveNumber(current?.totalFeeUsdt ?? current?.gasFeeUsdt);
   if (candidateUsdt !== null && currentUsdt === null) return true;
   if (candidateUsdt === null && currentUsdt !== null) return false;
   const candidateAt = Date.parse(candidate?.at ?? "");
@@ -258,6 +283,19 @@ function toBigInt(value) {
   if (typeof value === "bigint") return value;
   if (value === undefined || value === null || value === "") return 0n;
   return BigInt(String(value));
+}
+
+function normalizeExtraFeeWei({ action, transaction, extraFeeWei, extraFeeBnb }) {
+  if (extraFeeWei !== undefined && extraFeeWei !== null && extraFeeWei !== "") {
+    return toBigInt(extraFeeWei);
+  }
+  if (extraFeeBnb !== undefined && extraFeeBnb !== null && extraFeeBnb !== "") {
+    return parseUnits(String(extraFeeBnb), 18);
+  }
+  if (action === "builder_tip" && transaction?.value !== undefined && transaction?.value !== null) {
+    return toBigInt(transaction.value);
+  }
+  return 0n;
 }
 
 function finitePositiveNumber(value) {

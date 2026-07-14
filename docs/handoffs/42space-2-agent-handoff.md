@@ -31,7 +31,7 @@ Existing production project:
 Current strategy baseline:
 
 - Buy 3 outcomes.
-- Buy the middle outcomes by display/token order.
+- Buy the first outcomes by display/token order.
 - Stake per outcome: `6U`.
 - Normal max cost per market: `18U`.
 - Buy path must start within `EVENT_OPEN_WINDOW_SECONDS=20`.
@@ -148,7 +148,7 @@ Keep strategy values aligned with current production:
 ```bash
 STAKE_PER_OUTCOME_USDT=6
 EVENT_OUTCOME_COUNT=3
-EVENT_OUTCOME_SELECTION=middle
+EVENT_OUTCOME_SELECTION=first
 MAX_MARKET_STAKE_USDT=18
 MAX_BATCH_STAKE_USDT=18
 EVENT_OPEN_WINDOW_SECONDS=20
